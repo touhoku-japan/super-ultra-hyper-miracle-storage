@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\ApiController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
@@ -21,12 +22,12 @@ Route::middleware('auth:sanctum')->get('/user', function (Request $request) {
 */
 
 
-Route::get('/list', [ApiController::class, 'list'])->name('list');
-Route::get('/list/download', [ApiController::class, 'list_download'])->name('list.download');
-Route::get('/list/deleted/download', [ApiController::class, 'list_deleted_download'])->name('list.deleted.download');
+Route::post('/list', [ApiController::class, 'list'])->name('list');
+Route::post('/list/download', [ApiController::class, 'list_download'])->name('list.download');
+Route::post('/list/deleted/download', [ApiController::class, 'list_deleted_download'])->name('list.deleted.download');
 
 Route::post('/upload', [ApiController::class, 'upload'])->name('upload');
-Route::get('/download/{id}', [ApiController::class, 'download'])->name('download');
-Route::post('/download/md5', [ApiController::class, 'download_md5'])->name('download');
+Route::post('/download/{md5}', [ApiController::class, 'download'])->name('download');
+//Route::post('/download/md5', [ApiController::class, 'download_md5'])->name('download');
 
 Route::post('/find/md5', [ApiController::class, 'find_md5'])->name('md5');

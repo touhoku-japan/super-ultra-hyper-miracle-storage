@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Http\Requests\ApiAdminRequest;
 use App\Support\Directory;
 use Exception;
 use Illuminate\Http\Exceptions\ThrottleRequestsException;
@@ -11,20 +12,35 @@ use Throwable;
 
 class ApiController extends Controller
 {
-    //
 
+    //デフォルトの戻り値を作成
+    static function makeResult(){
+        return [
+            "result" => false
+            , "validation"=>[]
+            , "message" => ""
+        ];
+    }
     function __construct()
     {
 
     }
 
-    function list_download(Request $req)
-    {
+    function list(ApiAdminRequest $req){
 
     }
 
-    function upload(Request $req)
+    function list_download(ApiAdminRequest $req)
     {
+
+    }
+    function list_deleted_download(ApiAdminRequest $req){
+
+    }
+
+    function upload(ApiAdminRequest $req)
+    {
+        
         $file = $req->file("file");
         $temp_filename = md5(time() . mt_rand());
 
@@ -45,27 +61,23 @@ class ApiController extends Controller
         }
     }
 
-    function download(Request $req)
+    function download(ApiAdminRequest $req)
     {
         $all = $req->all();
-        $result = [
-            "result" => false
-            , "message" => ""
-        ];
-        if (!is_integer($all['id'])) {
-            $result["message"] = "idが正しい値ではありませんでした";
+        $result = self::makeResult();
+
+        if (32 != strlen($all['md5'])) {
+            $result["message"] = "MD5の引数が不正です。";
             return response()->json($result, 500);
         }
     }
 
 
-    function find_md5(Request $req)
+    function find_md5(ApiAdminRequest $req)
     {
         $all = $req->all();
-        $result = [
-            "result" => false
-            , "message" => ""
-        ];
+        $result = self::makeResult();
+
         $first = DB::table("files")->select("*")->where("name_md5", $all['md5'])->first();
         if (null === $first) {
             $result["message"] = "指定のMD5のデータは存在しませんでした。";
