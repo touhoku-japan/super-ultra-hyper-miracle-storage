@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -13,11 +13,17 @@ use crate::{
     config::StoreConfig,
     disk::{Disk, DiskId},
     error::{Result, StoreError},
-    meta::{self, BucketRecord, DeleteBucketOutcome, MetadataStore, ObjectRecord, StoredObject},
+    list::{self, ListPage, ListParams},
+    meta::{
+        self, BucketRecord, DeleteBucketOutcome, MetadataStore, ObjectRecord, StoredObject,
+        TenantRecord,
+    },
     placement::{self, Candidate},
 };
 
 const MAX_KEY_LEN: usize = 1024;
+/// S3's limit on the total size of user-defined metadata.
+const MAX_USER_METADATA: usize = 2048;
 const PAGE: u32 = 500;
 
 #[derive(Debug, Default)]
@@ -27,6 +33,10 @@ pub struct PutObjectRequest {
     pub content_type: Option<String>,
     /// S3 storage class; overrides the bucket's replica count.
     pub storage_class: Option<String>,
+    /// `x-amz-meta-*` headers, keys without the prefix.
+    pub user_metadata: BTreeMap<String, String>,
+    /// Expected MD5 (`Content-MD5`); the write fails with [`StoreError::BadDigest`] on mismatch.
+    pub content_md5: Option<[u8; 16]>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +66,13 @@ fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .expect("clock is after 1970");
     i64::try_from(d.as_millis()).expect("timestamp fits in i64")
+}
+
+fn validate_key(key: &str) -> Result<()> {
+    if key.is_empty() || key.len() > MAX_KEY_LEN {
+        return Err(StoreError::InvalidObjectKey);
+    }
+    Ok(())
 }
 
 fn validate_bucket_name(name: &str) -> Result<()> {
@@ -113,6 +130,16 @@ impl Store {
             disks,
             meta,
         })
+    }
+
+    /// Removes temp files left by interrupted writes. Call once at server startup, before
+    /// accepting requests; never while another process may be writing to the same disks.
+    pub async fn clear_tmp(&self) {
+        for disk in &self.disks {
+            if let Err(error) = disk.clear_tmp().await {
+                tracing::warn!(disk = %disk.root.display(), %error, "failed to clear temp files");
+            }
+        }
     }
 
     fn disk(&self, id: DiskId) -> Option<&Arc<Disk>> {
@@ -197,30 +224,80 @@ impl Store {
         }
     }
 
+    // ---- tenants ----
+
+    /// Creates a tenant (a customer account that owns buckets and access keys).
+    pub async fn create_tenant(&self, name: &str) -> Result<TenantRecord> {
+        if name.is_empty() || name.len() > 128 {
+            return Err(StoreError::InvalidArgument(
+                "tenant name must be 1-128 bytes".into(),
+            ));
+        }
+        let record = TenantRecord {
+            id: Uuid::new_v4().to_string(),
+            name: name.to_owned(),
+            created_at: now_millis(),
+        };
+        if !self.meta.create_tenant(&record).await? {
+            return Err(StoreError::TenantAlreadyExists(name.to_owned()));
+        }
+        Ok(record)
+    }
+
+    /// Direct access to the metadata store, for tenant/key administration.
+    pub fn metadata(&self) -> &Arc<dyn MetadataStore> {
+        &self.meta
+    }
+
     // ---- buckets ----
 
-    pub async fn create_bucket(&self, name: &str, replicas: Option<u8>) -> Result<BucketRecord> {
+    /// Looks up a bucket on behalf of `owner`. Another tenant's bucket is reported as
+    /// [`StoreError::AccessDenied`], like S3 does.
+    async fn owned_bucket(&self, owner: &str, name: &str) -> Result<BucketRecord> {
+        let bucket = self.require_bucket(name).await?;
+        if bucket.owner != owner {
+            return Err(StoreError::AccessDenied);
+        }
+        Ok(bucket)
+    }
+
+    pub async fn create_bucket(
+        &self,
+        owner: &str,
+        name: &str,
+        replicas: Option<u8>,
+    ) -> Result<BucketRecord> {
         validate_bucket_name(name)?;
         if let Some(n) = replicas {
             self.check_replicas(n)?;
         }
         let record = BucketRecord {
             name: name.to_owned(),
+            owner: owner.to_owned(),
             replicas,
             created_at: now_millis(),
         };
         if !self.meta.create_bucket(&record).await? {
-            return Err(StoreError::BucketAlreadyExists(name.to_owned()));
+            let existing = self.meta.get_bucket(name).await?;
+            return Err(match existing {
+                Some(b) if b.owner == owner => StoreError::BucketAlreadyOwnedByYou(name.to_owned()),
+                _ => StoreError::BucketAlreadyExists(name.to_owned()),
+            });
         }
         Ok(record)
     }
 
-    pub async fn get_bucket(&self, name: &str) -> Result<BucketRecord> {
-        self.require_bucket(name).await
+    pub async fn get_bucket(&self, owner: &str, name: &str) -> Result<BucketRecord> {
+        self.owned_bucket(owner, name).await
+    }
+
+    pub async fn list_buckets(&self, owner: &str) -> Result<Vec<BucketRecord>> {
+        self.meta.list_buckets(owner).await
     }
 
     /// Changes the bucket's replica count (`None` = cluster default). Existing objects without
     /// an explicit storage class follow; [`Store::repair`] adds or removes their copies.
+    /// Administrative: not scoped to a tenant.
     pub async fn set_bucket_replicas(&self, name: &str, replicas: Option<u8>) -> Result<()> {
         let effective = self.check_replicas(replicas.unwrap_or(self.config.default_replicas))?;
         if !self
@@ -233,7 +310,8 @@ impl Store {
         Ok(())
     }
 
-    pub async fn delete_bucket(&self, name: &str) -> Result<()> {
+    pub async fn delete_bucket(&self, owner: &str, name: &str) -> Result<()> {
+        self.owned_bucket(owner, name).await?;
         match self.meta.delete_bucket(name).await? {
             DeleteBucketOutcome::Deleted => Ok(()),
             DeleteBucketOutcome::NotFound => Err(StoreError::NoSuchBucket(name.to_owned())),
@@ -247,13 +325,22 @@ impl Store {
     /// durable; missing copies are filled in by [`Store::repair`].
     pub async fn put_object<R: AsyncRead + Unpin>(
         &self,
+        owner: &str,
         req: PutObjectRequest,
         body: R,
     ) -> Result<ObjectRecord> {
-        if req.key.is_empty() || req.key.len() > MAX_KEY_LEN {
-            return Err(StoreError::InvalidObjectKey);
+        validate_key(&req.key)?;
+        let meta_size: usize = req
+            .user_metadata
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum();
+        if meta_size > MAX_USER_METADATA {
+            return Err(StoreError::InvalidArgument(format!(
+                "user metadata exceeds {MAX_USER_METADATA} bytes"
+            )));
         }
-        let bucket = self.require_bucket(&req.bucket).await?;
+        let bucket = self.owned_bucket(owner, &req.bucket).await?;
         let (replicas, explicit) = self.resolve_replicas(&bucket, req.storage_class.as_deref())?;
         let required = placement::ack_threshold(replicas);
         let targets = self.place(usize::from(replicas), &[]);
@@ -266,39 +353,49 @@ impl Store {
 
         let id = Uuid::new_v4();
         let outcome = blob::write_replicas(&targets, id, required, body).await?;
-        if outcome.written.len() < usize::from(replicas) {
+        let written = StoredObject {
+            object: ObjectRecord {
+                id,
+                bucket: req.bucket,
+                key: req.key,
+                size: outcome.size,
+                etag: outcome.md5,
+                blake3: outcome.blake3,
+                content_type: req.content_type,
+                storage_class: req.storage_class,
+                user_metadata: req.user_metadata,
+                desired_replicas: replicas,
+                replicas_explicit: explicit,
+                created_at: now_millis(),
+            },
+            replicas: outcome.written,
+        };
+        if let Some(expected) = req.content_md5
+            && hex::encode(expected) != written.object.etag
+        {
+            self.remove_files(&written).await;
+            return Err(StoreError::BadDigest);
+        }
+        if written.replicas.len() < usize::from(replicas) {
             tracing::warn!(
-                bucket = %req.bucket, key = %req.key,
-                written = outcome.written.len(), replicas,
+                bucket = %written.object.bucket, key = %written.object.key,
+                written = written.replicas.len(), replicas,
                 "object stored with fewer copies than requested; repair will add the rest"
             );
         }
 
-        let record = ObjectRecord {
-            id,
-            bucket: req.bucket,
-            key: req.key,
-            size: outcome.size,
-            etag: outcome.md5,
-            blake3: outcome.blake3,
-            content_type: req.content_type,
-            storage_class: req.storage_class,
-            desired_replicas: replicas,
-            replicas_explicit: explicit,
-            created_at: now_millis(),
-        };
-        match self.meta.put_object(&record, &outcome.written).await {
+        match self
+            .meta
+            .put_object(&written.object, &written.replicas)
+            .await
+        {
             Ok(previous) => {
                 if let Some(prev) = previous {
                     self.remove_files(&prev).await;
                 }
-                Ok(record)
+                Ok(written.object)
             }
             Err(e) => {
-                let written = StoredObject {
-                    object: record,
-                    replicas: outcome.written,
-                };
                 self.remove_files(&written).await;
                 Err(e)
             }
@@ -316,13 +413,27 @@ impl Store {
         })
     }
 
-    pub async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectRecord> {
-        Ok(self.require_object(bucket, key).await?.object)
+    async fn owned_object(&self, owner: &str, bucket: &str, key: &str) -> Result<StoredObject> {
+        self.owned_bucket(owner, bucket).await?;
+        self.require_object(bucket, key).await
+    }
+
+    pub async fn head_object(&self, owner: &str, bucket: &str, key: &str) -> Result<ObjectRecord> {
+        Ok(self.owned_object(owner, bucket, key).await?.object)
     }
 
     /// Opens a readable copy of the object, trying each copy in turn.
-    pub async fn get_object(&self, bucket: &str, key: &str) -> Result<(ObjectRecord, File)> {
-        let stored = self.require_object(bucket, key).await?;
+    pub async fn get_object(
+        &self,
+        owner: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(ObjectRecord, File)> {
+        let stored = self.owned_object(owner, bucket, key).await?;
+        self.open_stored(stored).await
+    }
+
+    pub(crate) async fn open_stored(&self, stored: StoredObject) -> Result<(ObjectRecord, File)> {
         for id in &stored.replicas {
             let Some(disk) = self.disk(*id) else { continue };
             let path = disk.object_path(stored.object.id);
@@ -346,8 +457,8 @@ impl Store {
     }
 
     /// Deletes the object. Returns false when it did not exist.
-    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<bool> {
-        self.require_bucket(bucket).await?;
+    pub async fn delete_object(&self, owner: &str, bucket: &str, key: &str) -> Result<bool> {
+        self.owned_bucket(owner, bucket).await?;
         match self.meta.delete_object(bucket, key).await? {
             Some(prev) => {
                 self.remove_files(&prev).await;
@@ -357,7 +468,15 @@ impl Store {
         }
     }
 
+    /// Lists a bucket the way S3's ListObjects does: keys under `prefix`, with keys that share
+    /// a `delimiter`-terminated prefix rolled up into one common prefix.
+    pub async fn list_objects(&self, owner: &str, params: &ListParams) -> Result<ListPage> {
+        self.owned_bucket(owner, &params.bucket).await?;
+        list::list(self.meta.as_ref(), params).await
+    }
+
     /// Paths of the object's copies on this node's online disks.
+    /// Administrative: not scoped to a tenant.
     pub async fn object_locations(&self, bucket: &str, key: &str) -> Result<Vec<PathBuf>> {
         let stored = self.require_object(bucket, key).await?;
         Ok(stored

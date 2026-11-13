@@ -1,4 +1,4 @@
-# suhms の設定ファイル例。`suhms --config config.toml` で読み込む。
+# suhms の設定ファイル例。`suhms --config config.toml serve` で読み込む。
 # 未指定の項目はデフォルト値になる。
 
 [server]
@@ -10,3 +10,33 @@ listen = "127.0.0.1:9000"
 format = "pretty"
 # RUST_LOG 環境変数が設定されていればそちらを優先する
 level = "info"
+
+[storage]
+# このノードの ID。レプリカは別々のノードに置かれる
+node_id = "node1"
+# オブジェクトを置くディレクトリ（通常はディスクのマウントポイント）。事前に作成しておくこと。
+# 存在しないパスは自動作成しない（未マウントのまま OS ディスクに書き込むのを防ぐため）
+disks = ["/srv/suhms/disk1", "/srv/suhms/disk2", "/srv/suhms/disk3"]
+# メタデータ DB。sqlite は単一ノード専用（postgres / mysql は今後対応）
+metadata_url = "sqlite:///var/lib/suhms/meta.db"
+# オブジェクトにもバケットにも指定がないときのレプリカ数
+default_replicas = 3
+
+# S3 のストレージクラス名 → レプリカ数
+[storage.storage_classes]
+STANDARD = 3
+STANDARD_IA = 2
+REDUCED_REDUNDANCY = 1
+
+[s3]
+# クライアントが署名に使うリージョン名
+region = "jp-1"
+# 仮想ホスト形式（<bucket>.s3.example.com）を受けるベースドメイン。パス形式は常に有効
+domains = []
+# PutObject 1 回の最大サイズ（バイト）
+max_object_size = 5368709120
+
+[auth]
+# アクセスキーのシークレットを暗号化するマスターキー（`suhms gen-master-key` で生成した 64 桁 hex）。
+# 環境変数 SUHMS_MASTER_KEY が優先される。紛失すると既存のアクセスキーはすべて使えなくなる
+master_key_file = "/etc/suhms/master.key"

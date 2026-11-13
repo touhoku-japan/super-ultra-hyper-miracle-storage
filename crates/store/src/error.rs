@@ -34,6 +34,24 @@ pub enum StoreError {
     #[error("bucket {0} already exists")]
     BucketAlreadyExists(String),
 
+    #[error("bucket {0} is already owned by you")]
+    BucketAlreadyOwnedByYou(String),
+
+    #[error("access denied")]
+    AccessDenied,
+
+    #[error("tenant {0} does not exist")]
+    NoSuchTenant(String),
+
+    #[error("tenant {0} already exists")]
+    TenantAlreadyExists(String),
+
+    #[error("the uploaded content does not match the supplied digest")]
+    BadDigest,
+
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+
     #[error("bucket {0} is not empty")]
     BucketNotEmpty(String),
 

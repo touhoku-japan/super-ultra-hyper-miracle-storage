@@ -7,12 +7,27 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "suhms"
 path = "src/main.rs"
 
 [dependencies]
+aes-gcm = "0.11.1"
 anyhow.workspace = true
+async-trait = "0.1.92"
+base64 = "0.23.1"
+bytes = "1.12.1"
+futures = "0.3.34"
+getrandom = "0.4.3"
+hex = "0.4.3"
+s3s = { version = "0.17.0", default-features = false }
+suhms-store = { path = "../store" }
+tokio-util = { version = "0.7.20", features = ["io"] }
+tower.workspace = true
+uuid = { version = "1.29.2", features = ["v4"] }
 axum.workspace = true
 clap.workspace = true
 serde.workspace = true
@@ -23,7 +38,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-tower.workspace = true
+hmac = "0.13.0"
+md-5 = "0.11.0"
+sha2 = "0.11.1"
+tempfile = "3.27.0"
+time = "0.3.55"
 
 [lints]
 workspace = true

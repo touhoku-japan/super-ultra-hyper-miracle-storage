@@ -1,7 +1,11 @@
 use std::{collections::HashSet, path::PathBuf};
 
 use md5::{Digest, Md5};
-use suhms_store::{PutObjectRequest, Store, StoreConfig, StoreError};
+use suhms_store::{
+    ListParams, ListStart, PutObjectRequest, Store, StoreConfig, StoreError, TenantRecord,
+};
+
+const OWNER: &str = "tenant-1";
 use tempfile::TempDir;
 use tokio::io::AsyncReadExt;
 
@@ -32,7 +36,18 @@ impl Env {
     }
 
     async fn open(&self) -> Store {
-        Store::open(self.config()).await.unwrap()
+        let store = Store::open(self.config()).await.unwrap();
+        // Tests act as one tenant with a fixed id; creating it again on reopen is a no-op.
+        store
+            .metadata()
+            .create_tenant(&TenantRecord {
+                id: OWNER.into(),
+                name: OWNER.into(),
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+        store
     }
 }
 
@@ -49,11 +64,12 @@ fn put(bucket: &str, key: &str, class: Option<&str>) -> PutObjectRequest {
         key: key.into(),
         content_type: Some("application/octet-stream".into()),
         storage_class: class.map(Into::into),
+        ..Default::default()
     }
 }
 
 async fn read_object(store: &Store, bucket: &str, key: &str) -> Vec<u8> {
-    let (_, mut file) = store.get_object(bucket, key).await.unwrap();
+    let (_, mut file) = store.get_object(OWNER, bucket, key).await.unwrap();
     let mut out = Vec::new();
     file.read_to_end(&mut out).await.unwrap();
     out
@@ -67,11 +83,11 @@ fn disk_of(path: &std::path::Path, env: &Env) -> usize {
 async fn put_writes_plain_identical_files_on_distinct_disks() {
     let env = Env::new(4);
     let store = env.open().await;
-    store.create_bucket("backups", None).await.unwrap();
+    store.create_bucket(OWNER, "backups", None).await.unwrap();
     let data = payload();
 
     let rec = store
-        .put_object(put("backups", "dir/a.bin", None), &data[..])
+        .put_object(OWNER, put("backups", "dir/a.bin", None), &data[..])
         .await
         .unwrap();
     assert_eq!(rec.size, data.len() as u64);
@@ -95,8 +111,8 @@ async fn put_writes_plain_identical_files_on_distinct_disks() {
 async fn replica_count_follows_class_then_bucket_then_default() {
     let env = Env::new(4);
     let store = env.open().await;
-    store.create_bucket("one", Some(1)).await.unwrap();
-    store.create_bucket("dflt", None).await.unwrap();
+    store.create_bucket(OWNER, "one", Some(1)).await.unwrap();
+    store.create_bucket(OWNER, "dflt", None).await.unwrap();
 
     let count = |b: &'static str, k: &'static str| {
         let store = &store;
@@ -104,27 +120,30 @@ async fn replica_count_follows_class_then_bucket_then_default() {
     };
 
     store
-        .put_object(put("one", "a", None), &b"x"[..])
+        .put_object(OWNER, put("one", "a", None), &b"x"[..])
         .await
         .unwrap();
     assert_eq!(count("one", "a").await, 1);
     store
-        .put_object(put("one", "b", Some("STANDARD_IA")), &b"x"[..])
+        .put_object(OWNER, put("one", "b", Some("STANDARD_IA")), &b"x"[..])
         .await
         .unwrap();
     assert_eq!(count("one", "b").await, 2);
     store
-        .put_object(put("dflt", "c", None), &b"x"[..])
+        .put_object(OWNER, put("dflt", "c", None), &b"x"[..])
         .await
         .unwrap();
     assert_eq!(count("dflt", "c").await, 3);
 
     let err = store
-        .put_object(put("one", "d", Some("GLACIER")), &b"x"[..])
+        .put_object(OWNER, put("one", "d", Some("GLACIER")), &b"x"[..])
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::UnknownStorageClass(_)), "{err}");
-    let err = store.create_bucket("five", Some(5)).await.unwrap_err();
+    let err = store
+        .create_bucket(OWNER, "five", Some(5))
+        .await
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -141,15 +160,15 @@ async fn replica_count_follows_class_then_bucket_then_default() {
 async fn overwrite_and_delete_remove_old_files() {
     let env = Env::new(3);
     let store = env.open().await;
-    store.create_bucket("bk1", None).await.unwrap();
+    store.create_bucket(OWNER, "bk1", None).await.unwrap();
 
     store
-        .put_object(put("bk1", "k", None), &b"old"[..])
+        .put_object(OWNER, put("bk1", "k", None), &b"old"[..])
         .await
         .unwrap();
     let old = store.object_locations("bk1", "k").await.unwrap();
     store
-        .put_object(put("bk1", "k", None), &b"new"[..])
+        .put_object(OWNER, put("bk1", "k", None), &b"new"[..])
         .await
         .unwrap();
     assert!(
@@ -158,18 +177,18 @@ async fn overwrite_and_delete_remove_old_files() {
     );
     assert_eq!(read_object(&store, "bk1", "k").await, b"new");
 
-    let err = store.delete_bucket("bk1").await.unwrap_err();
+    let err = store.delete_bucket(OWNER, "bk1").await.unwrap_err();
     assert!(matches!(err, StoreError::BucketNotEmpty(_)), "{err}");
 
     let cur = store.object_locations("bk1", "k").await.unwrap();
-    assert!(store.delete_object("bk1", "k").await.unwrap());
+    assert!(store.delete_object(OWNER, "bk1", "k").await.unwrap());
     assert!(cur.iter().all(|p| !p.exists()));
-    assert!(!store.delete_object("bk1", "k").await.unwrap());
-    let err = store.get_object("bk1", "k").await.unwrap_err();
+    assert!(!store.delete_object(OWNER, "bk1", "k").await.unwrap());
+    let err = store.get_object(OWNER, "bk1", "k").await.unwrap_err();
     assert!(matches!(err, StoreError::NoSuchKey { .. }), "{err}");
 
-    store.delete_bucket("bk1").await.unwrap();
-    let err = store.get_object("bk1", "k").await.unwrap_err();
+    store.delete_bucket(OWNER, "bk1").await.unwrap();
+    let err = store.get_object(OWNER, "bk1", "k").await.unwrap_err();
     assert!(matches!(err, StoreError::NoSuchBucket(_)), "{err}");
 }
 
@@ -177,9 +196,9 @@ async fn overwrite_and_delete_remove_old_files() {
 async fn get_falls_back_to_another_copy() {
     let env = Env::new(3);
     let store = env.open().await;
-    store.create_bucket("bk1", None).await.unwrap();
+    store.create_bucket(OWNER, "bk1", None).await.unwrap();
     store
-        .put_object(put("bk1", "k", None), &b"hello"[..])
+        .put_object(OWNER, put("bk1", "k", None), &b"hello"[..])
         .await
         .unwrap();
     let locs = store.object_locations("bk1", "k").await.unwrap();
@@ -192,10 +211,10 @@ async fn get_falls_back_to_another_copy() {
 async fn scrub_and_repair_restore_corrupt_and_missing_copies() {
     let env = Env::new(4);
     let store = env.open().await;
-    store.create_bucket("bk1", None).await.unwrap();
+    store.create_bucket(OWNER, "bk1", None).await.unwrap();
     let data = payload();
     store
-        .put_object(put("bk1", "k", None), &data[..])
+        .put_object(OWNER, put("bk1", "k", None), &data[..])
         .await
         .unwrap();
     let locs = store.object_locations("bk1", "k").await.unwrap();
@@ -233,13 +252,13 @@ async fn scrub_and_repair_restore_corrupt_and_missing_copies() {
 async fn changing_bucket_replicas_adds_or_trims_copies() {
     let env = Env::new(3);
     let store = env.open().await;
-    store.create_bucket("bk1", None).await.unwrap();
+    store.create_bucket(OWNER, "bk1", None).await.unwrap();
     store
-        .put_object(put("bk1", "auto", None), &b"a"[..])
+        .put_object(OWNER, put("bk1", "auto", None), &b"a"[..])
         .await
         .unwrap();
     store
-        .put_object(put("bk1", "pinned", Some("STANDARD")), &b"p"[..])
+        .put_object(OWNER, put("bk1", "pinned", Some("STANDARD")), &b"p"[..])
         .await
         .unwrap();
 
@@ -271,9 +290,9 @@ async fn offline_disk_is_skipped_and_never_created() {
     let env = Env::new(3);
     {
         let store = env.open().await;
-        store.create_bucket("bk1", None).await.unwrap();
+        store.create_bucket(OWNER, "bk1", None).await.unwrap();
         store
-            .put_object(put("bk1", "k", None), &b"data"[..])
+            .put_object(OWNER, put("bk1", "k", None), &b"data"[..])
             .await
             .unwrap();
     }
@@ -315,16 +334,218 @@ async fn rejects_invalid_names() {
     for bad in ["ab", "UPPER", "-start", "end-", "a..b", "has_underscore"] {
         assert!(
             matches!(
-                store.create_bucket(bad, None).await,
+                store.create_bucket(OWNER, bad, None).await,
                 Err(StoreError::InvalidBucketName(_))
             ),
             "{bad}"
         );
     }
-    store.create_bucket("ok-bucket.1", Some(1)).await.unwrap();
+    store
+        .create_bucket(OWNER, "ok-bucket.1", Some(1))
+        .await
+        .unwrap();
     let err = store
-        .put_object(put("ok-bucket.1", "", None), &b""[..])
+        .put_object(OWNER, put("ok-bucket.1", "", None), &b""[..])
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::InvalidObjectKey), "{err}");
+}
+
+#[tokio::test]
+async fn tenants_cannot_touch_each_others_buckets() {
+    let env = Env::new(3);
+    let store = env.open().await;
+    let other = store.create_tenant("other-customer").await.unwrap();
+    let err = store.create_tenant("other-customer").await.unwrap_err();
+    assert!(matches!(err, StoreError::TenantAlreadyExists(_)), "{err}");
+
+    store.create_bucket(OWNER, "mine", None).await.unwrap();
+    store
+        .put_object(OWNER, put("mine", "secret", None), &b"s"[..])
+        .await
+        .unwrap();
+
+    let denied = |r: Result<_, StoreError>| matches!(r, Err(StoreError::AccessDenied));
+    assert!(denied(
+        store
+            .get_object(&other.id, "mine", "secret")
+            .await
+            .map(|_| ())
+    ));
+    assert!(denied(
+        store
+            .head_object(&other.id, "mine", "secret")
+            .await
+            .map(|_| ())
+    ));
+    assert!(denied(
+        store
+            .put_object(&other.id, put("mine", "x", None), &b"x"[..])
+            .await
+            .map(|_| ())
+    ));
+    assert!(denied(
+        store
+            .delete_object(&other.id, "mine", "secret")
+            .await
+            .map(|_| ())
+    ));
+    assert!(denied(store.delete_bucket(&other.id, "mine").await));
+    let params = ListParams {
+        bucket: "mine".into(),
+        prefix: String::new(),
+        delimiter: None,
+        start: ListStart::Beginning,
+        max_keys: 1000,
+    };
+    assert!(denied(
+        store.list_objects(&other.id, &params).await.map(|_| ())
+    ));
+
+    let err = store
+        .create_bucket(&other.id, "mine", None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::BucketAlreadyExists(_)), "{err}");
+    let err = store.create_bucket(OWNER, "mine", None).await.unwrap_err();
+    assert!(
+        matches!(err, StoreError::BucketAlreadyOwnedByYou(_)),
+        "{err}"
+    );
+
+    assert_eq!(store.list_buckets(&other.id).await.unwrap(), vec![]);
+    assert_eq!(store.list_buckets(OWNER).await.unwrap().len(), 1);
+    // Still intact for the owner.
+    assert_eq!(read_object(&store, "mine", "secret").await, b"s");
+}
+
+#[tokio::test]
+async fn content_md5_mismatch_is_rejected_and_leaves_nothing() {
+    let env = Env::new(3);
+    let store = env.open().await;
+    store.create_bucket(OWNER, "bk1", None).await.unwrap();
+    store
+        .put_object(OWNER, put("bk1", "k", None), &b"keep"[..])
+        .await
+        .unwrap();
+    let before = store.object_locations("bk1", "k").await.unwrap();
+
+    let mut req = put("bk1", "k", None);
+    req.content_md5 = Some([0; 16]);
+    let err = store
+        .put_object(OWNER, req, &b"other"[..])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::BadDigest), "{err}");
+    assert_eq!(
+        read_object(&store, "bk1", "k").await,
+        b"keep",
+        "old version survives"
+    );
+    assert_eq!(store.object_locations("bk1", "k").await.unwrap(), before);
+
+    let mut req = put("bk1", "k2", None);
+    req.content_md5 = Some(Md5::digest(b"good").into());
+    req.user_metadata.insert("mtime".into(), "123".into());
+    let rec = store.put_object(OWNER, req, &b"good"[..]).await.unwrap();
+    assert_eq!(
+        rec.user_metadata.get("mtime").map(String::as_str),
+        Some("123")
+    );
+    let head = store.head_object(OWNER, "bk1", "k2").await.unwrap();
+    assert_eq!(head.user_metadata, rec.user_metadata);
+}
+
+async fn list_all(
+    store: &Store,
+    prefix: &str,
+    delimiter: Option<&str>,
+    page_size: usize,
+    use_cursor: bool,
+) -> (Vec<String>, Vec<String>, usize) {
+    let mut keys = Vec::new();
+    let mut prefixes = Vec::new();
+    let mut pages = 0;
+    let mut start = ListStart::Beginning;
+    loop {
+        let page = store
+            .list_objects(
+                OWNER,
+                &ListParams {
+                    bucket: "lst".into(),
+                    prefix: prefix.into(),
+                    delimiter: delimiter.map(Into::into),
+                    start: start.clone(),
+                    max_keys: page_size,
+                },
+            )
+            .await
+            .unwrap();
+        pages += 1;
+        keys.extend(page.objects.iter().map(|o| o.key.clone()));
+        prefixes.extend(page.common_prefixes.iter().cloned());
+        if !page.truncated {
+            break;
+        }
+        start = if use_cursor {
+            ListStart::Cursor(page.next_cursor.unwrap())
+        } else {
+            ListStart::Marker(page.next_marker.unwrap())
+        };
+    }
+    (keys, prefixes, pages)
+}
+
+#[tokio::test]
+async fn list_objects_follows_s3_semantics() {
+    let env = Env::new(1);
+    let store = env.open().await;
+    store.create_bucket(OWNER, "lst", Some(1)).await.unwrap();
+    let keys = [
+        "a.txt",
+        "b/1",
+        "b/2",
+        "b/sub/3",
+        "c/1",
+        "d",
+        "日本/x",
+        "photos/2024/1.jpg",
+        "photos/2024/2.jpg",
+        "photos/2025/1.jpg",
+        "photos/top.jpg",
+    ];
+    for k in keys {
+        store
+            .put_object(OWNER, put("lst", k, None), &b"x"[..])
+            .await
+            .unwrap();
+    }
+
+    // Flat listing is in UTF-8 byte order, across page boundaries.
+    for use_cursor in [true, false] {
+        let (all, cps, pages) = list_all(&store, "", None, 3, use_cursor).await;
+        let mut expected: Vec<_> = keys.iter().map(|k| k.to_string()).collect();
+        expected.sort();
+        assert_eq!(all, expected);
+        assert!(cps.is_empty());
+        assert_eq!(pages, 4);
+    }
+
+    // Delimiter roll-up, with page size 1 so every prefix is its own page.
+    for use_cursor in [true, false] {
+        let (k, cps, _) = list_all(&store, "", Some("/"), 1, use_cursor).await;
+        assert_eq!(k, vec!["a.txt", "d"]);
+        assert_eq!(cps, vec!["b/", "c/", "photos/", "日本/"]);
+    }
+
+    let (k, cps, _) = list_all(&store, "photos/", Some("/"), 1000, true).await;
+    assert_eq!(k, vec!["photos/top.jpg"]);
+    assert_eq!(cps, vec!["photos/2024/", "photos/2025/"]);
+
+    let (k, cps, _) = list_all(&store, "photos/2024/", None, 1000, true).await;
+    assert_eq!(k, vec!["photos/2024/1.jpg", "photos/2024/2.jpg"]);
+    assert!(cps.is_empty());
+
+    let (k, _, _) = list_all(&store, "zzz", None, 1000, true).await;
+    assert!(k.is_empty());
 }

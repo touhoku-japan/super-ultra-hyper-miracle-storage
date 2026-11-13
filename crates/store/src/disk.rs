@@ -86,12 +86,7 @@ impl Disk {
         };
 
         fs::create_dir_all(root.join(OBJECTS_DIR)).map_err(unavailable)?;
-        let tmp = meta_dir.join(TMP_DIR);
-        // Leftovers from writes interrupted by a crash; their objects were never committed.
-        if tmp.exists() {
-            fs::remove_dir_all(&tmp).map_err(unavailable)?;
-        }
-        fs::create_dir_all(&tmp).map_err(unavailable)?;
+        fs::create_dir_all(meta_dir.join(TMP_DIR)).map_err(unavailable)?;
 
         Ok(Self { id, node_id, root })
     }
@@ -134,6 +129,20 @@ impl Disk {
             .map_err(unavailable)?;
         tracing::info!(path = %root.display(), disk_id = %id, "formatted new disk");
         Ok(id)
+    }
+
+    /// Deletes leftovers of writes interrupted by a crash (their objects were never committed).
+    /// Only safe while nothing else is writing to this disk, i.e. at server startup.
+    pub async fn clear_tmp(&self) -> io::Result<()> {
+        let tmp = self.root.join(META_DIR).join(TMP_DIR);
+        tokio::task::spawn_blocking(move || {
+            if tmp.exists() {
+                fs::remove_dir_all(&tmp)?;
+            }
+            fs::create_dir_all(&tmp)
+        })
+        .await
+        .expect("cleanup task panicked")
     }
 
     /// Final location of a blob's file on this disk.

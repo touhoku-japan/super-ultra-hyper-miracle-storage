@@ -7,24 +7,38 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
 
 - テスト: `CARGO_BUILD_JOBS=1 cargo test --workspace`
 - Lint: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings`
-- 起動: `cargo run -p suhms-server -- --config config.example.toml`（`GET /health` で疎通確認）
+- 起動: `cargo run -p suhms-server -- -c config.toml serve`（`GET /_suhms/health` で疎通確認。認証不要）
+- 管理: `suhms gen-master-key` / `suhms tenant create|list` / `suhms key create|list|disable|enable` /
+  `suhms bucket set-replicas <bucket> <n|default>` / `suhms scrub` / `suhms repair`
+  - tenant/key 系はメタデータ DB だけを触るので、サーバ稼働中に実行してよい
+  - ディスクの一時ファイル掃除（`Store::clear_tmp`）は `serve` 起動時のみ。管理コマンドは掃除しない（稼働中サーバの書き込み中ファイルを消さないため）
 
 開発ホストは 2 コア / 2.9GB RAM で他アプリと共有しているため、ビルドは `CARGO_BUILD_JOBS=1` で行う。
-release ビルドは CI 側で行う想定。
+release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレートはこのホストでのビルドが重いので dev-dependency に入れない。
+実クライアントでの互換確認はホストにある `rclone` で行う（環境変数 `RCLONE_CONFIG_S_*` で設定、`force_path_style=true`）。
 
 ## 構成
 
 - Cargo workspace。クレートは `crates/*`
-  - `server/` — バイナリ `suhms`。設定（TOML、`deny_unknown_fields`）、tracing、graceful shutdown。まだ store とは未接続
-  - `store/` — ストレージエンジン（Phase 1）
+  - `server/` — lib + バイナリ `suhms`
+    - `lib.rs` — `app()`: axum ルータ（ヘルスチェック + それ以外は s3s の S3 サービス）
+    - `s3.rs` — `s3s::S3` 実装。リクエストごとに検証済みアクセスキー → テナント ID を引き、store にテナントを渡す。
+      `KeyStore`（`S3Auth`）が SigV4 用にシークレットを復号して返す。body 読み取り中の s3s エラー（SHA-256 不一致等）は `body_error` で S3 エラーに戻す
+    - `crypto.rs` — アクセスキーのシークレットを AES-256-GCM で暗号化（AAD = アクセスキー ID）。マスターキーは `SUHMS_MASTER_KEY` か `[auth] master_key_file`
+    - `admin.rs` — 管理サブコマンド
+    - `tests/` — `common/mod.rs` の自前 SigV4 署名器で、実ルータを in-process で叩く E2E テスト
+  - `store/` — ストレージエンジン
     - `disk.rs` — ディスク = 既存ディレクトリ。`.suhms/format.json` の UUID で識別（マウント順が変わっても同一視）。
       ルートが無ければ作らない（未マウント時にルート FS へ書くのを防ぐ）。中身のある未フォーマットのディレクトリは使わない
     - `placement.rs` — 配置（別ノード優先 → 同ノード別ディスク、空き容量の多い順）と ACK 閾値（過半数）
     - `blob.rs` — 全レプリカへの同時ストリーミング書き込み（MD5=ETag と BLAKE3 を同時計算）、検証付きコピー
-    - `meta/` — `MetadataStore` trait と SQLite 実装（`sqlite_schema.sql`）
-    - `store.rs` — `Store`: バケット/オブジェクト操作、`scrub()`（ハッシュ照合で壊れたコピーを除去）、`repair()`（不足分を複製・過剰分を削除）
-- 予定: `auth/`（テナント・アクセスキー・SigV4）、`admin-cli/`
-- S3 プロトコル層は `s3s` クレートを採用（決定済み、Apache-2.0。`openssl` feature は使わない）
+    - `meta/` — `MetadataStore` trait と SQLite 実装。スキーマは `meta/migrations/<backend>/NNNN_*.sql`（リリース済みのマイグレーションは編集しない）
+    - `list.rs` — S3 の ListObjects 意味論（prefix / delimiter / marker / continuation）。キー順は UTF-8 バイト順
+    - `store.rs` — `Store`: テナント・バケット・オブジェクト操作（すべて owner = テナント ID でスコープ。他テナントのバケットは AccessDenied）、
+      `scrub()`、`repair()`
+- S3 プロトコル層は `s3s` クレート（Apache-2.0。`openssl` feature は使わない）
+- 対応済み S3 操作: ListBuckets, Create/Head/Delete Bucket, GetBucketLocation, GetBucketVersioning（常に未設定）,
+  Put/Get（Range）/Head/Delete Object, DeleteObjects, ListObjects V1/V2（encoding-type=url 対応）, presigned URL
 
 ## ライセンス
 
@@ -55,11 +69,14 @@ MIT ライセンス。依存クレートは `deny.toml` の許可リスト（MIT
   SQLite は単一ノード構成と開発専用。マルチノードでは PostgreSQL（Patroni 等）か MariaDB（Galera 等）の HA 構成が前提。
   SQL は 3 方言すべてで動くものに限り、テストも 3 バックエンドで実行する。
 
-## 未対応（Phase 1 時点の既知の穴）
+## 未対応（既知の穴）
 
 - `deny.toml` で RUSTSEC-2026-0459（同梱 SQLite の脆弱性）を一時除外中。sqlx が libsqlite3-sys >= 0.39 を許容したら更新して除外を外す
 - PostgreSQL / MariaDB バックエンド未実装（`meta::connect` がエラーを返す）
-- scrub / repair は呼び出し側が実行する前提で、定期実行の仕組みはまだない
+- Multipart Upload / CopyObject 未対応（Phase 3）。aws CLI は 8MB 超、rclone は 200MiB 超で multipart を使う
+- `x-amz-checksum-*`（ヘッダ・aws-chunked トレーラ）を検証していない。`Content-MD5` と `x-amz-content-sha256` は検証済み
+- 条件付きリクエスト（If-Match / If-None-Match / If-Modified-Since）未対応
+- scrub / repair は手動実行のみ（定期実行なし）
 - メタデータ更新前にクラッシュした場合や、オフラインのディスク上に残った孤立ファイルの GC がない
 - ディスクの恒久撤去（decommission）時に replicas 行を消す管理操作がない
 - `list_misreplicated` は objects の全件走査。数億件規模では見直しが必要

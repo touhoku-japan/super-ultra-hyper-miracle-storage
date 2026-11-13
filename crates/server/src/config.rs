@@ -1,13 +1,50 @@
-use std::{net::SocketAddr, path::Path};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context;
 use serde::Deserialize;
+use suhms_store::StoreConfig;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub server: ServerConfig,
     pub log: LogConfig,
+    pub storage: StoreConfig,
+    pub s3: S3Config,
+    pub auth: AuthConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct S3Config {
+    /// Region name clients sign requests for (and that GetBucketLocation reports).
+    pub region: String,
+    /// Base domains for virtual-hosted-style requests (`<bucket>.<domain>`). Path-style
+    /// requests always work.
+    pub domains: Vec<String>,
+    /// Largest single PutObject body, in bytes.
+    pub max_object_size: u64,
+}
+
+impl Default for S3Config {
+    fn default() -> Self {
+        Self {
+            region: "jp-1".to_owned(),
+            domains: Vec::new(),
+            max_object_size: 5 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthConfig {
+    /// File holding the hex master key that encrypts access key secrets. The
+    /// `SUHMS_MASTER_KEY` environment variable takes precedence.
+    pub master_key_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +108,9 @@ mod tests {
         let cfg: Config = toml::from_str(text).unwrap();
         assert_eq!(cfg.server.listen.port(), 9000);
         assert_eq!(cfg.log.format, LogFormat::Pretty);
+        assert_eq!(cfg.s3.region, "jp-1");
+        assert_eq!(cfg.storage.disks.len(), 3);
+        assert_eq!(cfg.storage.storage_classes.get("STANDARD"), Some(&3));
     }
 
     #[test]

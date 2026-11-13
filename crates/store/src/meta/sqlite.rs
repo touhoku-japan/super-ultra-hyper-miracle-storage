@@ -9,20 +9,22 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::{
-    BucketRecord, DeleteBucketOutcome, MetadataStore, ObjectRecord, ReplicaEntry, StoredObject,
+    AccessKeyRecord, BucketRecord, DeleteBucketOutcome, MetadataStore, ObjectRecord, ReplicaEntry,
+    StoredObject, TenantRecord, decode_user_metadata, encode_user_metadata,
 };
 use crate::{
     disk::DiskId,
     error::{Result, StoreError},
 };
 
-const SCHEMA: &str = include_str!("sqlite_schema.sql");
+/// Applied in order; each runs once, inside a transaction. Never edit a released migration.
+const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("migrations/sqlite/0001_init.sql"))];
 
 macro_rules! object_select {
     ($where:literal) => {
         concat!(
             "SELECT id, bucket, object_key, size, etag, blake3, content_type, storage_class, ",
-            "desired_replicas, replicas_explicit, created_at FROM objects WHERE ",
+            "user_metadata, desired_replicas, replicas_explicit, created_at FROM objects WHERE ",
             $where
         )
     };
@@ -48,12 +50,35 @@ impl SqliteMetadata {
             .max_connections(8)
             .connect_with(options)
             .await?;
-        sqlx::raw_sql(SCHEMA).execute(&pool).await?;
+        migrate(&pool).await?;
         Ok(Self {
             pool,
             write_lock: Mutex::new(()),
         })
     }
+}
+
+async fn migrate(pool: &SqlitePool) -> Result<()> {
+    sqlx::raw_sql("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)")
+        .execute(pool)
+        .await?;
+    let current: Option<i64> = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
+        .fetch_one(pool)
+        .await?;
+    for (version, sql) in MIGRATIONS {
+        if Some(*version) <= current {
+            continue;
+        }
+        let mut tx = pool.begin().await?;
+        sqlx::raw_sql(*sql).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO schema_migrations (version) VALUES (?)")
+            .bind(version)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        tracing::info!(version, "applied metadata migration");
+    }
+    Ok(())
 }
 
 fn parse_uuid(s: &str) -> Result<Uuid> {
@@ -75,9 +100,40 @@ fn object_from_row(row: &SqliteRow) -> Result<ObjectRecord> {
         blake3: row.try_get("blake3")?,
         content_type: row.try_get("content_type")?,
         storage_class: row.try_get("storage_class")?,
+        user_metadata: decode_user_metadata(row.try_get("user_metadata")?)?,
         desired_replicas: to_u8(row.try_get("desired_replicas")?)?,
         replicas_explicit: row.try_get("replicas_explicit")?,
         created_at: row.try_get("created_at")?,
+    })
+}
+
+fn bucket_from_row(r: &SqliteRow) -> Result<BucketRecord> {
+    Ok(BucketRecord {
+        name: r.try_get("name")?,
+        owner: r.try_get("owner")?,
+        replicas: r
+            .try_get::<Option<i64>, _>("replicas")?
+            .map(to_u8)
+            .transpose()?,
+        created_at: r.try_get("created_at")?,
+    })
+}
+
+fn tenant_from_row(r: &SqliteRow) -> Result<TenantRecord> {
+    Ok(TenantRecord {
+        id: r.try_get("id")?,
+        name: r.try_get("name")?,
+        created_at: r.try_get("created_at")?,
+    })
+}
+
+fn key_from_row(r: &SqliteRow) -> Result<AccessKeyRecord> {
+    Ok(AccessKeyRecord {
+        id: r.try_get("id")?,
+        tenant_id: r.try_get("tenant_id")?,
+        secret_enc: r.try_get("secret_enc")?,
+        active: r.try_get("active")?,
+        created_at: r.try_get("created_at")?,
     })
 }
 
@@ -126,6 +182,100 @@ async fn load_by_id(conn: &mut SqliteConnection, id: Uuid) -> Result<Option<Stor
 
 #[async_trait]
 impl MetadataStore for SqliteMetadata {
+    async fn create_tenant(&self, tenant: &TenantRecord) -> Result<bool> {
+        let _guard = self.write_lock.lock().await;
+        let res = sqlx::query(
+            "INSERT INTO tenants (id, name, created_at) VALUES (?, ?, ?) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(&tenant.id)
+        .bind(&tenant.name)
+        .bind(tenant.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn get_tenant(&self, id: &str) -> Result<Option<TenantRecord>> {
+        sqlx::query("SELECT id, name, created_at FROM tenants WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .as_ref()
+            .map(tenant_from_row)
+            .transpose()
+    }
+
+    async fn get_tenant_by_name(&self, name: &str) -> Result<Option<TenantRecord>> {
+        sqlx::query("SELECT id, name, created_at FROM tenants WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?
+            .as_ref()
+            .map(tenant_from_row)
+            .transpose()
+    }
+
+    async fn list_tenants(&self) -> Result<Vec<TenantRecord>> {
+        sqlx::query("SELECT id, name, created_at FROM tenants ORDER BY name")
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(tenant_from_row)
+            .collect()
+    }
+
+    async fn create_access_key(&self, key: &AccessKeyRecord) -> Result<()> {
+        let _guard = self.write_lock.lock().await;
+        sqlx::query(
+            "INSERT INTO access_keys (id, tenant_id, secret_enc, active, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&key.id)
+        .bind(&key.tenant_id)
+        .bind(&key.secret_enc)
+        .bind(key.active)
+        .bind(key.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_access_key(&self, id: &str) -> Result<Option<AccessKeyRecord>> {
+        sqlx::query(
+            "SELECT id, tenant_id, secret_enc, active, created_at FROM access_keys WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(key_from_row)
+        .transpose()
+    }
+
+    async fn list_access_keys(&self, tenant_id: &str) -> Result<Vec<AccessKeyRecord>> {
+        sqlx::query(
+            "SELECT id, tenant_id, secret_enc, active, created_at FROM access_keys \
+             WHERE tenant_id = ? ORDER BY created_at, id",
+        )
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(key_from_row)
+        .collect()
+    }
+
+    async fn set_access_key_active(&self, id: &str, active: bool) -> Result<bool> {
+        let _guard = self.write_lock.lock().await;
+        let res = sqlx::query("UPDATE access_keys SET active = ? WHERE id = ?")
+            .bind(active)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
     async fn set_node_disks_offline(&self, node_id: &str) -> Result<()> {
         let _guard = self.write_lock.lock().await;
         sqlx::query("UPDATE disks SET online = 0 WHERE node_id = ?")
@@ -153,10 +303,11 @@ impl MetadataStore for SqliteMetadata {
     async fn create_bucket(&self, bucket: &BucketRecord) -> Result<bool> {
         let _guard = self.write_lock.lock().await;
         let res = sqlx::query(
-            "INSERT INTO buckets (name, replicas, created_at) VALUES (?, ?, ?) \
+            "INSERT INTO buckets (name, owner, replicas, created_at) VALUES (?, ?, ?, ?) \
              ON CONFLICT (name) DO NOTHING",
         )
         .bind(&bucket.name)
+        .bind(&bucket.owner)
         .bind(bucket.replicas.map(i64::from))
         .bind(bucket.created_at)
         .execute(&self.pool)
@@ -165,21 +316,25 @@ impl MetadataStore for SqliteMetadata {
     }
 
     async fn get_bucket(&self, name: &str) -> Result<Option<BucketRecord>> {
-        let row = sqlx::query("SELECT name, replicas, created_at FROM buckets WHERE name = ?")
+        sqlx::query("SELECT name, owner, replicas, created_at FROM buckets WHERE name = ?")
             .bind(name)
             .fetch_optional(&self.pool)
-            .await?;
-        row.map(|r| {
-            Ok(BucketRecord {
-                name: r.try_get("name")?,
-                replicas: r
-                    .try_get::<Option<i64>, _>("replicas")?
-                    .map(to_u8)
-                    .transpose()?,
-                created_at: r.try_get("created_at")?,
-            })
-        })
-        .transpose()
+            .await?
+            .as_ref()
+            .map(bucket_from_row)
+            .transpose()
+    }
+
+    async fn list_buckets(&self, owner: &str) -> Result<Vec<BucketRecord>> {
+        sqlx::query(
+            "SELECT name, owner, replicas, created_at FROM buckets WHERE owner = ? ORDER BY name",
+        )
+        .bind(owner)
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(bucket_from_row)
+        .collect()
     }
 
     async fn set_bucket_replicas(
@@ -258,8 +413,8 @@ impl MetadataStore for SqliteMetadata {
 
         sqlx::query(
             "INSERT INTO objects (id, bucket, object_key, size, etag, blake3, content_type, \
-             storage_class, desired_replicas, replicas_explicit, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             storage_class, user_metadata, desired_replicas, replicas_explicit, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(object.id.to_string())
         .bind(&object.bucket)
@@ -269,6 +424,7 @@ impl MetadataStore for SqliteMetadata {
         .bind(&object.blake3)
         .bind(&object.content_type)
         .bind(&object.storage_class)
+        .bind(encode_user_metadata(&object.user_metadata))
         .bind(i64::from(object.desired_replicas))
         .bind(object.replicas_explicit)
         .bind(object.created_at)
@@ -307,6 +463,28 @@ impl MetadataStore for SqliteMetadata {
         }
         tx.commit().await?;
         Ok(previous)
+    }
+
+    async fn list_objects(
+        &self,
+        bucket: &str,
+        from: &str,
+        after: &str,
+        limit: u32,
+    ) -> Result<Vec<ObjectRecord>> {
+        // SQLite's default BINARY collation compares UTF-8 bytes, which is S3's key order.
+        sqlx::query(object_select!(
+            "bucket = ? AND object_key >= ? AND object_key > ? ORDER BY object_key LIMIT ?"
+        ))
+        .bind(bucket)
+        .bind(from)
+        .bind(after)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(object_from_row)
+        .collect()
     }
 
     async fn add_replica(&self, object_id: Uuid, disk_id: DiskId) -> Result<bool> {

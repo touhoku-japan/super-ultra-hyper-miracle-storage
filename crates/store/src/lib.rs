@@ -5,6 +5,7 @@ mod blob;
 pub mod config;
 pub mod disk;
 pub mod error;
+pub mod list;
 pub mod meta;
 pub mod placement;
 mod store;
@@ -12,6 +13,7 @@ mod store;
 pub use crate::{
     config::StoreConfig,
     error::{Result, StoreError},
-    meta::{BucketRecord, ObjectRecord},
+    list::{ListPage, ListParams, ListStart},
+    meta::{AccessKeyRecord, BucketRecord, ObjectRecord, TenantRecord},
     store::{PutObjectRequest, RepairReport, ScrubReport, Store},
 };
