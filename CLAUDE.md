@@ -80,6 +80,7 @@ release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレ
 
 ## ドキュメント・デプロイ
 
+- `docs/TODO.md` — やり残し（バックログ）。項目を片付けたらここと下の「未対応」を更新する
 - `docs/sorahost-integration.md` — SoraHost ポータル（dev-sorahost）から管理 API を使う仕様（課金計算を含む）。
   `docs/examples/SuhmsAdminClient.php` は Laravel 用クライアント例。**dev-sorahost 側の実装はこのリポジトリでは行わない**
 - `deploy/suhms.service`（systemd）、`deploy/nginx.conf`（TLS 終端。管理 API とノード間 API は公開しない）
