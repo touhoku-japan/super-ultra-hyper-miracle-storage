@@ -1,0 +1,12 @@
+# suhms の設定ファイル例。`suhms --config config.toml` で読み込む。
+# 未指定の項目はデフォルト値になる。
+
+[server]
+# S3 API の待ち受けアドレス
+listen = "127.0.0.1:9000"
+
+[log]
+# "pretty"（開発向け）または "json"（本番向け）
+format = "pretty"
+# RUST_LOG 環境変数が設定されていればそちらを優先する
+level = "info"
