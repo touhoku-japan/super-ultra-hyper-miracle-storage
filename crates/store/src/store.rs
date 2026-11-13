@@ -1126,13 +1126,14 @@ impl Store {
         if max == 0 {
             return Ok(page);
         }
-        // Upload ids are lowercase UUIDs, which all sort before "~".
+        // Without an upload id marker, S3 starts after every upload of `key_marker`. Skipped
+        // here rather than with a sentinel id, whose sort order would depend on the database
+        // collation.
+        let skip_key =
+            (upload_id_marker.is_empty() && !key_marker.is_empty()).then(|| key_marker.to_owned());
         let (mut key, mut id) = match rolled_up(key_marker, prefix, delimiter) {
             Some(cp) if cp.len() == key_marker.len() => {
                 (format!("{key_marker}{PREFIX_SKIP}"), String::new())
-            }
-            _ if upload_id_marker.is_empty() && !key_marker.is_empty() => {
-                (key_marker.to_owned(), "~".to_owned())
             }
             _ => (key_marker.to_owned(), upload_id_marker.to_owned()),
         };
@@ -1145,6 +1146,11 @@ impl Store {
             for u in batch {
                 if !u.key.starts_with(prefix) {
                     break 'fetch;
+                }
+                if skip_key.as_deref() == Some(u.key.as_str()) {
+                    key.clone_from(&u.key);
+                    id = u.id.to_string();
+                    continue;
                 }
                 if page.uploads.len() + page.common_prefixes.len() == max {
                     page.truncated = true;
