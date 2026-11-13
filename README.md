@@ -4,6 +4,18 @@ Super-Ultra-Hyper-Miracle Storage is HTTP Storage Server
 S3 互換のオブジェクトストレージ（Rust 製）。SoraHost の社内バックアップおよび顧客向けの外販を想定し、
 マルチテナント・Erasure Coding による複数ディスク/複数ノードの冗長化を目標とする。
 
+## 機能
+
+- S3 互換 API（SigV4 / presigned URL / aws-chunked、マルチパート、コピー、Range、条件付きリクエスト、チェックサム検証）
+- オブジェクトは**普通のファイルとしてそのまま保存**。レプリカ数 1〜3 をバケット/ストレージクラスごとに選択、複数ノードに分散
+- 複数ノードのクラスタ（ノード障害時も読み書き継続、復旧後に自動修復）、scrub によるビット腐敗検出と修復
+- メタデータ DB: SQLite（単一ノード）/ PostgreSQL / MariaDB
+- マルチテナント: テナントごとのアクセスキー、容量クォータ、停止、レート制限、課金用の使用量計測、管理 API
+- バージョニング、Object Lock（WORM）、ライフサイクル、CORS、公開バケット
+
+ドキュメント: [`docs/sorahost-integration.md`](docs/sorahost-integration.md)（SoraHost 連携・課金）、
+[`deploy/`](deploy/)（systemd・nginx）、[`config.example.toml`](config.example.toml)（全設定項目）
+
 ## 使い方
 
 ```sh
