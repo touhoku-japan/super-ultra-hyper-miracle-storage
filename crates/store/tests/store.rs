@@ -1580,6 +1580,7 @@ async fn lifecycle_transitions_change_replica_count() {
         transitions: vec![Transition {
             days: 0,
             storage_class: "GLACIER".into(),
+            ..Transition::default()
         }],
         ..LifecycleRule::default()
     }];
@@ -1594,10 +1595,12 @@ async fn lifecycle_transitions_change_replica_count() {
         Transition {
             days: 0,
             storage_class: "STANDARD_IA".into(),
+            ..Transition::default()
         },
         Transition {
             days: 30,
             storage_class: "REDUCED_REDUNDANCY".into(),
+            ..Transition::default()
         },
     ];
     store
@@ -1620,4 +1623,111 @@ async fn lifecycle_transitions_change_replica_count() {
         usize::from(want)
     );
     assert_eq!(store.apply_lifecycle().await.unwrap().transitioned, 0);
+}
+
+#[tokio::test]
+async fn lifecycle_size_filters_and_dates() {
+    use suhms_store::lifecycle::LifecycleRule;
+    let env = Env::new(1).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "lsz", Some(1)).await.unwrap();
+    for (k, size) in [("small", 10usize), ("mid", 100), ("big", 1000)] {
+        store
+            .put_object(OWNER, put("lsz", k, None), &vec![0u8; size][..])
+            .await
+            .unwrap();
+    }
+    // Strict bounds, as in S3: only "mid" is > 10 and < 1000.
+    let mut rules = vec![LifecycleRule {
+        id: "size".into(),
+        enabled: true,
+        expiration_days: Some(0),
+        min_size: Some(10),
+        max_size: Some(1000),
+        ..LifecycleRule::default()
+    }];
+    store
+        .set_lifecycle(OWNER, "lsz", Some(&rules))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    assert_eq!(store.apply_lifecycle().await.unwrap().expired, 1);
+    assert!(store.head_object(OWNER, "lsz", "mid").await.is_err());
+
+    // A date in the future does nothing; once reached, every current object expires.
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    rules[0] = LifecycleRule {
+        id: "date".into(),
+        enabled: true,
+        expiration_date: Some(now + 86_400_000),
+        ..LifecycleRule::default()
+    };
+    store
+        .set_lifecycle(OWNER, "lsz", Some(&rules))
+        .await
+        .unwrap();
+    assert_eq!(store.apply_lifecycle().await.unwrap().expired, 0);
+    rules[0].expiration_date = Some(now - 1);
+    store
+        .set_lifecycle(OWNER, "lsz", Some(&rules))
+        .await
+        .unwrap();
+    assert_eq!(store.apply_lifecycle().await.unwrap().expired, 2);
+}
+
+#[tokio::test]
+async fn lifecycle_keeps_newer_noncurrent_versions() {
+    use suhms_store::lifecycle::LifecycleRule;
+    let env = Env::new(1).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "lnn", Some(1)).await.unwrap();
+    store.set_versioning(OWNER, "lnn", "Enabled").await.unwrap();
+    for i in 0..5u8 {
+        store
+            .put_object(OWNER, put("lnn", "k", None), &[i][..])
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    // 1 current + 4 noncurrent; keep the 2 newest noncurrent ones.
+    let rules = vec![LifecycleRule {
+        id: "keep2".into(),
+        enabled: true,
+        noncurrent_days: Some(0),
+        newer_noncurrent_versions: Some(2),
+        ..LifecycleRule::default()
+    }];
+    store
+        .set_lifecycle(OWNER, "lnn", Some(&rules))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    assert_eq!(store.apply_lifecycle().await.unwrap().purged, 2);
+    let vs = versions(&store, "lnn").await;
+    assert_eq!(vs.len(), 3, "{vs:?}");
+    // The survivors are the newest three writes (bytes 4, 3, 2).
+    let mut kept = Vec::new();
+    for (_, v, _, _) in &vs {
+        let o = store
+            .get_object_version(OWNER, "lnn", "k", v)
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        store
+            .read_object(&o, 0..o.object.size)
+            .await
+            .unwrap()
+            .read_to_end(&mut buf)
+            .await
+            .unwrap();
+        kept.extend(buf);
+    }
+    assert_eq!(kept, [4, 3, 2]);
+    assert_eq!(store.apply_lifecycle().await.unwrap().purged, 0);
 }

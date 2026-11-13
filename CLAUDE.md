@@ -29,6 +29,10 @@ release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレ
       不一致は EOF で読み取りエラーにし、store がコミット前に書き込みを捨てる。計算結果は `ChecksumSlot` 経由で
       store に渡り、objects / multipart_parts の `checksum` 列に JSON（algorithm / type / value）で保存。
       GET/HEAD は `x-amz-checksum-mode: ENABLED` のときだけ返す（Range 付きは返さない）。
+      `checksum::Policy` で保存するアルゴリズムを決める: 指定なしのアップロードは S3 と同じく CRC64NVME（`DEFAULT_ALGO`）を
+      付け、クライアントが別アルゴリズムを送ればそれも同時に計算して検証する。アルゴリズム指定なしのマルチパートは
+      パートに CRC64NVME を持たせ、完了時に FULL_OBJECT の CRC64NVME を合成する。対応アルゴリズムは CRC32 / CRC32C /
+      CRC64NVME / SHA1 / SHA256 / SHA512 / MD5 / XXHASH64 / XXHASH3 / XXHASH128（FULL_OBJECT は CRC 系のみ）。
       マルチパートは作成時にアルゴリズムと型を決め（upload の `checksum` 列）、各パートはサーバ側でも計算する。
       完了時に COMPOSITE（パートのチェックサムを連結してハッシュ + `-N`）か FULL_OBJECT（CRC をパートから
       `crc_fast::checksum_combine` で合成。データは読み直さない）を求める。コピーは要求されたアルゴリズム、
@@ -79,7 +83,9 @@ release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレ
   （他の版が無い削除マーカーの削除）、transition / noncurrent transition、未完了マルチパートの中止。prefix 単位。
   leader が 1 時間ごとに `Store::apply_lifecycle`。transition は「ストレージクラス＝レプリカ数」の変更
   （`set_object_storage_class` で desired_replicas を変え、repair がコピーを増減）。複数の transition は日数が最大の
-  ものだけを適用。設定時に未知のストレージクラスは InvalidStorageClass。Date 指定（日付での期限・移行）は未対応
+  ものだけを適用。設定時に未知のストレージクラスは InvalidStorageClass。期限・移行は日数か Date（その日時以降は全対象）、
+  フィルタは prefix と ObjectSizeGreaterThan / LessThan（`And` 可）、NewerNoncurrentVersions（キーごとに新しい非現行版を
+  N 個残す）に対応。タグでのフィルタはオブジェクトタグ自体が無いので NotImplemented
 - 書き込みの前提条件（`meta::WriteCondition`）: PUT / CompleteMultipartUpload の `If-None-Match: *` と `If-Match`
   （ETag か `*`）。メタデータのトランザクション内で最新版に対して判定（無ければ NoSuchKey、不一致は 412）
 - versionId 付きのコピー元（CopyObject / UploadPartCopy）。応答に `x-amz-copy-source-version-id`。
@@ -96,8 +102,8 @@ release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレ
   Put/Get（Range）/Head/Delete Object, DeleteObjects, ListObjects V1/V2（encoding-type=url 対応）, presigned URL,
   CopyObject（COPY/REPLACE）, Create/UploadPart/UploadPartCopy/Complete/Abort MultipartUpload, ListParts, ListMultipartUploads,
   条件付きリクエスト（GET/HEAD の If-Match / If-None-Match / If-(Un)Modified-Since、PUT / CompleteMultipartUpload の
-  If-Match / If-None-Match: *）, チェックサム（CRC32 / CRC32C / CRC64NVME / SHA1 / SHA256、マルチパートの COMPOSITE /
-  FULL_OBJECT）, versionId 付きコピー元, ListObjectVersions / ListMultipartUploads の delimiter,
+  If-Match / If-None-Match: *）, チェックサム（CRC32 / CRC32C / CRC64NVME / SHA1 / SHA256 / SHA512 / MD5 / xxHash 系、
+  マルチパートの COMPOSITE / FULL_OBJECT、未指定時の CRC64NVME）, versionId 付きコピー元, ListObjectVersions / ListMultipartUploads の delimiter,
   Put/GetBucketVersioning, ListObjectVersions, versionId 付き GET/HEAD/DELETE, Put/Get/DeleteBucketLifecycleConfiguration,
   Put/GetObjectLockConfiguration, Put/GetObjectRetention, Put/GetObjectLegalHold, Put/Get/DeleteBucketCors
 
@@ -143,9 +149,8 @@ MIT ライセンス。依存クレートは `deny.toml` の許可リスト（MIT
 - PostgreSQL / MariaDB はこのホストでは未検証（CI の `metadata-backends` ジョブでサービスコンテナに対して store のテストを実行）。
   ローカルで試すなら `SUHMS_TEST_POSTGRES=postgres://... cargo test -p suhms-store`（テストごとに DB を作る）
 - `[cluster.tls]` を設定しないとノード間通信は平文 HTTP（HMAC 認証のみ）。その場合はプライベートネットワークか WireGuard 等で保護すること
-- チェックサムを指定しないアップロードにはチェックサムを付けない（AWS の既定 CRC64NVME 自動付与はしない）。
-  アルゴリズム未指定のマルチパートも同様。MD5 / SHA512 / xxHash 系のチェックサムは未対応
-- ライフサイクルの Date 指定、NewerNoncurrentVersions、タグ・サイズによるフィルタは未対応
+- オブジェクトタグ（Put/GetObjectTagging）が無いので、ライフサイクルのタグフィルタも未対応
+- 既定チェックサム（CRC64NVME）は既定チェックサム導入前に保存したオブジェクト・パートには付かない（後から計算し直す処理はない）
 - メタデータ更新前にクラッシュした場合や、オフラインのディスク上に残った孤立ファイルの GC がない
 - ディスクの恒久撤去（decommission）時に replicas 行を消す管理操作がない
 - `list_misreplicated` は objects の全件走査。数億件規模では見直しが必要

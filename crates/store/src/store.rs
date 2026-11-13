@@ -1874,33 +1874,43 @@ impl Store {
                 continue;
             };
             for rule in rules.iter().filter(|r| r.enabled) {
-                let days = |d: u32| now - i64::from(d) * 86_400_000;
                 report.transitioned += self
-                    .lifecycle_transitions(&b.name, &rule.prefix, false, &rule.transitions, now)
+                    .lifecycle_transitions(&b.name, rule, false, &rule.transitions, now)
                     .await?;
                 report.transitioned += self
-                    .lifecycle_transitions(
-                        &b.name,
-                        &rule.prefix,
-                        true,
-                        &rule.noncurrent_transitions,
-                        now,
-                    )
+                    .lifecycle_transitions(&b.name, rule, true, &rule.noncurrent_transitions, now)
                     .await?;
-                if let Some(d) = rule.expiration_days {
+                if let Some(cut) =
+                    lifecycle::cutoff(now, rule.expiration_days, rule.expiration_date)
+                {
                     for o in self
-                        .lifecycle_scan(&b.name, &rule.prefix, LifecycleScan::Current, days(d))
+                        .lifecycle_scan(&b.name, &rule.prefix, LifecycleScan::Current, cut)
                         .await?
+                        .into_iter()
+                        .filter(|o| rule.matches_size(o.size, false))
                     {
                         self.delete_object(&b.owner, &b.name, &o.key).await?;
                         report.expired += 1;
                     }
                 }
-                if let Some(d) = rule.noncurrent_days {
-                    for o in self
-                        .lifecycle_scan(&b.name, &rule.prefix, LifecycleScan::Noncurrent, days(d))
-                        .await?
-                    {
+                if let Some(cut) = lifecycle::cutoff(now, rule.noncurrent_days, None) {
+                    let candidates = self
+                        .lifecycle_scan(&b.name, &rule.prefix, LifecycleScan::Noncurrent, cut)
+                        .await?;
+                    let mut ranks = HashMap::new();
+                    for o in candidates {
+                        if !rule.matches_size(o.size, o.delete_marker)
+                            || !self
+                                .beyond_newer(
+                                    &b.name,
+                                    &o,
+                                    rule.newer_noncurrent_versions,
+                                    &mut ranks,
+                                )
+                                .await?
+                        {
+                            continue;
+                        }
                         match self
                             .delete_object_version(&b.owner, &b.name, &o.key, &o.version_id, false)
                             .await
@@ -1931,8 +1941,7 @@ impl Store {
                         }
                     }
                 }
-                if let Some(d) = rule.abort_multipart_days {
-                    let cutoff = days(d);
+                if let Some(cutoff) = lifecycle::cutoff(now, rule.abort_multipart_days, None) {
                     let uploads = self
                         .meta
                         .list_uploads(&b.name, &rule.prefix, "", "", 1000)
@@ -1949,6 +1958,43 @@ impl Store {
         Ok(report)
     }
 
+    /// For `NewerNoncurrentVersions`: whether noncurrent version `o` is older than the `keep`
+    /// newest noncurrent versions of its key. `ranks` caches each key's ranking.
+    async fn beyond_newer(
+        &self,
+        bucket: &str,
+        o: &ObjectRecord,
+        keep: Option<u32>,
+        ranks: &mut HashMap<String, HashMap<Uuid, usize>>,
+    ) -> Result<bool> {
+        let Some(keep) = keep else { return Ok(true) };
+        if !ranks.contains_key(&o.key) {
+            let mut rank = HashMap::new();
+            let mut after = (o.key.clone(), i64::MAX, String::new());
+            let mut n = 0;
+            loop {
+                let page = self
+                    .meta
+                    .list_object_versions(bucket, &o.key, (&after.0, after.1, &after.2), PAGE)
+                    .await?;
+                let mine: Vec<&ObjectRecord> = page.iter().filter(|v| v.key == o.key).collect();
+                for v in mine.iter().filter(|v| !v.is_latest) {
+                    rank.insert(v.id, n);
+                    n += 1;
+                }
+                match page.last() {
+                    Some(last) if last.key == o.key && page.len() == PAGE as usize => {
+                        after = (last.key.clone(), last.created_at, last.id.to_string());
+                    }
+                    _ => break,
+                }
+            }
+            ranks.insert(o.key.clone(), rank);
+        }
+        let rank = ranks[&o.key].get(&o.id).copied().unwrap_or(usize::MAX);
+        Ok(rank >= keep as usize)
+    }
+
     /// Whether `o` is the only version of its key.
     async fn only_version(&self, bucket: &str, o: &ObjectRecord) -> Result<bool> {
         let versions = self
@@ -1961,39 +2007,60 @@ impl Store {
             .all(|v| v.id == o.id))
     }
 
-    /// Moves versions old enough for a transition to its storage class (the one with the
-    /// most days that applies). Returns how many versions changed class.
+    /// Moves versions old enough for a transition to its storage class (the transition whose
+    /// cutoff is earliest wins, i.e. the one with the most days). Returns how many versions
+    /// changed class.
     async fn lifecycle_transitions(
         &self,
         bucket: &str,
-        prefix: &str,
+        rule: &LifecycleRule,
         noncurrent: bool,
         transitions: &[Transition],
         now: i64,
     ) -> Result<u64> {
-        let mut sorted: Vec<&Transition> = transitions.iter().collect();
-        sorted.sort_by_key(|t| std::cmp::Reverse(t.days));
+        let mut active: Vec<(i64, &Transition)> = transitions
+            .iter()
+            .filter_map(|t| {
+                let days = (t.date.is_none()).then_some(t.days);
+                lifecycle::cutoff(now, days, t.date).map(|c| (c, t))
+            })
+            .collect();
+        active.sort_by_key(|(c, _)| *c);
+        let scan = if noncurrent {
+            LifecycleScan::Noncurrent
+        } else {
+            LifecycleScan::Current
+        };
         let mut moved = 0;
-        // Versions older than this belong to a transition with more days.
+        let mut ranks = HashMap::new();
+        // Versions older than this belong to a transition with an earlier cutoff.
         let mut older_cutoff = i64::MIN;
-        for t in sorted {
+        for (cutoff, t) in active {
             let Some(&replicas) = self.config.storage_classes.get(&t.storage_class) else {
                 tracing::warn!(bucket, class = %t.storage_class, "lifecycle transition to unknown storage class");
                 continue;
             };
-            let scan = if noncurrent {
-                LifecycleScan::Noncurrent
-            } else {
-                LifecycleScan::Current
-            };
-            let cutoff = now - i64::from(t.days) * 86_400_000;
-            for o in self.lifecycle_scan(bucket, prefix, scan, cutoff).await? {
+            for o in self
+                .lifecycle_scan(bucket, &rule.prefix, scan, cutoff)
+                .await?
+            {
                 let age_from = if noncurrent {
                     o.noncurrent_at.unwrap_or(o.created_at)
                 } else {
                     o.created_at
                 };
-                if age_from < older_cutoff || o.storage_class.as_deref() == Some(&t.storage_class) {
+                if age_from < older_cutoff
+                    || o.delete_marker
+                    || o.storage_class.as_deref() == Some(&t.storage_class)
+                    || !rule.matches_size(o.size, false)
+                {
+                    continue;
+                }
+                if noncurrent
+                    && !self
+                        .beyond_newer(bucket, &o, t.newer_noncurrent_versions, &mut ranks)
+                        .await?
+                {
                     continue;
                 }
                 if self
