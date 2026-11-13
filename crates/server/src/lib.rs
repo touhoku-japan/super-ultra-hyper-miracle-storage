@@ -16,16 +16,29 @@ use std::{convert::Infallible, sync::Arc};
 use axum::{
     Router,
     body::Body,
-    http::{Request, Response, StatusCode},
-    routing::get,
+    http::{Method, Request, Response, StatusCode},
 };
 use suhms_store::Store;
 use tower_http::trace::TraceLayer;
 
 use crate::{config::Config, crypto::SecretCipher, tenancy::Tenancy};
 
-/// Health check path. Bucket names cannot start with `_`, so this never shadows a bucket.
-pub const HEALTH_PATH: &str = "/_suhms/health";
+/// Health check path. `suhms` is a reserved bucket name ([`suhms_store::RESERVED_BUCKETS`]), so
+/// on path-style requests this never shadows a bucket; virtual-hosted requests for a bucket
+/// (`<bucket>.<domain>/suhms/health`) still reach the object of that key.
+pub const HEALTH_PATH: &str = "/suhms/health";
+
+/// Whether the request's Host names a bucket under one of the virtual-hosting `domains`.
+fn is_bucket_host(req: &Request<Body>, domains: &[String]) -> bool {
+    let Some(host) = req.headers().get("host").and_then(|h| h.to_str().ok()) else {
+        return false;
+    };
+    let host = host.split(':').next().unwrap_or(host);
+    domains.iter().any(|d| {
+        host.strip_suffix(d.as_str())
+            .is_some_and(|rest| rest.len() > 1 && rest.ends_with('.'))
+    })
+}
 
 /// Builds the HTTP application: the health check plus the S3 API for every other path.
 pub fn app(
@@ -58,9 +71,16 @@ pub fn app(
     }
     let s3_service = builder.build();
 
+    let domains: Arc<[String]> = config.s3.domains.clone().into();
     let fallback = tower::service_fn(move |req: Request<Body>| {
         let mut svc = s3_service.clone();
+        let health = req.uri().path() == HEALTH_PATH
+            && matches!(*req.method(), Method::GET | Method::HEAD)
+            && !is_bucket_host(&req, &domains);
         async move {
+            if health {
+                return Ok::<_, Infallible>(Response::new(Body::from("ok")));
+            }
             let response = match tower::Service::call(&mut svc, req).await {
                 Ok(resp) => resp.map(Body::new),
                 Err(error) => {
@@ -76,7 +96,6 @@ pub fn app(
     });
 
     Ok(Router::new()
-        .route(HEALTH_PATH, get(|| async { "ok" }))
         .fallback_service(fallback)
         .layer(axum::middleware::from_fn_with_state(
             cors::CorsState {
@@ -132,4 +151,26 @@ async fn audit(req: Request<Body>, next: axum::middleware::Next) -> Response<Bod
         "s3 request"
     );
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(host: &str) -> Request<Body> {
+        Request::get(HEALTH_PATH)
+            .header("host", host)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn bucket_hosts_are_not_health_checks() {
+        let domains = ["s3.sorahost.net".to_owned()];
+        assert!(is_bucket_host(&req("photos.s3.sorahost.net"), &domains));
+        assert!(is_bucket_host(&req("photos.s3.sorahost.net:443"), &domains));
+        assert!(!is_bucket_host(&req("s3.sorahost.net"), &domains));
+        assert!(!is_bucket_host(&req("evils3.sorahost.net"), &domains));
+        assert!(!is_bucket_host(&req("localhost:9000"), &[]));
+    }
 }

@@ -206,9 +206,16 @@ fn spawn_maintenance(
     every(secs(3600), "lifecycle", move || {
         let s = Arc::clone(&s);
         async move {
-            let (expired, purged, aborted) = s.apply_lifecycle().await?;
-            if expired + purged + aborted > 0 {
-                tracing::info!(expired, purged, aborted, "lifecycle applied");
+            let r = s.apply_lifecycle().await?;
+            if r != suhms_store::LifecycleReport::default() {
+                tracing::info!(
+                    expired = r.expired,
+                    purged = r.purged,
+                    markers = r.markers,
+                    transitioned = r.transitioned,
+                    aborted = r.aborted,
+                    "lifecycle applied"
+                );
             }
             Ok(())
         }

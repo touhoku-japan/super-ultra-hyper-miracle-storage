@@ -40,5 +40,5 @@ rclone mkdir s:backups && rclone copy ./data s:backups/
 
 ```sh
 CARGO_BUILD_JOBS=1 cargo test --workspace
-curl http://127.0.0.1:9000/_suhms/health
+curl http://127.0.0.1:9000/suhms/health
 ```

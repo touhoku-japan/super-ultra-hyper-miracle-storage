@@ -6,10 +6,11 @@ use sqlx::{
 use uuid::Uuid;
 
 use super::{
-    AccessKeyRecord, BucketRecord, BucketSetting, DeleteBucketOutcome, DiskRecord, MetadataStore,
-    NULL_VERSION, ObjectRecord, PartRecord, ReplicaEntry, StorageUsage, StoredObject, TenantRecord,
-    TenantUpdate, UploadRecord, UsageDelta, UsageRow, VersioningMode, decode_disks,
-    decode_user_metadata, encode_disks, encode_user_metadata, is_retryable,
+    AccessKeyRecord, BucketRecord, BucketSetting, DeleteBucketOutcome, DiskRecord, LifecycleScan,
+    MetadataStore, NULL_VERSION, ObjectRecord, PartRecord, ReplicaEntry, StorageUsage,
+    StoredObject, TenantRecord, TenantUpdate, UploadRecord, UsageDelta, UsageRow, VersioningMode,
+    WriteCondition, decode_disks, decode_user_metadata, encode_disks, encode_user_metadata,
+    is_retryable,
 };
 use crate::{
     disk::DiskId,
@@ -21,6 +22,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("migrations/mysql/0001_init.sql")),
     (2, include_str!("migrations/mysql/0002_commercial.sql")),
     (3, include_str!("migrations/mysql/0003_versioning.sql")),
+    (4, include_str!("migrations/mysql/0004_checksums.sql")),
 ];
 
 macro_rules! object_select {
@@ -28,7 +30,7 @@ macro_rules! object_select {
         concat!(
             "SELECT id, bucket, object_key, size, etag, blake3, content_type, storage_class, ",
             "user_metadata, desired_replicas, replicas_explicit, created_at, version_id, ",
-            "is_latest, delete_marker, noncurrent_at, lock_mode, lock_until, legal_hold ",
+            "is_latest, delete_marker, noncurrent_at, lock_mode, lock_until, legal_hold, checksum ",
             "FROM objects WHERE ",
             $where
         )
@@ -46,7 +48,7 @@ impl MysqlMetadata {
         &self,
         object: &ObjectRecord,
         replicas: &[DiskId],
-        if_absent: bool,
+        cond: &WriteCondition,
         mode: VersioningMode,
     ) -> Result<Vec<StoredObject>> {
         let mut tx = self.pool.begin().await?;
@@ -58,7 +60,7 @@ impl MysqlMetadata {
         if !bucket_exists {
             return Err(StoreError::NoSuchBucket(object.bucket.clone()));
         }
-        let removed = place_version(&mut tx, object, replicas, if_absent, mode).await?;
+        let removed = place_version(&mut tx, object, replicas, cond, mode).await?;
         tx.commit().await?;
         Ok(removed)
     }
@@ -68,6 +70,7 @@ impl MysqlMetadata {
         upload_id: Uuid,
         object: &ObjectRecord,
         replicas: &[DiskId],
+        cond: &WriteCondition,
         mode: VersioningMode,
     ) -> Result<(Vec<PartRecord>, Vec<StoredObject>)> {
         let mut tx = self.pool.begin().await?;
@@ -79,7 +82,7 @@ impl MysqlMetadata {
         if res.rows_affected() == 0 {
             return Err(StoreError::NoSuchUpload);
         }
-        let removed = place_version(&mut tx, object, replicas, false, mode).await?;
+        let removed = place_version(&mut tx, object, replicas, cond, mode).await?;
         tx.commit().await?;
         Ok((parts, removed))
     }
@@ -170,6 +173,7 @@ fn object_from_row(row: &MySqlRow) -> Result<ObjectRecord> {
         lock_mode: row.try_get("lock_mode")?,
         lock_until: row.try_get("lock_until")?,
         legal_hold: row.try_get("legal_hold")?,
+        checksum: row.try_get("checksum")?,
     })
 }
 
@@ -194,7 +198,7 @@ macro_rules! upload_select {
     ($where:literal) => {
         concat!(
             "SELECT id, bucket, object_key, content_type, storage_class, user_metadata, ",
-            "desired_replicas, replicas_explicit, disks, created_at FROM multipart_uploads WHERE ",
+            "desired_replicas, replicas_explicit, disks, created_at, checksum FROM multipart_uploads WHERE ",
             $where
         )
     };
@@ -203,7 +207,7 @@ macro_rules! upload_select {
 macro_rules! part_select {
     ($where:literal) => {
         concat!(
-            "SELECT upload_id, part_number, blob_id, size, etag, blake3, disks, created_at ",
+            "SELECT upload_id, part_number, blob_id, size, etag, blake3, disks, created_at, checksum ",
             "FROM multipart_parts WHERE ",
             $where
         )
@@ -222,6 +226,7 @@ fn upload_from_row(r: &MySqlRow) -> Result<UploadRecord> {
         replicas_explicit: r.try_get("replicas_explicit")?,
         disks: decode_disks(r.try_get("disks")?)?,
         created_at: r.try_get("created_at")?,
+        checksum: r.try_get("checksum")?,
     })
 }
 
@@ -237,6 +242,7 @@ fn part_from_row(r: &MySqlRow) -> Result<PartRecord> {
         blake3: r.try_get("blake3")?,
         disks: decode_disks(r.try_get("disks")?)?,
         created_at: r.try_get("created_at")?,
+        checksum: r.try_get("checksum")?,
     })
 }
 
@@ -263,8 +269,8 @@ async fn insert_object(
     sqlx::query(
         "INSERT INTO objects (id, bucket, object_key, size, etag, blake3, content_type, \
          storage_class, user_metadata, desired_replicas, replicas_explicit, created_at, \
-         version_id, is_latest, delete_marker, lock_mode, lock_until, legal_hold) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, ?, ?, ?, ?)",
+         version_id, is_latest, delete_marker, lock_mode, lock_until, legal_hold, checksum) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, ?, ?, ?, ?, ?)",
     )
     .bind(object.id.to_string())
     .bind(&object.bucket)
@@ -283,6 +289,7 @@ async fn insert_object(
     .bind(&object.lock_mode)
     .bind(object.lock_until)
     .bind(object.legal_hold)
+    .bind(&object.checksum)
     .execute(&mut *conn)
     .await?;
     for disk in replicas {
@@ -351,13 +358,15 @@ async fn place_version(
     conn: &mut MySqlConnection,
     object: &ObjectRecord,
     replicas: &[DiskId],
-    if_absent: bool,
+    cond: &WriteCondition,
     mode: VersioningMode,
 ) -> Result<Vec<StoredObject>> {
     let latest = load_by_key(conn, &object.bucket, &object.key).await?;
-    if if_absent && latest.as_ref().is_some_and(|l| !l.object.delete_marker) {
-        return Err(StoreError::PreconditionFailed);
-    }
+    cond.check(
+        latest.as_ref().map(|l| &l.object),
+        &object.bucket,
+        &object.key,
+    )?;
     let mut removed = Vec::new();
     match mode {
         VersioningMode::Unversioned => {
@@ -456,15 +465,12 @@ impl MetadataStore for MysqlMetadata {
         &self,
         object: &ObjectRecord,
         replicas: &[DiskId],
-        if_absent: bool,
+        cond: &WriteCondition,
         mode: VersioningMode,
     ) -> Result<Vec<StoredObject>> {
         let mut attempt = 0;
         loop {
-            match self
-                .put_object_once(object, replicas, if_absent, mode)
-                .await
-            {
+            match self.put_object_once(object, replicas, cond, mode).await {
                 Err(e) if attempt < 5 && is_retryable(&e) => attempt += 1,
                 other => return other,
             }
@@ -476,12 +482,13 @@ impl MetadataStore for MysqlMetadata {
         upload_id: Uuid,
         object: &ObjectRecord,
         replicas: &[DiskId],
+        cond: &WriteCondition,
         mode: VersioningMode,
     ) -> Result<(Vec<PartRecord>, Vec<StoredObject>)> {
         let mut attempt = 0;
         loop {
             match self
-                .complete_upload_once(upload_id, object, replicas, mode)
+                .complete_upload_once(upload_id, object, replicas, cond, mode)
                 .await
             {
                 Err(e) if attempt < 5 && is_retryable(&e) => attempt += 1,
@@ -718,22 +725,26 @@ impl MetadataStore for MysqlMetadata {
         &self,
         bucket: &str,
         prefix: &str,
-        noncurrent: bool,
+        scan: LifecycleScan,
         before: i64,
         after: (&str, &str),
         limit: u32,
     ) -> Result<Vec<ObjectRecord>> {
-        let sql = if noncurrent {
-            object_select!(
+        let sql = match scan {
+            LifecycleScan::Noncurrent => object_select!(
                 "bucket = ? AND object_key >= ? AND (object_key, id) > (?, ?) \
                  AND is_latest = FALSE AND noncurrent_at < ? ORDER BY object_key, id LIMIT ?"
-            )
-        } else {
-            object_select!(
+            ),
+            LifecycleScan::Current => object_select!(
                 "bucket = ? AND object_key >= ? AND (object_key, id) > (?, ?) \
                  AND is_latest = TRUE AND delete_marker = FALSE AND created_at < ? \
                  ORDER BY object_key, id LIMIT ?"
-            )
+            ),
+            LifecycleScan::DeleteMarkers => object_select!(
+                "bucket = ? AND object_key >= ? AND (object_key, id) > (?, ?) \
+                 AND is_latest = TRUE AND delete_marker = TRUE AND created_at < ? \
+                 ORDER BY object_key, id LIMIT ?"
+            ),
         };
         sqlx::query(sql)
             .bind(bucket)
@@ -761,6 +772,24 @@ impl MetadataStore for MysqlMetadata {
             .bind(object_id.to_string())
             .execute(&self.pool)
             .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn set_object_storage_class(
+        &self,
+        object_id: Uuid,
+        storage_class: &str,
+        replicas: u8,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE objects SET storage_class = ?, desired_replicas = ?, \
+             replicas_explicit = TRUE WHERE id = ?",
+        )
+        .bind(storage_class)
+        .bind(i64::from(replicas))
+        .bind(object_id.to_string())
+        .execute(&self.pool)
+        .await?;
         Ok(res.rows_affected() == 1)
     }
 
@@ -1109,8 +1138,8 @@ impl MetadataStore for MysqlMetadata {
         }
         sqlx::query(
             "INSERT INTO multipart_uploads (id, bucket, object_key, content_type, storage_class, \
-             user_metadata, desired_replicas, replicas_explicit, disks, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             user_metadata, desired_replicas, replicas_explicit, disks, created_at, checksum) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(upload.id.to_string())
         .bind(&upload.bucket)
@@ -1122,6 +1151,7 @@ impl MetadataStore for MysqlMetadata {
         .bind(upload.replicas_explicit)
         .bind(encode_disks(&upload.disks))
         .bind(upload.created_at)
+        .bind(&upload.checksum)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1183,10 +1213,10 @@ impl MetadataStore for MysqlMetadata {
             .transpose()?;
         sqlx::query(
             "INSERT INTO multipart_parts (upload_id, part_number, blob_id, size, etag, blake3, \
-             disks, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             disks, created_at, checksum) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON DUPLICATE KEY UPDATE blob_id = VALUES(blob_id), size = VALUES(size), \
              etag = VALUES(etag), blake3 = VALUES(blake3), disks = VALUES(disks), \
-             created_at = VALUES(created_at)",
+             created_at = VALUES(created_at), checksum = VALUES(checksum)",
         )
         .bind(part.upload_id.to_string())
         .bind(i64::from(part.part_number))
@@ -1196,6 +1226,7 @@ impl MetadataStore for MysqlMetadata {
         .bind(&part.blake3)
         .bind(encode_disks(&part.disks))
         .bind(part.created_at)
+        .bind(&part.checksum)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
