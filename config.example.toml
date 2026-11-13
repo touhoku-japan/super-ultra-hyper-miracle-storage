@@ -1,0 +1,79 @@
+# suhms の設定ファイル例。`suhms --config config.toml serve` で読み込む。
+# 未指定の項目はデフォルト値になる。
+
+[server]
+# S3 API の待ち受けアドレス
+listen = "127.0.0.1:9000"
+
+[log]
+# "pretty"（開発向け）または "json"（本番向け）
+format = "pretty"
+# RUST_LOG 環境変数が設定されていればそちらを優先する
+level = "info"
+
+[storage]
+# このノードの ID。レプリカは別々のノードに置かれる
+node_id = "node1"
+# オブジェクトを置くディレクトリ（通常はディスクのマウントポイント）。事前に作成しておくこと。
+# 存在しないパスは自動作成しない（未マウントのまま OS ディスクに書き込むのを防ぐため）
+disks = ["/srv/suhms/disk1", "/srv/suhms/disk2", "/srv/suhms/disk3"]
+# メタデータ DB。sqlite は単一ノード専用（postgres / mysql は今後対応）
+metadata_url = "sqlite:///var/lib/suhms/meta.db"
+# オブジェクトにもバケットにも指定がないときのレプリカ数
+default_replicas = 3
+
+# S3 のストレージクラス名 → レプリカ数
+[storage.storage_classes]
+STANDARD = 3
+STANDARD_IA = 2
+REDUCED_REDUNDANCY = 1
+
+[s3]
+# クライアントが署名に使うリージョン名
+region = "jp-1"
+# 仮想ホスト形式（<bucket>.s3.example.com）を受けるベースドメイン。パス形式は常に有効
+domains = []
+# PutObject 1 回の最大サイズ（バイト）
+max_object_size = 5368709120
+# 管理 API でバケットを公開（匿名で GET/HEAD 可）にすることを許可するか。既定は不許可
+allow_public_buckets = false
+
+[auth]
+# アクセスキーのシークレットを暗号化するマスターキー（`suhms gen-master-key` で生成した 64 桁 hex）。
+# 環境変数 SUHMS_MASTER_KEY が優先される。紛失すると既存のアクセスキーはすべて使えなくなる
+master_key_file = "/etc/suhms/master.key"
+
+# 複数ノード構成。単一ノードなら nodes を空のままにする（このセクションごと省略してよい）。
+# 全ノードで同じ metadata_url（PostgreSQL / MariaDB の HA 構成）と同じ secret を使う。
+[cluster]
+# ノード間通信の待ち受け。プライベートネットワーク上のアドレスにすること（HTTP。暗号化はしない）
+# listen = "10.0.0.1:9100"
+# ノード間リクエストの認証に使う共有シークレット（32 文字以上）。環境変数 SUHMS_CLUSTER_SECRET が優先
+# secret_file = "/etc/suhms/cluster.key"
+# 全ノード（自分を含む）。id は各ノードの [storage] node_id
+# nodes = [
+#   { id = "node1", url = "http://10.0.0.1:9100" },
+#   { id = "node2", url = "http://10.0.0.2:9100" },
+#   { id = "node3", url = "http://10.0.0.3:9100" },
+# ]
+
+# 管理 API（SoraHost ポータル用）。listen を設定したときだけ有効。プライベートネットワークに置くこと
+[admin]
+# listen = "10.0.0.1:9200"
+# Bearer トークン（32 文字以上）。環境変数 SUHMS_ADMIN_TOKEN が優先
+# token_file = "/etc/suhms/admin.token"
+
+# アクセスキーごとのレート制限（ノードごと）。超えると 503 SlowDown
+[limits]
+requests_per_second = 200.0
+burst = 400.0
+
+[maintenance]
+# repair・放置マルチパートの削除・使用量スナップショットを実行するノード。クラスタでは 1 台だけ true にする
+leader = true
+repair_interval_secs = 600
+# 自ノードのディスクの scrub 間隔（0 で無効）
+scrub_interval_secs = 604800
+abort_uploads_after_secs = 604800
+usage_flush_secs = 60
+storage_snapshot_secs = 3600

@@ -1,0 +1,51 @@
+[package]
+name = "suhms-server"
+description = "Super-Ultra-Hyper-Miracle Storage: S3-compatible object storage server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "suhms"
+path = "src/main.rs"
+
+[dependencies]
+aes-gcm = "0.11.1"
+anyhow.workspace = true
+async-trait = "0.1.92"
+base64 = "0.23.1"
+bytes = "1.12.1"
+futures = "0.3.34"
+getrandom = "0.4.3"
+hex = "0.4.3"
+hmac = "0.13.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["stream", "json"] }
+s3s = { version = "0.17.0", default-features = false }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+suhms-store = { path = "../store" }
+tokio-util = { version = "0.7.20", features = ["io"] }
+tokio-stream = "0.1"
+time = "0.3.55"
+tower.workspace = true
+uuid = { version = "1.29.2", features = ["v4"] }
+axum.workspace = true
+clap.workspace = true
+serde.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+md-5 = "0.11.0"
+tempfile = "3.27.0"
+
+[lints]
+workspace = true

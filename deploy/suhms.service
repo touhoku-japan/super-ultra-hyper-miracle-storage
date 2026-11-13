@@ -1,0 +1,31 @@
+# systemd unit for suhms. Install the binary as /usr/local/bin/suhms, the config as
+# /etc/suhms/config.toml, then: systemctl daemon-reload && systemctl enable --now suhms
+[Unit]
+Description=Super-Ultra-Hyper-Miracle Storage (S3-compatible object storage)
+After=network-online.target local-fs.target
+Wants=network-online.target
+# Do not start before the data disks are mounted (adjust to your mount points).
+RequiresMountsFor=/srv/suhms/disk1 /srv/suhms/disk2 /srv/suhms/disk3
+
+[Service]
+Type=simple
+User=suhms
+Group=suhms
+ExecStart=/usr/local/bin/suhms --config /etc/suhms/config.toml serve
+Restart=on-failure
+RestartSec=5
+# SIGTERM lets in-flight requests finish.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+LimitNOFILE=1048576
+
+# Hardening: the service only needs its disks and its metadata directory.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/srv/suhms /var/lib/suhms
+ReadOnlyPaths=/etc/suhms
+
+[Install]
+WantedBy=multi-user.target
