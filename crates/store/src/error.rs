@@ -70,6 +70,12 @@ pub enum StoreError {
     #[error("precondition failed")]
     PreconditionFailed,
 
+    #[error("the specified method is not allowed against this resource")]
+    MethodNotAllowed,
+
+    #[error("the object is locked (Object Lock retention or legal hold)")]
+    ObjectLocked,
+
     #[error("storage quota exceeded")]
     QuotaExceeded,
 

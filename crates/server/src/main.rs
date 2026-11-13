@@ -203,6 +203,17 @@ fn spawn_maintenance(
         }
     });
     let s = Arc::clone(store);
+    every(secs(3600), "lifecycle", move || {
+        let s = Arc::clone(&s);
+        async move {
+            let (expired, purged, aborted) = s.apply_lifecycle().await?;
+            if expired + purged + aborted > 0 {
+                tracing::info!(expired, purged, aborted, "lifecycle applied");
+            }
+            Ok(())
+        }
+    });
+    let s = Arc::clone(store);
     every(
         secs(m.storage_snapshot_secs),
         "storage snapshot",

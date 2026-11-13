@@ -21,19 +21,34 @@ use s3s::{
     S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     auth::{S3Auth, SecretKey},
     dto::{
-        AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketLocationConstraint,
-        Checksum, CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
-        CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopyPartResult, CopySource,
-        CreateBucketInput, CreateBucketOutput, CreateMultipartUploadInput,
-        CreateMultipartUploadOutput, DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput,
-        DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
-        ETagCondition, GetBucketLocationInput, GetBucketLocationOutput, GetBucketVersioningInput,
-        GetBucketVersioningOutput, GetObjectInput, GetObjectOutput, HeadBucketInput,
-        HeadBucketOutput, HeadObjectInput, HeadObjectOutput, Initiator, ListBucketsInput,
-        ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput, ListObjectsInput,
-        ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, ListPartsInput,
-        ListPartsOutput, MultipartUpload, Object, ObjectStorageClass, Owner, Part, PutObjectInput,
-        PutObjectOutput, StorageClass, StreamingBlob, Timestamp, UploadPartCopyInput,
+        AbortIncompleteMultipartUpload, AbortMultipartUploadInput, AbortMultipartUploadOutput,
+        Bucket, BucketLocationConstraint, BucketVersioningStatus, CORSRule, Checksum, CommonPrefix,
+        CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput,
+        CopyObjectOutput, CopyObjectResult, CopyPartResult, CopySource, CreateBucketInput,
+        CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
+        DefaultRetention, DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketInput,
+        DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput, DeleteBucketOutput,
+        DeleteMarkerEntry, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput,
+        DeleteObjectsOutput, DeletedObject, ETag, ETagCondition, ExpirationStatus,
+        GetBucketCorsInput, GetBucketCorsOutput, GetBucketLifecycleConfigurationInput,
+        GetBucketLifecycleConfigurationOutput, GetBucketLocationInput, GetBucketLocationOutput,
+        GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectInput,
+        GetObjectLegalHoldInput, GetObjectLegalHoldOutput, GetObjectLockConfigurationInput,
+        GetObjectLockConfigurationOutput, GetObjectOutput, GetObjectRetentionInput,
+        GetObjectRetentionOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
+        HeadObjectOutput, Initiator, LifecycleExpiration, LifecycleRule as S3LifecycleRule,
+        ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput,
+        ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
+        ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput, MultipartUpload,
+        NoncurrentVersionExpiration, Object, ObjectLockConfiguration, ObjectLockEnabled,
+        ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention,
+        ObjectLockRetentionMode, ObjectLockRule, ObjectStorageClass, ObjectVersion,
+        ObjectVersionStorageClass, Owner, Part, PutBucketCorsInput, PutBucketCorsOutput,
+        PutBucketLifecycleConfigurationInput, PutBucketLifecycleConfigurationOutput,
+        PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectInput,
+        PutObjectLegalHoldInput, PutObjectLegalHoldOutput, PutObjectLockConfigurationInput,
+        PutObjectLockConfigurationOutput, PutObjectOutput, PutObjectRetentionInput,
+        PutObjectRetentionOutput, StorageClass, StreamingBlob, Timestamp, UploadPartCopyInput,
         UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
     },
     s3_error,
@@ -41,8 +56,8 @@ use s3s::{
 use std::sync::atomic::Ordering;
 
 use suhms_store::{
-    CompletedPart, ListPage, ListParams, ListStart, ObjectRecord, PutObjectRequest, Store,
-    StoreError, meta::StoredObject,
+    CompletedPart, ListPage, ListParams, ListStart, NULL_VERSION, ObjectRecord, PutObjectRequest,
+    Store, StoreError, lifecycle::LifecycleRule, meta::StoredObject,
 };
 use tokio::io::AsyncRead;
 use tokio_util::io::{ReaderStream, StreamReader};
@@ -230,6 +245,13 @@ fn s3_err(e: StoreError) -> S3Error {
             e
         }
         StoreError::TooManyBuckets => s3_error!(TooManyBuckets),
+        StoreError::MethodNotAllowed => s3_error!(MethodNotAllowed),
+        StoreError::ObjectLocked => {
+            s3_error!(
+                AccessDenied,
+                "Access Denied because object protected by object lock."
+            )
+        }
         StoreError::InvalidRequest(m) => S3Error::with_message(S3ErrorCode::InvalidRequest, m),
         e @ (StoreError::InvalidReplicaCount { .. } | StoreError::InvalidArgument(_)) => {
             S3Error::with_message(S3ErrorCode::InvalidArgument, e.to_string())
@@ -462,6 +484,16 @@ fn check_preconditions(
     Ok(())
 }
 
+fn millis(t: Timestamp) -> i64 {
+    i64::try_from(time::OffsetDateTime::from(t).unix_timestamp_nanos() / 1_000_000)
+        .unwrap_or(i64::MAX)
+}
+
+/// The version id to report; the `null` version of unversioned buckets is not reported.
+fn version_of(rec: &ObjectRecord) -> Option<String> {
+    (rec.version_id != NULL_VERSION).then(|| rec.version_id.clone())
+}
+
 fn take_checksum(outcome: &checksum::Outcome) -> Checksum {
     outcome
         .lock()
@@ -523,6 +555,12 @@ impl S3 for S3Service {
             .create_bucket(&tenant, &name, None)
             .await
             .map_err(s3_err)?;
+        if req.input.object_lock_enabled_for_bucket == Some(true) {
+            self.store
+                .enable_object_lock(&tenant, &name)
+                .await
+                .map_err(s3_err)?;
+        }
         Ok(S3Response::new(CreateBucketOutput {
             location: Some(format!("/{name}")),
             ..Default::default()
@@ -558,17 +596,462 @@ impl S3 for S3Service {
         }))
     }
 
-    /// Versioning is not supported yet; report it as never enabled.
     async fn get_bucket_versioning(
         &self,
         req: S3Request<GetBucketVersioningInput>,
     ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
         let tenant = self.tenant(&req, Class::B).await?;
-        self.store
+        let b = self
+            .store
             .get_bucket(&tenant, &req.input.bucket)
             .await
             .map_err(s3_err)?;
-        Ok(S3Response::new(GetBucketVersioningOutput::default()))
+        Ok(S3Response::new(GetBucketVersioningOutput {
+            status: b.versioning.map(BucketVersioningStatus::from),
+            ..Default::default()
+        }))
+    }
+
+    async fn put_bucket_versioning(
+        &self,
+        req: S3Request<PutBucketVersioningInput>,
+    ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        let tenant = self.tenant(&req, Class::A).await?;
+        let input = req.input;
+        let status = input
+            .versioning_configuration
+            .status
+            .ok_or_else(|| s3_error!(MalformedXML, "missing Status"))?;
+        self.store
+            .set_versioning(&tenant, &input.bucket, status.as_str())
+            .await
+            .map_err(s3_err)?;
+        Ok(S3Response::new(PutBucketVersioningOutput::default()))
+    }
+
+    async fn list_object_versions(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        let tenant = self.tenant(&req, Class::A).await?;
+        let input = req.input;
+        let enc = encoder(input.encoding_type.as_ref())?;
+        let prefix = input.prefix.clone().unwrap_or_default();
+        let key_marker = input.key_marker.clone().unwrap_or_default();
+        let page = self
+            .store
+            .list_object_versions(
+                &tenant,
+                &input.bucket,
+                &prefix,
+                &key_marker,
+                input.version_id_marker.as_deref(),
+                max_keys(input.max_keys)?,
+            )
+            .await
+            .map_err(s3_err)?;
+        let owner = Owner {
+            id: Some(tenant.clone()),
+            display_name: None,
+        };
+        let mut versions = Vec::new();
+        let mut markers = Vec::new();
+        for o in &page.versions {
+            if o.delete_marker {
+                markers.push(DeleteMarkerEntry {
+                    key: Some(enc(&o.key)),
+                    version_id: Some(o.version_id.clone()),
+                    is_latest: Some(o.is_latest),
+                    last_modified: Some(timestamp(o.created_at)),
+                    owner: Some(owner.clone()),
+                });
+            } else {
+                versions.push(ObjectVersion {
+                    key: Some(enc(&o.key)),
+                    version_id: Some(o.version_id.clone()),
+                    is_latest: Some(o.is_latest),
+                    last_modified: Some(timestamp(o.created_at)),
+                    e_tag: Some(etag(o)),
+                    size: Some(size_i64(o.size)),
+                    storage_class: Some(ObjectVersionStorageClass::from(
+                        o.storage_class
+                            .clone()
+                            .unwrap_or_else(|| "STANDARD".to_owned()),
+                    )),
+                    owner: Some(owner.clone()),
+                    ..Default::default()
+                });
+            }
+        }
+        let last = page.versions.last();
+        Ok(S3Response::new(ListObjectVersionsOutput {
+            name: Some(input.bucket),
+            prefix: Some(enc(&prefix)),
+            key_marker: input.key_marker.as_deref().map(enc),
+            version_id_marker: input.version_id_marker,
+            max_keys: input.max_keys.or(Some(1000)),
+            is_truncated: Some(page.truncated),
+            next_key_marker: last.filter(|_| page.truncated).map(|o| enc(&o.key)),
+            next_version_id_marker: last
+                .filter(|_| page.truncated)
+                .map(|o| o.version_id.clone()),
+            versions: Some(versions),
+            delete_markers: Some(markers),
+            encoding_type: input.encoding_type,
+            ..Default::default()
+        }))
+    }
+
+    async fn put_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<PutBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
+        let tenant = self.tenant(&req, Class::A).await?;
+        let input = req.input;
+        let rules = input
+            .lifecycle_configuration
+            .map(|c| c.rules)
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| {
+                if r.transitions.as_ref().is_some_and(|t| !t.is_empty()) {
+                    return Err(s3_error!(NotImplemented, "lifecycle transitions"));
+                }
+                let prefix = r
+                    .filter
+                    .as_ref()
+                    .and_then(|f| f.prefix.clone())
+                    .or(r.prefix.clone())
+                    .unwrap_or_default();
+                let days = |d: Option<i32>| d.and_then(|d| u32::try_from(d).ok());
+                Ok(LifecycleRule {
+                    id: r.id.clone().unwrap_or_else(|| format!("rule-{}", i + 1)),
+                    prefix,
+                    enabled: r.status.as_str() == ExpirationStatus::ENABLED,
+                    expiration_days: days(r.expiration.as_ref().and_then(|e| e.days)),
+                    noncurrent_days: days(
+                        r.noncurrent_version_expiration
+                            .as_ref()
+                            .and_then(|e| e.noncurrent_days),
+                    ),
+                    abort_multipart_days: days(
+                        r.abort_incomplete_multipart_upload
+                            .as_ref()
+                            .and_then(|a| a.days_after_initiation),
+                    ),
+                })
+            })
+            .collect::<S3Result<Vec<_>>>()?;
+        self.store
+            .set_lifecycle(&tenant, &input.bucket, Some(&rules))
+            .await
+            .map_err(s3_err)?;
+        Ok(S3Response::new(
+            PutBucketLifecycleConfigurationOutput::default(),
+        ))
+    }
+
+    async fn get_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<GetBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
+        let tenant = self.tenant(&req, Class::B).await?;
+        let rules = self
+            .store
+            .lifecycle(&tenant, &req.input.bucket)
+            .await
+            .map_err(s3_err)?
+            .ok_or_else(|| s3_error!(NoSuchLifecycleConfiguration))?;
+        let days = |d: Option<u32>| d.and_then(|d| i32::try_from(d).ok());
+        let rules = rules
+            .into_iter()
+            .map(|r| S3LifecycleRule {
+                id: Some(r.id),
+                status: ExpirationStatus::from(
+                    if r.enabled { "Enabled" } else { "Disabled" }.to_owned(),
+                ),
+                filter: Some(s3s::dto::LifecycleRuleFilter {
+                    prefix: Some(r.prefix),
+                    ..Default::default()
+                }),
+                expiration: r.expiration_days.map(|d| LifecycleExpiration {
+                    days: days(Some(d)),
+                    ..Default::default()
+                }),
+                noncurrent_version_expiration: r.noncurrent_days.map(|d| {
+                    NoncurrentVersionExpiration {
+                        noncurrent_days: days(Some(d)),
+                        ..Default::default()
+                    }
+                }),
+                abort_incomplete_multipart_upload: r.abort_multipart_days.map(|d| {
+                    AbortIncompleteMultipartUpload {
+                        days_after_initiation: days(Some(d)),
+                    }
+                }),
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            })
+            .collect();
+        Ok(S3Response::new(GetBucketLifecycleConfigurationOutput {
+            rules: Some(rules),
+            ..Default::default()
+        }))
+    }
+
+    async fn delete_bucket_lifecycle(
+        &self,
+        req: S3Request<DeleteBucketLifecycleInput>,
+    ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
+        let tenant = self.tenant(&req, Class::B).await?;
+        self.store
+            .set_lifecycle(&tenant, &req.input.bucket, None)
+            .await
+            .map_err(s3_err)?;
+        Ok(S3Response::new(DeleteBucketLifecycleOutput::default()))
+    }
+
+    async fn put_object_lock_configuration(
+        &self,
+        req: S3Request<PutObjectLockConfigurationInput>,
+    ) -> S3Result<S3Response<PutObjectLockConfigurationOutput>> {
+        let tenant = self.tenant(&req, Class::A).await?;
+        let input = req.input;
+        let cfg = input.object_lock_configuration.unwrap_or_default();
+        let current = self
+            .store
+            .object_lock_config(&tenant, &input.bucket)
+            .await
+            .map_err(s3_err)?;
+        if !current.enabled {
+            // S3 allows enabling Object Lock on an existing versioned bucket.
+            if cfg
+                .object_lock_enabled
+                .as_ref()
+                .map(ObjectLockEnabled::as_str)
+                != Some(ObjectLockEnabled::ENABLED)
+            {
+                return Err(s3_error!(InvalidRequest, "Object Lock is not enabled"));
+            }
+            self.store
+                .enable_object_lock(&tenant, &input.bucket)
+                .await
+                .map_err(s3_err)?;
+        }
+        let default = match cfg.rule.and_then(|r| r.default_retention) {
+            None => None,
+            Some(d) => {
+                let mode = d
+                    .mode
+                    .ok_or_else(|| s3_error!(MalformedXML, "missing Mode"))?
+                    .as_str()
+                    .to_owned();
+                let days = match (d.days, d.years) {
+                    (Some(days), None) => days,
+                    (None, Some(years)) => years.saturating_mul(365),
+                    _ => return Err(s3_error!(MalformedXML, "specify Days or Years")),
+                };
+                let days = u32::try_from(days)
+                    .ok()
+                    .filter(|d| *d > 0)
+                    .ok_or_else(|| s3_error!(InvalidArgument, "retention must be positive"))?;
+                Some((mode, days))
+            }
+        };
+        self.store
+            .set_default_retention(&tenant, &input.bucket, default)
+            .await
+            .map_err(s3_err)?;
+        Ok(S3Response::new(PutObjectLockConfigurationOutput::default()))
+    }
+
+    async fn get_object_lock_configuration(
+        &self,
+        req: S3Request<GetObjectLockConfigurationInput>,
+    ) -> S3Result<S3Response<GetObjectLockConfigurationOutput>> {
+        let tenant = self.tenant(&req, Class::B).await?;
+        let cfg = self
+            .store
+            .object_lock_config(&tenant, &req.input.bucket)
+            .await
+            .map_err(s3_err)?;
+        if !cfg.enabled {
+            return Err(s3_error!(ObjectLockConfigurationNotFoundError));
+        }
+        let rule = match (cfg.default_mode, cfg.default_days) {
+            (Some(mode), Some(days)) => Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from(mode)),
+                    days: i32::try_from(days).ok(),
+                    years: None,
+                }),
+            }),
+            _ => None,
+        };
+        Ok(S3Response::new(GetObjectLockConfigurationOutput {
+            object_lock_configuration: Some(ObjectLockConfiguration {
+                object_lock_enabled: Some(ObjectLockEnabled::from_static(
+                    ObjectLockEnabled::ENABLED,
+                )),
+                rule,
+            }),
+        }))
+    }
+
+    async fn put_object_retention(
+        &self,
+        req: S3Request<PutObjectRetentionInput>,
+    ) -> S3Result<S3Response<PutObjectRetentionOutput>> {
+        let tenant = self.tenant(&req, Class::A).await?;
+        let input = req.input;
+        let retention = match input.retention {
+            Some(ObjectLockRetention {
+                mode: Some(mode),
+                retain_until_date: Some(until),
+            }) => Some((mode.as_str().to_owned(), millis(until))),
+            _ => None,
+        };
+        self.store
+            .set_object_retention(
+                &tenant,
+                &input.bucket,
+                &input.key,
+                input.version_id.as_deref(),
+                retention,
+                input.bypass_governance_retention.unwrap_or(false),
+            )
+            .await
+            .map_err(s3_err)?;
+        Ok(S3Response::new(PutObjectRetentionOutput::default()))
+    }
+
+    async fn get_object_retention(
+        &self,
+        req: S3Request<GetObjectRetentionInput>,
+    ) -> S3Result<S3Response<GetObjectRetentionOutput>> {
+        let tenant = self.tenant(&req, Class::B).await?;
+        let input = req.input;
+        let o = self
+            .store
+            .object_lock_state(
+                &tenant,
+                &input.bucket,
+                &input.key,
+                input.version_id.as_deref(),
+            )
+            .await
+            .map_err(s3_err)?;
+        let (Some(mode), Some(until)) = (o.lock_mode, o.lock_until) else {
+            return Err(s3_error!(NoSuchObjectLockConfiguration));
+        };
+        Ok(S3Response::new(GetObjectRetentionOutput {
+            retention: Some(ObjectLockRetention {
+                mode: Some(ObjectLockRetentionMode::from(mode)),
+                retain_until_date: Some(timestamp(until)),
+            }),
+        }))
+    }
+
+    async fn put_object_legal_hold(
+        &self,
+        req: S3Request<PutObjectLegalHoldInput>,
+    ) -> S3Result<S3Response<PutObjectLegalHoldOutput>> {
+        let tenant = self.tenant(&req, Class::A).await?;
+        let input = req.input;
+        let on = input
+            .legal_hold
+            .and_then(|h| h.status)
+            .is_some_and(|s| s.as_str() == ObjectLockLegalHoldStatus::ON);
+        self.store
+            .set_legal_hold(
+                &tenant,
+                &input.bucket,
+                &input.key,
+                input.version_id.as_deref(),
+                on,
+            )
+            .await
+            .map_err(s3_err)?;
+        Ok(S3Response::new(PutObjectLegalHoldOutput::default()))
+    }
+
+    async fn get_object_legal_hold(
+        &self,
+        req: S3Request<GetObjectLegalHoldInput>,
+    ) -> S3Result<S3Response<GetObjectLegalHoldOutput>> {
+        let tenant = self.tenant(&req, Class::B).await?;
+        let input = req.input;
+        let o = self
+            .store
+            .object_lock_state(
+                &tenant,
+                &input.bucket,
+                &input.key,
+                input.version_id.as_deref(),
+            )
+            .await
+            .map_err(s3_err)?;
+        let status = if o.legal_hold {
+            ObjectLockLegalHoldStatus::ON
+        } else {
+            ObjectLockLegalHoldStatus::OFF
+        };
+        Ok(S3Response::new(GetObjectLegalHoldOutput {
+            legal_hold: Some(ObjectLockLegalHold {
+                status: Some(ObjectLockLegalHoldStatus::from_static(status)),
+            }),
+        }))
+    }
+
+    async fn put_bucket_cors(
+        &self,
+        req: S3Request<PutBucketCorsInput>,
+    ) -> S3Result<S3Response<PutBucketCorsOutput>> {
+        let tenant = self.tenant(&req, Class::A).await?;
+        let input = req.input;
+        let rules: Vec<crate::cors::CorsRule> = input
+            .cors_configuration
+            .cors_rules
+            .into_iter()
+            .map(crate::cors::CorsRule::from)
+            .collect();
+        let json = serde_json::to_string(&rules).map_err(internal)?;
+        self.store
+            .set_cors(&tenant, &input.bucket, Some(&json))
+            .await
+            .map_err(s3_err)?;
+        Ok(S3Response::new(PutBucketCorsOutput::default()))
+    }
+
+    async fn get_bucket_cors(
+        &self,
+        req: S3Request<GetBucketCorsInput>,
+    ) -> S3Result<S3Response<GetBucketCorsOutput>> {
+        let tenant = self.tenant(&req, Class::B).await?;
+        let b = self
+            .store
+            .get_bucket(&tenant, &req.input.bucket)
+            .await
+            .map_err(s3_err)?;
+        let rules = crate::cors::decode(b.cors.as_deref())
+            .ok_or_else(|| s3_error!(NoSuchCORSConfiguration))?;
+        Ok(S3Response::new(GetBucketCorsOutput {
+            cors_rules: Some(rules.into_iter().map(CORSRule::from).collect()),
+        }))
+    }
+
+    async fn delete_bucket_cors(
+        &self,
+        req: S3Request<DeleteBucketCorsInput>,
+    ) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
+        let tenant = self.tenant(&req, Class::B).await?;
+        self.store
+            .set_cors(&tenant, &req.input.bucket, None)
+            .await
+            .map_err(s3_err)?;
+        Ok(S3Response::new(DeleteBucketCorsOutput::default()))
     }
 
     async fn delete_bucket(
@@ -612,6 +1095,11 @@ impl S3 for S3Service {
                 .collect::<BTreeMap<_, _>>(),
             content_md5: parse_md5(input.content_md5.as_deref())?,
             if_absent,
+            lock_mode: input.object_lock_mode.map(|m| m.as_str().to_owned()),
+            lock_until: input.object_lock_retain_until_date.map(millis),
+            legal_hold: input
+                .object_lock_legal_hold_status
+                .is_some_and(|s| s.as_str() == ObjectLockLegalHoldStatus::ON),
         };
         let (body, verified) = checksum::wrap(body_reader(input.body), expected);
         let rec = self
@@ -622,6 +1110,7 @@ impl S3 for S3Service {
         self.tenancy.meter.ingress(&tenant, rec.size);
         let c = take_checksum(&verified);
         Ok(S3Response::new(PutObjectOutput {
+            version_id: version_of(&rec),
             e_tag: Some(etag(&rec)),
             size: Some(size_i64(rec.size)),
             checksum_crc32: c.checksum_crc32,
@@ -653,6 +1142,7 @@ impl S3 for S3Service {
             user_metadata: input.metadata.unwrap_or_default().into_iter().collect(),
             content_md5: None,
             if_absent: matches!(input.if_none_match, Some(ETagCondition::Any)),
+            ..PutObjectRequest::default()
         };
         let rec = self
             .store
@@ -683,6 +1173,7 @@ impl S3 for S3Service {
             user_metadata: input.metadata.unwrap_or_default().into_iter().collect(),
             content_md5: None,
             if_absent: false,
+            ..PutObjectRequest::default()
         };
         let upload = self
             .store
@@ -799,6 +1290,7 @@ impl S3 for S3Service {
                 bucket: Some(bucket),
                 key: Some(key),
                 e_tag: Some(etag(&rec)),
+                version_id: version_of(&rec),
                 ..Default::default()
             })
         };
@@ -952,9 +1444,20 @@ impl S3 for S3Service {
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let reader = self.reader(&req).await?;
         let input = req.input;
-        let (stored, payer) = self
-            .lookup_for_read(reader.as_deref(), &input.bucket, &input.key)
-            .await?;
+        let (stored, payer) = match (&input.version_id, &reader) {
+            (Some(v), Some(tenant)) => (
+                self.store
+                    .get_object_version(tenant, &input.bucket, &input.key, v)
+                    .await
+                    .map_err(s3_err)?,
+                tenant.clone(),
+            ),
+            (Some(_), None) => return Err(s3_error!(AccessDenied)),
+            (None, _) => {
+                self.lookup_for_read(reader.as_deref(), &input.bucket, &input.key)
+                    .await?
+            }
+        };
         let rec = &stored.object;
         check_preconditions(
             rec,
@@ -984,6 +1487,7 @@ impl S3 for S3Service {
             body: Some(StreamingBlob::wrap(body)),
             content_length: Some(size_i64(len)),
             content_range,
+            version_id: version_of(rec),
             accept_ranges: Some("bytes".to_owned()),
             e_tag: Some(etag(rec)),
             last_modified: Some(timestamp(rec.created_at)),
@@ -999,9 +1503,20 @@ impl S3 for S3Service {
     ) -> S3Result<S3Response<HeadObjectOutput>> {
         let reader = self.reader(&req).await?;
         let input = &req.input;
-        let (stored, _) = self
-            .lookup_for_read(reader.as_deref(), &input.bucket, &input.key)
-            .await?;
+        let (stored, _) = match (&input.version_id, &reader) {
+            (Some(v), Some(tenant)) => (
+                self.store
+                    .get_object_version(tenant, &input.bucket, &input.key, v)
+                    .await
+                    .map_err(s3_err)?,
+                tenant.clone(),
+            ),
+            (Some(_), None) => return Err(s3_error!(AccessDenied)),
+            (None, _) => {
+                self.lookup_for_read(reader.as_deref(), &input.bucket, &input.key)
+                    .await?
+            }
+        };
         let rec = stored.object;
         check_preconditions(
             &rec,
@@ -1011,6 +1526,7 @@ impl S3 for S3Service {
             input.if_unmodified_since.as_ref(),
         )?;
         Ok(S3Response::new(HeadObjectOutput {
+            version_id: version_of(&rec),
             content_length: Some(size_i64(rec.size)),
             accept_ranges: Some("bytes".to_owned()),
             e_tag: Some(etag(&rec)),
@@ -1026,11 +1542,31 @@ impl S3 for S3Service {
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let tenant = self.tenant(&req, Class::B).await?;
-        self.store
-            .delete_object(&tenant, &req.input.bucket, &req.input.key)
-            .await
-            .map_err(s3_err)?;
-        Ok(S3Response::new(DeleteObjectOutput::default()))
+        let input = req.input;
+        let result = match &input.version_id {
+            Some(v) => {
+                self.store
+                    .delete_object_version(
+                        &tenant,
+                        &input.bucket,
+                        &input.key,
+                        v,
+                        input.bypass_governance_retention.unwrap_or(false),
+                    )
+                    .await
+            }
+            None => {
+                self.store
+                    .delete_object(&tenant, &input.bucket, &input.key)
+                    .await
+            }
+        }
+        .map_err(s3_err)?;
+        Ok(S3Response::new(DeleteObjectOutput {
+            delete_marker: result.delete_marker.then_some(true),
+            version_id: result.version_id.filter(|v| v != NULL_VERSION),
+            ..Default::default()
+        }))
     }
 
     async fn delete_objects(
@@ -1046,16 +1582,37 @@ impl S3 for S3Service {
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
         for obj in input.delete.objects {
-            match self
-                .store
-                .delete_object(&tenant, &input.bucket, &obj.key)
-                .await
-            {
-                Ok(_) => {
+            let result = match &obj.version_id {
+                Some(v) => {
+                    self.store
+                        .delete_object_version(
+                            &tenant,
+                            &input.bucket,
+                            &obj.key,
+                            v,
+                            input.bypass_governance_retention.unwrap_or(false),
+                        )
+                        .await
+                }
+                None => {
+                    self.store
+                        .delete_object(&tenant, &input.bucket, &obj.key)
+                        .await
+                }
+            };
+            match result {
+                Ok(r) => {
                     if !quiet {
+                        let marker_version = r
+                            .delete_marker
+                            .then(|| r.version_id.clone())
+                            .flatten()
+                            .filter(|_| obj.version_id.is_none());
                         deleted.push(DeletedObject {
                             key: Some(obj.key),
-                            ..Default::default()
+                            version_id: obj.version_id.clone(),
+                            delete_marker: r.delete_marker.then_some(true),
+                            delete_marker_version_id: marker_version,
                         });
                     }
                 }

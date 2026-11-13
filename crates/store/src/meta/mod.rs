@@ -54,9 +54,50 @@ pub struct BucketRecord {
     pub created_at: i64,
     /// Anyone may GET/HEAD objects (only if the server allows public buckets).
     pub public_read: bool,
+    /// `Enabled` or `Suspended`; `None` for a bucket that never had versioning.
+    pub versioning: Option<String>,
+    /// Lifecycle rules (JSON, see `crate::lifecycle`).
+    pub lifecycle: Option<String>,
+    /// CORS rules (JSON, opaque to the store).
+    pub cors: Option<String>,
+    /// Object Lock configuration (JSON, see `crate::lock`).
+    pub object_lock: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The version id of objects written while versioning was off or suspended.
+pub const NULL_VERSION: &str = "null";
+
+/// How a write treats the key's existing versions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersioningMode {
+    /// The previous object is replaced (deleted).
+    Unversioned,
+    /// The previous latest version is kept as a noncurrent version.
+    Enabled,
+    /// Like `Enabled`, but the new version is the `null` version, replacing any older one.
+    Suspended,
+}
+
+impl VersioningMode {
+    pub fn of(bucket: &BucketRecord) -> Self {
+        match bucket.versioning.as_deref() {
+            Some("Enabled") => Self::Enabled,
+            Some("Suspended") => Self::Suspended,
+            _ => Self::Unversioned,
+        }
+    }
+}
+
+/// Bucket settings stored as text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketSetting {
+    Versioning,
+    Lifecycle,
+    Cors,
+    ObjectLock,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ObjectRecord {
     /// Blob id; also names the object's files on disk. A new id is used for every write.
     pub id: Uuid,
@@ -77,6 +118,17 @@ pub struct ObjectRecord {
     pub replicas_explicit: bool,
     /// Unix time in milliseconds.
     pub created_at: i64,
+    /// [`NULL_VERSION`] unless written while versioning was enabled.
+    pub version_id: String,
+    pub is_latest: bool,
+    /// A delete marker has no data (and no replicas).
+    pub delete_marker: bool,
+    /// When this version stopped being the latest.
+    pub noncurrent_at: Option<i64>,
+    /// Object Lock retention: `GOVERNANCE` or `COMPLIANCE`, until `lock_until` (unix ms).
+    pub lock_mode: Option<String>,
+    pub lock_until: Option<i64>,
+    pub legal_hold: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,18 +292,73 @@ pub trait MetadataStore: Send + Sync {
     async fn delete_bucket(&self, name: &str) -> Result<DeleteBucketOutcome>;
     /// Returns false when the bucket does not exist.
     async fn set_bucket_public(&self, name: &str, public_read: bool) -> Result<bool>;
+    /// Returns false when the bucket does not exist.
+    async fn set_bucket_setting(
+        &self,
+        name: &str,
+        setting: BucketSetting,
+        value: Option<&str>,
+    ) -> Result<bool>;
+    /// Every bucket of every tenant (for background jobs such as lifecycle).
+    async fn list_all_buckets(&self) -> Result<Vec<BucketRecord>>;
 
     // ---- objects ----
 
-    /// Inserts or replaces the object at (bucket, key) and returns the object it replaced.
-    /// Fails with [`StoreError::NoSuchBucket`] when the bucket does not exist, and with
-    /// [`StoreError::PreconditionFailed`] when `if_absent` is set and the key exists.
+    /// Stores `object` as the latest version of its key; earlier versions are kept or removed
+    /// according to `mode`. Returns the versions that were removed (their files must be
+    /// deleted). Fails with [`StoreError::NoSuchBucket`] when the bucket does not exist, and
+    /// with [`StoreError::PreconditionFailed`] when `if_absent` is set and the key exists.
     async fn put_object(
         &self,
         object: &ObjectRecord,
         replicas: &[DiskId],
         if_absent: bool,
+        mode: VersioningMode,
+    ) -> Result<Vec<StoredObject>>;
+    /// A specific version of a key.
+    async fn get_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
     ) -> Result<Option<StoredObject>>;
+    /// Permanently removes one version; if it was the latest, the newest remaining version
+    /// becomes the latest.
+    async fn delete_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<Option<StoredObject>>;
+    /// All versions (including delete markers) under `prefix`, ordered by key, newest first,
+    /// after the version (`after_key`, `after_created_at`, `after_id`).
+    async fn list_object_versions(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        after: (&str, i64, &str),
+        limit: u32,
+    ) -> Result<Vec<ObjectRecord>>;
+    /// Lifecycle candidates under `prefix`, in key order after `after` (key, id): latest
+    /// versions created before `before`, or (with `noncurrent`) noncurrent versions that
+    /// became noncurrent before `before`.
+    async fn lifecycle_candidates(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        noncurrent: bool,
+        before: i64,
+        after: (&str, &str),
+        limit: u32,
+    ) -> Result<Vec<ObjectRecord>>;
+    /// Returns false when the object (version) does not exist.
+    async fn set_object_lock(
+        &self,
+        object_id: Uuid,
+        mode: Option<&str>,
+        until: Option<i64>,
+    ) -> Result<bool>;
+    async fn set_legal_hold(&self, object_id: Uuid, on: bool) -> Result<bool>;
     async fn get_object(&self, bucket: &str, key: &str) -> Result<Option<StoredObject>>;
     async fn get_object_by_id(&self, id: Uuid) -> Result<Option<StoredObject>>;
     /// Removes the object and returns what was removed.
@@ -299,7 +406,8 @@ pub trait MetadataStore: Send + Sync {
         upload_id: Uuid,
         object: &ObjectRecord,
         replicas: &[DiskId],
-    ) -> Result<(Vec<PartRecord>, Option<StoredObject>)>;
+        mode: VersioningMode,
+    ) -> Result<(Vec<PartRecord>, Vec<StoredObject>)>;
 
     /// Uploads started before `created_before` (unix ms), oldest first.
     async fn list_stale_uploads(

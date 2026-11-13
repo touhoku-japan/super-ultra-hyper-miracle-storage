@@ -6,6 +6,7 @@ pub mod admin_api;
 pub mod checksum;
 pub mod cluster;
 pub mod config;
+pub mod cors;
 pub mod crypto;
 pub mod s3;
 pub mod tenancy;
@@ -77,6 +78,13 @@ pub fn app(
     Ok(Router::new()
         .route(HEALTH_PATH, get(|| async { "ok" }))
         .fallback_service(fallback)
+        .layer(axum::middleware::from_fn_with_state(
+            cors::CorsState {
+                store: Arc::clone(&store),
+                domains: config.s3.domains.clone().into(),
+            },
+            cors::middleware,
+        ))
         .layer(axum::middleware::from_fn(audit))
         .layer(TraceLayer::new_for_http()))
 }

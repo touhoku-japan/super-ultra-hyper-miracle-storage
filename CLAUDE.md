@@ -59,11 +59,24 @@ release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレ
   バケット数上限、公開バケット（`[s3] allow_public_buckets` + 管理 API でバケットごとに許可。匿名は GET/HEAD のみ、
   通信量はバケット所有者に課金）、監査ログ（`suhms::audit` ターゲット。ログレベルに関係なく出力）、
   定期メンテナンス（`[maintenance]`: 全ノードで heartbeat・メーター書き出し・scrub、leader だけ repair・放置マルチパート削除・容量スナップショット）
+- バージョニング: 全バージョンを `objects` テーブルに持つ（`version_id` / `is_latest` / `delete_marker`）。最新版の一意性は
+  部分ユニークインデックス（SQLite/PG）、MariaDB は生成列 `latest_key` で担保。`MetadataStore::put_object` が
+  `VersioningMode`（Unversioned / Enabled / Suspended）に従って旧版を削除・非現行化し、削除した版を返す（呼び出し側がファイル削除）。
+  未バージョンのオブジェクトは `version_id = "null"`
+- Object Lock（`store/src/lock.rs`）: バケット作成時の `x-amz-bucket-object-lock-enabled`、既定保持期間、オブジェクト単位の
+  retention（GOVERNANCE はバイパスヘッダで解除可、COMPLIANCE は短縮・削除不可）と legal hold。保護対象は「版の削除」で、
+  キーの DELETE（削除マーカー追加）は可能
+- ライフサイクル（`store/src/lifecycle.rs`）: 期限切れ（現行版）、非現行版の削除、未完了マルチパートの中止。prefix 単位。
+  leader が 1 時間ごとに `Store::apply_lifecycle`。transition（ストレージクラス移行）は未対応
+- CORS（`server/src/cors.rs`）: ルールはバケットに JSON で保存し、ミドルウェアがプリフライト（OPTIONS）と応答ヘッダを処理
+- SQLite のマイグレーションは外部キーを無効化して実行する（`objects` の再作成で replicas が CASCADE 削除されないように）
 - サーバ側暗号化（SSE）は実装しない: 「ファイルをそのまま置く」方針と矛盾するため。保存時暗号化はディスク側（LUKS 等）で行う
 - 対応済み S3 操作: ListBuckets, Create/Head/Delete Bucket, GetBucketLocation, GetBucketVersioning（常に未設定）,
   Put/Get（Range）/Head/Delete Object, DeleteObjects, ListObjects V1/V2（encoding-type=url 対応）, presigned URL,
   CopyObject（COPY/REPLACE）, Create/UploadPart/UploadPartCopy/Complete/Abort MultipartUpload, ListParts, ListMultipartUploads,
-  条件付きリクエスト（GET/HEAD の If-Match / If-None-Match / If-(Un)Modified-Since、PUT の If-None-Match: *）
+  条件付きリクエスト（GET/HEAD の If-Match / If-None-Match / If-(Un)Modified-Since、PUT の If-None-Match: *）,
+  Put/GetBucketVersioning, ListObjectVersions, versionId 付き GET/HEAD/DELETE, Put/Get/DeleteBucketLifecycleConfiguration,
+  Put/GetObjectLockConfiguration, Put/GetObjectRetention, Put/GetObjectLegalHold, Put/Get/DeleteBucketCors
 
 ## ドキュメント・デプロイ
 
@@ -107,7 +120,8 @@ MIT ライセンス。依存クレートは `deny.toml` の許可リスト（MIT
   ローカルで試すなら `SUHMS_TEST_POSTGRES=postgres://... cargo test -p suhms-store`（テストごとに DB を作る）
 - ノード間通信は平文 HTTP（HMAC 認証のみ）。ノード間はプライベートネットワークか WireGuard 等で保護すること
 - チェックサムは検証するが保存しないので、GET で `x-amz-checksum-*` を返さない。マルチパート全体のチェックサム（COMPOSITE / FULL_OBJECT）も未対応
-- PUT の If-Match、ListMultipartUploads の delimiter は未対応
+- PUT の If-Match、ListMultipartUploads / ListObjectVersions の delimiter、versionId 指定のコピー元は未対応
+- 削除マーカーだけが残ったキーの自動掃除（ExpiredObjectDeleteMarker）、ライフサイクルの transition は未対応
 - メタデータ更新前にクラッシュした場合や、オフラインのディスク上に残った孤立ファイルの GC がない
 - ディスクの恒久撤去（decommission）時に replicas 行を消す管理操作がない
 - `list_misreplicated` は objects の全件走査。数億件規模では見直しが必要

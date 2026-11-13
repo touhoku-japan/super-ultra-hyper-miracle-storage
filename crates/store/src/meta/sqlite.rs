@@ -9,9 +9,10 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::{
-    AccessKeyRecord, BucketRecord, DeleteBucketOutcome, DiskRecord, MetadataStore, ObjectRecord,
-    PartRecord, ReplicaEntry, StorageUsage, StoredObject, TenantRecord, TenantUpdate, UploadRecord,
-    UsageDelta, UsageRow, decode_disks, decode_user_metadata, encode_disks, encode_user_metadata,
+    AccessKeyRecord, BucketRecord, BucketSetting, DeleteBucketOutcome, DiskRecord, MetadataStore,
+    NULL_VERSION, ObjectRecord, PartRecord, ReplicaEntry, StorageUsage, StoredObject, TenantRecord,
+    TenantUpdate, UploadRecord, UsageDelta, UsageRow, VersioningMode, decode_disks,
+    decode_user_metadata, encode_disks, encode_user_metadata,
 };
 use crate::{
     disk::DiskId,
@@ -24,13 +25,16 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (2, include_str!("migrations/sqlite/0002_multipart.sql")),
     (3, include_str!("migrations/sqlite/0003_cluster.sql")),
     (4, include_str!("migrations/sqlite/0004_commercial.sql")),
+    (5, include_str!("migrations/sqlite/0005_versioning.sql")),
 ];
 
 macro_rules! object_select {
     ($where:literal) => {
         concat!(
             "SELECT id, bucket, object_key, size, etag, blake3, content_type, storage_class, ",
-            "user_metadata, desired_replicas, replicas_explicit, created_at FROM objects WHERE ",
+            "user_metadata, desired_replicas, replicas_explicit, created_at, version_id, ",
+            "is_latest, delete_marker, noncurrent_at, lock_mode, lock_until, legal_hold ",
+            "FROM objects WHERE ",
             $where
         )
     };
@@ -75,13 +79,22 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
         if Some(*version) <= current {
             continue;
         }
-        let mut tx = pool.begin().await?;
+        // Table rebuilds must not cascade-delete dependent rows: run with foreign keys off
+        // (the pragma is ignored inside a transaction, so set it on the connection first).
+        let mut conn = pool.acquire().await?;
+        sqlx::raw_sql("PRAGMA foreign_keys = OFF")
+            .execute(&mut *conn)
+            .await?;
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
         sqlx::raw_sql(*sql).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO schema_migrations (version) VALUES (?)")
             .bind(version)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        sqlx::raw_sql("PRAGMA foreign_keys = ON")
+            .execute(&mut *conn)
+            .await?;
         tracing::info!(version, "applied metadata migration");
     }
     Ok(())
@@ -114,6 +127,13 @@ fn object_from_row(row: &SqliteRow) -> Result<ObjectRecord> {
         desired_replicas: to_u8(row.try_get("desired_replicas")?)?,
         replicas_explicit: row.try_get("replicas_explicit")?,
         created_at: row.try_get("created_at")?,
+        version_id: row.try_get("version_id")?,
+        is_latest: row.try_get("is_latest")?,
+        delete_marker: row.try_get("delete_marker")?,
+        noncurrent_at: row.try_get("noncurrent_at")?,
+        lock_mode: row.try_get("lock_mode")?,
+        lock_until: row.try_get("lock_until")?,
+        legal_hold: row.try_get("legal_hold")?,
     })
 }
 
@@ -127,6 +147,10 @@ fn bucket_from_row(r: &SqliteRow) -> Result<BucketRecord> {
             .transpose()?,
         created_at: r.try_get("created_at")?,
         public_read: r.try_get("public_read")?,
+        versioning: r.try_get("versioning")?,
+        lifecycle: r.try_get("lifecycle")?,
+        cors: r.try_get("cors")?,
+        object_lock: r.try_get("object_lock")?,
     })
 }
 
@@ -202,8 +226,9 @@ async fn insert_object(
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO objects (id, bucket, object_key, size, etag, blake3, content_type, \
-         storage_class, user_metadata, desired_replicas, replicas_explicit, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         storage_class, user_metadata, desired_replicas, replicas_explicit, created_at, \
+         version_id, is_latest, delete_marker, lock_mode, lock_until, legal_hold) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, ?, ?, ?, ?)",
     )
     .bind(object.id.to_string())
     .bind(&object.bucket)
@@ -217,6 +242,11 @@ async fn insert_object(
     .bind(i64::from(object.desired_replicas))
     .bind(object.replicas_explicit)
     .bind(object.created_at)
+    .bind(&object.version_id)
+    .bind(object.delete_marker)
+    .bind(&object.lock_mode)
+    .bind(object.lock_until)
+    .bind(object.legal_hold)
     .execute(&mut *conn)
     .await?;
     for disk in replicas {
@@ -243,6 +273,82 @@ async fn take_object(
             .await?;
     }
     Ok(previous)
+}
+
+async fn demote(conn: &mut SqliteConnection, id: Uuid, now: i64) -> Result<()> {
+    sqlx::query("UPDATE objects SET is_latest = FALSE, noncurrent_at = ? WHERE id = ?")
+        .bind(now)
+        .bind(id.to_string())
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+async fn load_version(
+    conn: &mut SqliteConnection,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Result<Option<StoredObject>> {
+    let row = sqlx::query(object_select!(
+        "bucket = ? AND object_key = ? AND version_id = ?"
+    ))
+    .bind(bucket)
+    .bind(key)
+    .bind(version_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    finish(conn, row).await
+}
+
+async fn delete_row(conn: &mut SqliteConnection, id: Uuid) -> Result<()> {
+    sqlx::query("DELETE FROM objects WHERE id = ?")
+        .bind(id.to_string())
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// Makes room for `object` as the key's new latest version and inserts it (inside the
+/// caller's transaction). Returns the versions that were removed.
+async fn place_version(
+    conn: &mut SqliteConnection,
+    object: &ObjectRecord,
+    replicas: &[DiskId],
+    if_absent: bool,
+    mode: VersioningMode,
+) -> Result<Vec<StoredObject>> {
+    let latest = load_by_key(conn, &object.bucket, &object.key).await?;
+    if if_absent && latest.as_ref().is_some_and(|l| !l.object.delete_marker) {
+        return Err(StoreError::PreconditionFailed);
+    }
+    let mut removed = Vec::new();
+    match mode {
+        VersioningMode::Unversioned => {
+            if let Some(l) = latest {
+                delete_row(conn, l.object.id).await?;
+                removed.push(l);
+            }
+        }
+        VersioningMode::Enabled => {
+            if let Some(l) = latest {
+                demote(conn, l.object.id, object.created_at).await?;
+            }
+        }
+        VersioningMode::Suspended => {
+            if let Some(n) = load_version(conn, &object.bucket, &object.key, NULL_VERSION).await? {
+                delete_row(conn, n.object.id).await?;
+                removed.push(n);
+            }
+            if let Some(l) = latest
+                && l.object.version_id != NULL_VERSION
+            {
+                demote(conn, l.object.id, object.created_at).await?;
+            }
+        }
+    }
+    insert_object(conn, object, replicas).await?;
+    Ok(removed)
 }
 
 fn tenant_from_row(r: &SqliteRow) -> Result<TenantRecord> {
@@ -293,11 +399,13 @@ async fn load_by_key(
     bucket: &str,
     key: &str,
 ) -> Result<Option<StoredObject>> {
-    let row = sqlx::query(object_select!("bucket = ? AND object_key = ?"))
-        .bind(bucket)
-        .bind(key)
-        .fetch_optional(&mut *conn)
-        .await?;
+    let row = sqlx::query(object_select!(
+        "bucket = ? AND object_key = ? AND is_latest = TRUE"
+    ))
+    .bind(bucket)
+    .bind(key)
+    .fetch_optional(&mut *conn)
+    .await?;
     finish(conn, row).await
 }
 
@@ -465,6 +573,180 @@ impl MetadataStore for SqliteMetadata {
                 stored_bytes: u64_of(r.try_get("stored_bytes")?),
             })
         })
+        .collect()
+    }
+
+    async fn get_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<Option<StoredObject>> {
+        let mut conn = self.pool.acquire().await?;
+        load_version(&mut conn, bucket, key, version_id).await
+    }
+
+    async fn delete_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<Option<StoredObject>> {
+        let _guard = self.write_lock.lock().await;
+        let mut tx = self.pool.begin().await?;
+        let Some(v) = load_version(&mut tx, bucket, key, version_id).await? else {
+            return Ok(None);
+        };
+        delete_row(&mut tx, v.object.id).await?;
+        if v.object.is_latest {
+            let next = sqlx::query(object_select!(
+                "bucket = ? AND object_key = ? ORDER BY created_at DESC, id DESC LIMIT 1"
+            ))
+            .bind(bucket)
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(row) = next {
+                let next = object_from_row(&row)?;
+                sqlx::query(
+                    "UPDATE objects SET is_latest = TRUE, noncurrent_at = NULL WHERE id = ?",
+                )
+                .bind(next.id.to_string())
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(Some(v))
+    }
+
+    async fn list_object_versions(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        after: (&str, i64, &str),
+        limit: u32,
+    ) -> Result<Vec<ObjectRecord>> {
+        let (key, created, id) = after;
+        sqlx::query(object_select!(
+            "bucket = ? AND object_key >= ? AND (object_key > ? OR (object_key = ? AND \
+             (created_at < ? OR (created_at = ? AND id < ?)))) \
+             ORDER BY object_key, created_at DESC, id DESC LIMIT ?"
+        ))
+        .bind(bucket)
+        .bind(prefix)
+        .bind(key)
+        .bind(key)
+        .bind(created)
+        .bind(created)
+        .bind(id)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(object_from_row)
+        .collect()
+    }
+
+    async fn lifecycle_candidates(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        noncurrent: bool,
+        before: i64,
+        after: (&str, &str),
+        limit: u32,
+    ) -> Result<Vec<ObjectRecord>> {
+        let sql = if noncurrent {
+            object_select!(
+                "bucket = ? AND object_key >= ? AND (object_key, id) > (?, ?) \
+                 AND is_latest = FALSE AND noncurrent_at < ? ORDER BY object_key, id LIMIT ?"
+            )
+        } else {
+            object_select!(
+                "bucket = ? AND object_key >= ? AND (object_key, id) > (?, ?) \
+                 AND is_latest = TRUE AND delete_marker = FALSE AND created_at < ? \
+                 ORDER BY object_key, id LIMIT ?"
+            )
+        };
+        sqlx::query(sql)
+            .bind(bucket)
+            .bind(prefix)
+            .bind(after.0)
+            .bind(after.1)
+            .bind(before)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(object_from_row)
+            .collect()
+    }
+
+    async fn set_object_lock(
+        &self,
+        object_id: Uuid,
+        mode: Option<&str>,
+        until: Option<i64>,
+    ) -> Result<bool> {
+        let _guard = self.write_lock.lock().await;
+        let res = sqlx::query("UPDATE objects SET lock_mode = ?, lock_until = ? WHERE id = ?")
+            .bind(mode)
+            .bind(until)
+            .bind(object_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn set_legal_hold(&self, object_id: Uuid, on: bool) -> Result<bool> {
+        let _guard = self.write_lock.lock().await;
+        let res = sqlx::query("UPDATE objects SET legal_hold = ? WHERE id = ?")
+            .bind(on)
+            .bind(object_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn set_bucket_setting(
+        &self,
+        name: &str,
+        setting: BucketSetting,
+        value: Option<&str>,
+    ) -> Result<bool> {
+        let _guard = self.write_lock.lock().await;
+        let sql = match setting {
+            BucketSetting::Versioning => "UPDATE buckets SET versioning = ? WHERE name = ?",
+            BucketSetting::Lifecycle => "UPDATE buckets SET lifecycle = ? WHERE name = ?",
+            BucketSetting::Cors => "UPDATE buckets SET cors = ? WHERE name = ?",
+            BucketSetting::ObjectLock => "UPDATE buckets SET object_lock = ? WHERE name = ?",
+        };
+        let exists = sqlx::query("SELECT 1 FROM buckets WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some();
+        if !exists {
+            return Ok(false);
+        }
+        sqlx::query(sql)
+            .bind(value)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(true)
+    }
+
+    async fn list_all_buckets(&self) -> Result<Vec<BucketRecord>> {
+        sqlx::query(
+            "SELECT name, owner, replicas, created_at, public_read, versioning, lifecycle, cors, \
+             object_lock FROM buckets ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(bucket_from_row)
         .collect()
     }
 
@@ -645,7 +927,7 @@ impl MetadataStore for SqliteMetadata {
 
     async fn get_bucket(&self, name: &str) -> Result<Option<BucketRecord>> {
         sqlx::query(
-            "SELECT name, owner, replicas, created_at, public_read FROM buckets WHERE name = ?",
+            "SELECT name, owner, replicas, created_at, public_read, versioning, lifecycle, cors, object_lock FROM buckets WHERE name = ?",
         )
         .bind(name)
         .fetch_optional(&self.pool)
@@ -657,7 +939,7 @@ impl MetadataStore for SqliteMetadata {
 
     async fn list_buckets(&self, owner: &str) -> Result<Vec<BucketRecord>> {
         sqlx::query(
-            "SELECT name, owner, replicas, created_at, public_read FROM buckets WHERE owner = ? ORDER BY name",
+            "SELECT name, owner, replicas, created_at, public_read, versioning, lifecycle, cors, object_lock FROM buckets WHERE owner = ? ORDER BY name",
         )
         .bind(owner)
         .fetch_all(&self.pool)
@@ -722,7 +1004,8 @@ impl MetadataStore for SqliteMetadata {
         object: &ObjectRecord,
         replicas: &[DiskId],
         if_absent: bool,
-    ) -> Result<Option<StoredObject>> {
+        mode: VersioningMode,
+    ) -> Result<Vec<StoredObject>> {
         let _guard = self.write_lock.lock().await;
         let mut tx = self.pool.begin().await?;
         let bucket_exists = sqlx::query("SELECT 1 FROM buckets WHERE name = ?")
@@ -733,13 +1016,9 @@ impl MetadataStore for SqliteMetadata {
         if !bucket_exists {
             return Err(StoreError::NoSuchBucket(object.bucket.clone()));
         }
-        let previous = take_object(&mut tx, &object.bucket, &object.key).await?;
-        if if_absent && previous.is_some() {
-            return Err(StoreError::PreconditionFailed);
-        }
-        insert_object(&mut tx, object, replicas).await?;
+        let removed = place_version(&mut tx, object, replicas, if_absent, mode).await?;
         tx.commit().await?;
-        Ok(previous)
+        Ok(removed)
     }
 
     async fn get_object(&self, bucket: &str, key: &str) -> Result<Option<StoredObject>> {
@@ -769,7 +1048,8 @@ impl MetadataStore for SqliteMetadata {
     ) -> Result<Vec<ObjectRecord>> {
         // SQLite's default BINARY collation compares UTF-8 bytes, which is S3's key order.
         sqlx::query(object_select!(
-            "bucket = ? AND object_key >= ? AND object_key > ? ORDER BY object_key LIMIT ?"
+            "bucket = ? AND object_key >= ? AND object_key > ? AND is_latest = TRUE \
+             AND delete_marker = FALSE ORDER BY object_key LIMIT ?"
         ))
         .bind(bucket)
         .bind(from)
@@ -935,7 +1215,8 @@ impl MetadataStore for SqliteMetadata {
         upload_id: Uuid,
         object: &ObjectRecord,
         replicas: &[DiskId],
-    ) -> Result<(Vec<PartRecord>, Option<StoredObject>)> {
+        mode: VersioningMode,
+    ) -> Result<(Vec<PartRecord>, Vec<StoredObject>)> {
         let _guard = self.write_lock.lock().await;
         let mut tx = self.pool.begin().await?;
         let parts = load_parts(&mut tx, upload_id).await?;
@@ -946,10 +1227,9 @@ impl MetadataStore for SqliteMetadata {
         if res.rows_affected() == 0 {
             return Err(StoreError::NoSuchUpload);
         }
-        let previous = take_object(&mut tx, &object.bucket, &object.key).await?;
-        insert_object(&mut tx, object, replicas).await?;
+        let removed = place_version(&mut tx, object, replicas, false, mode).await?;
         tx.commit().await?;
-        Ok((parts, previous))
+        Ok((parts, removed))
     }
 
     async fn add_replica(&self, object_id: Uuid, disk_id: DiskId) -> Result<bool> {

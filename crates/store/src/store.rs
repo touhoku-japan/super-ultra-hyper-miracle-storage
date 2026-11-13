@@ -16,10 +16,13 @@ use crate::{
     config::StoreConfig,
     disk::{Disk, DiskId},
     error::{Result, StoreError},
+    lifecycle::{self, LifecycleRule},
     list::{self, ListPage, ListParams},
+    lock::{self, BucketLock},
     meta::{
-        self, BucketRecord, DeleteBucketOutcome, MetadataStore, ObjectRecord, PartRecord,
-        StorageUsage, StoredObject, TenantRecord, UploadRecord,
+        self, BucketRecord, BucketSetting, DeleteBucketOutcome, MetadataStore, NULL_VERSION,
+        ObjectRecord, PartRecord, StorageUsage, StoredObject, TenantRecord, UploadRecord,
+        VersioningMode,
     },
     placement::{self, Candidate},
 };
@@ -64,6 +67,26 @@ pub struct PutObjectRequest {
     pub content_md5: Option<[u8; 16]>,
     /// `If-None-Match: *`: fail with [`StoreError::PreconditionFailed`] if the key exists.
     pub if_absent: bool,
+    /// Object Lock retention for the new object (needs a lock-enabled bucket); without it the
+    /// bucket's default retention applies.
+    pub lock_mode: Option<String>,
+    pub lock_until: Option<i64>,
+    pub legal_hold: bool,
+}
+
+/// Outcome of a DeleteObject.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeleteResult {
+    /// The version that was deleted, or the delete marker that was created.
+    pub version_id: Option<String>,
+    /// Whether a delete marker was created (or deleted).
+    pub delete_marker: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VersionsPage {
+    pub versions: Vec<ObjectRecord>,
+    pub truncated: bool,
 }
 
 /// One entry of a CompleteMultipartUpload request.
@@ -123,6 +146,29 @@ fn now_millis() -> i64 {
 /// Start (unix ms) of the hour containing `millis`.
 pub fn hour_of(millis: i64) -> i64 {
     millis - millis.rem_euclid(3_600_000)
+}
+
+/// Version id for a new object or delete marker: time-ordered when versioning is enabled,
+/// otherwise the `null` version.
+fn new_version_id(mode: VersioningMode) -> String {
+    match mode {
+        VersioningMode::Enabled => Uuid::now_v7().simple().to_string(),
+        _ => NULL_VERSION.to_owned(),
+    }
+}
+
+/// Fails if Object Lock protects the version from deletion.
+fn check_unlocked(o: &ObjectRecord, bypass_governance: bool) -> Result<()> {
+    if o.legal_hold {
+        return Err(StoreError::ObjectLocked);
+    }
+    if let (Some(mode), Some(until)) = (&o.lock_mode, o.lock_until)
+        && until > now_millis()
+        && (mode == lock::COMPLIANCE || !bypass_governance)
+    {
+        return Err(StoreError::ObjectLocked);
+    }
+    Ok(())
 }
 
 fn validate_key(key: &str) -> Result<()> {
@@ -515,7 +561,7 @@ impl Store {
             owner: owner.to_owned(),
             replicas,
             created_at: now_millis(),
-            public_read: false,
+            ..BucketRecord::default()
         };
         if !self.meta.create_bucket(&record).await? {
             let existing = self.meta.get_bucket(name).await?;
@@ -624,6 +670,14 @@ impl Store {
             });
         }
 
+        let mode = VersioningMode::of(bucket);
+        let (lock_mode, lock_until) =
+            Self::retention_for(bucket, req.lock_mode.as_deref(), req.lock_until)?;
+        if req.legal_hold && !lock::decode(bucket.object_lock.as_deref()).enabled {
+            return Err(StoreError::InvalidRequest(
+                "the bucket does not have Object Lock enabled".into(),
+            ));
+        }
         let id = Uuid::new_v4();
         let outcome = blob::write_replicas(&targets, Dest::Object(id), required, body).await?;
         let written = StoredObject {
@@ -640,6 +694,13 @@ impl Store {
                 desired_replicas: replicas,
                 replicas_explicit: explicit,
                 created_at: now_millis(),
+                version_id: new_version_id(mode),
+                is_latest: true,
+                delete_marker: false,
+                noncurrent_at: None,
+                lock_mode,
+                lock_until,
+                legal_hold: req.legal_hold,
             },
             replicas: outcome.written,
         };
@@ -660,17 +721,22 @@ impl Store {
                 "object stored with fewer copies than requested; repair will add the rest"
             );
         }
-        self.commit_object(written, req.if_absent).await
+        self.commit_object(written, req.if_absent, mode).await
     }
 
-    async fn commit_object(&self, written: StoredObject, if_absent: bool) -> Result<ObjectRecord> {
+    async fn commit_object(
+        &self,
+        written: StoredObject,
+        if_absent: bool,
+        mode: VersioningMode,
+    ) -> Result<ObjectRecord> {
         match self
             .meta
-            .put_object(&written.object, &written.replicas, if_absent)
+            .put_object(&written.object, &written.replicas, if_absent, mode)
             .await
         {
-            Ok(previous) => {
-                if let Some(prev) = previous {
+            Ok(removed) => {
+                for prev in removed {
                     self.remove_files(&prev).await;
                 }
                 Ok(written.object)
@@ -943,6 +1009,9 @@ impl Store {
         requested: &[CompletedPart],
     ) -> Result<ObjectRecord> {
         let upload = self.owned_upload(owner, bucket, key, upload_id).await?;
+        let bucket_rec = self.require_bucket(bucket).await?;
+        let mode = VersioningMode::of(&bucket_rec);
+        let (lock_mode, lock_until) = Self::retention_for(&bucket_rec, None, None)?;
         self.check_quota(owner, 0).await?;
         if requested.is_empty() {
             return Err(StoreError::InvalidRequest(
@@ -1045,6 +1114,13 @@ impl Store {
                 desired_replicas: upload.desired_replicas,
                 replicas_explicit: upload.replicas_explicit,
                 created_at: now_millis(),
+                version_id: new_version_id(mode),
+                is_latest: true,
+                delete_marker: false,
+                noncurrent_at: None,
+                lock_mode,
+                lock_until,
+                legal_hold: false,
             },
             replicas: written.iter().map(|(d, _)| *d).collect(),
         };
@@ -1059,11 +1135,11 @@ impl Store {
 
         match self
             .meta
-            .complete_upload(upload_id, &new_object.object, &new_object.replicas)
+            .complete_upload(upload_id, &new_object.object, &new_object.replicas, mode)
             .await
         {
-            Ok((parts, previous)) => {
-                if let Some(prev) = previous {
+            Ok((parts, removed)) => {
+                for prev in removed {
                     self.remove_files(&prev).await;
                 }
                 self.remove_upload_files(&upload, &parts).await;
@@ -1076,8 +1152,11 @@ impl Store {
         }
     }
 
+    /// The latest version of a key; a delete marker counts as no object.
     async fn require_object(&self, bucket: &str, key: &str) -> Result<StoredObject> {
-        if let Some(stored) = self.meta.get_object(bucket, key).await? {
+        if let Some(stored) = self.meta.get_object(bucket, key).await?
+            && !stored.object.delete_marker
+        {
             return Ok(stored);
         }
         self.require_bucket(bucket).await?;
@@ -1121,16 +1200,450 @@ impl Store {
         Err(StoreError::NoHealthyReplica(stored.object.id))
     }
 
-    /// Deletes the object. Returns false when it did not exist.
-    pub async fn delete_object(&self, owner: &str, bucket: &str, key: &str) -> Result<bool> {
-        self.owned_bucket(owner, bucket).await?;
-        match self.meta.delete_object(bucket, key).await? {
-            Some(prev) => {
+    /// Deletes the key. In a versioned bucket this adds a delete marker (the data stays as a
+    /// noncurrent version); otherwise the object is removed.
+    pub async fn delete_object(
+        &self,
+        owner: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<DeleteResult> {
+        let b = self.owned_bucket(owner, bucket).await?;
+        let mode = VersioningMode::of(&b);
+        if mode == VersioningMode::Unversioned {
+            if let Some(prev) = self.meta.delete_object(bucket, key).await? {
                 self.remove_files(&prev).await;
-                Ok(true)
             }
-            None => Ok(false),
+            return Ok(DeleteResult::default());
         }
+        let marker = ObjectRecord {
+            id: Uuid::new_v4(),
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            created_at: now_millis(),
+            version_id: new_version_id(mode),
+            is_latest: true,
+            delete_marker: true,
+            ..ObjectRecord::default()
+        };
+        for prev in self.meta.put_object(&marker, &[], false, mode).await? {
+            self.remove_files(&prev).await;
+        }
+        Ok(DeleteResult {
+            version_id: Some(marker.version_id),
+            delete_marker: true,
+        })
+    }
+
+    /// Permanently deletes one version, unless Object Lock protects it. A GOVERNANCE
+    /// retention can be bypassed with `bypass_governance`; COMPLIANCE and legal holds cannot.
+    pub async fn delete_object_version(
+        &self,
+        owner: &str,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        bypass_governance: bool,
+    ) -> Result<DeleteResult> {
+        self.owned_bucket(owner, bucket).await?;
+        let Some(v) = self
+            .meta
+            .get_object_version(bucket, key, version_id)
+            .await?
+        else {
+            // Deleting a missing version succeeds, as in S3.
+            return Ok(DeleteResult {
+                version_id: Some(version_id.to_owned()),
+                delete_marker: false,
+            });
+        };
+        check_unlocked(&v.object, bypass_governance)?;
+        if let Some(removed) = self
+            .meta
+            .delete_object_version(bucket, key, version_id)
+            .await?
+        {
+            self.remove_files(&removed).await;
+        }
+        Ok(DeleteResult {
+            version_id: Some(version_id.to_owned()),
+            delete_marker: v.object.delete_marker,
+        })
+    }
+
+    /// A specific version for reading. Asking for a delete marker is
+    /// [`StoreError::MethodNotAllowed`], as in S3.
+    pub async fn get_object_version(
+        &self,
+        owner: &str,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<StoredObject> {
+        self.owned_bucket(owner, bucket).await?;
+        let v = self
+            .meta
+            .get_object_version(bucket, key, version_id)
+            .await?
+            .ok_or_else(|| StoreError::NoSuchKey {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+            })?;
+        if v.object.delete_marker {
+            return Err(StoreError::MethodNotAllowed);
+        }
+        Ok(v)
+    }
+
+    /// Lists every version (and delete marker) under `prefix`, newest first per key.
+    pub async fn list_object_versions(
+        &self,
+        owner: &str,
+        bucket: &str,
+        prefix: &str,
+        key_marker: &str,
+        version_marker: Option<&str>,
+        max: usize,
+    ) -> Result<VersionsPage> {
+        self.owned_bucket(owner, bucket).await?;
+        let resume = match version_marker {
+            Some(v) if !key_marker.is_empty() => self
+                .meta
+                .get_object_version(bucket, key_marker, v)
+                .await?
+                .map(|o| (o.object.created_at, o.object.id.to_string())),
+            _ => None,
+        };
+        let (created, id) = resume.unwrap_or((i64::MIN, String::new()));
+        let max = max.min(1000);
+        let limit = u32::try_from(max + 1).unwrap_or(u32::MAX);
+        let mut versions: Vec<ObjectRecord> = self
+            .meta
+            .list_object_versions(bucket, prefix, (key_marker, created, &id), limit)
+            .await?
+            .into_iter()
+            .take_while(|o| o.key.starts_with(prefix))
+            .collect();
+        let truncated = versions.len() > max;
+        versions.truncate(max);
+        Ok(VersionsPage {
+            versions,
+            truncated,
+        })
+    }
+
+    // ---- bucket configuration: versioning, lifecycle, object lock, CORS ----
+
+    /// Turns versioning on (`Enabled`) or pauses it (`Suspended`). It cannot be turned off
+    /// again, and buckets with Object Lock must stay `Enabled`.
+    pub async fn set_versioning(&self, owner: &str, bucket: &str, status: &str) -> Result<()> {
+        let b = self.owned_bucket(owner, bucket).await?;
+        if !matches!(status, "Enabled" | "Suspended") {
+            return Err(StoreError::InvalidArgument(format!(
+                "invalid versioning status {status}"
+            )));
+        }
+        if status == "Suspended" && lock::decode(b.object_lock.as_deref()).enabled {
+            return Err(StoreError::InvalidRequest(
+                "versioning cannot be suspended on a bucket with Object Lock".into(),
+            ));
+        }
+        self.meta
+            .set_bucket_setting(bucket, BucketSetting::Versioning, Some(status))
+            .await?;
+        Ok(())
+    }
+
+    /// Enables Object Lock on a bucket (which also enables versioning); used at creation.
+    pub async fn enable_object_lock(&self, owner: &str, bucket: &str) -> Result<()> {
+        self.owned_bucket(owner, bucket).await?;
+        let cfg = BucketLock {
+            enabled: true,
+            ..BucketLock::default()
+        };
+        self.meta
+            .set_bucket_setting(bucket, BucketSetting::ObjectLock, Some(&lock::encode(&cfg)))
+            .await?;
+        self.meta
+            .set_bucket_setting(bucket, BucketSetting::Versioning, Some("Enabled"))
+            .await?;
+        Ok(())
+    }
+
+    /// Sets the default retention of a lock-enabled bucket (`None` removes it).
+    pub async fn set_default_retention(
+        &self,
+        owner: &str,
+        bucket: &str,
+        default: Option<(String, u32)>,
+    ) -> Result<()> {
+        let b = self.owned_bucket(owner, bucket).await?;
+        let mut cfg = lock::decode(b.object_lock.as_deref());
+        if !cfg.enabled {
+            return Err(StoreError::InvalidRequest(
+                "the bucket does not have Object Lock enabled".into(),
+            ));
+        }
+        if let Some((mode, _)) = &default
+            && !lock::valid_mode(mode)
+        {
+            return Err(StoreError::InvalidArgument(format!(
+                "invalid retention mode {mode}"
+            )));
+        }
+        cfg.default_mode = default.as_ref().map(|(m, _)| m.clone());
+        cfg.default_days = default.map(|(_, d)| d);
+        self.meta
+            .set_bucket_setting(bucket, BucketSetting::ObjectLock, Some(&lock::encode(&cfg)))
+            .await?;
+        Ok(())
+    }
+
+    /// The bucket's Object Lock configuration.
+    pub async fn object_lock_config(&self, owner: &str, bucket: &str) -> Result<BucketLock> {
+        let b = self.owned_bucket(owner, bucket).await?;
+        Ok(lock::decode(b.object_lock.as_deref()))
+    }
+
+    /// Retention for a new object: explicit, else the bucket default, else none.
+    fn retention_for(
+        bucket: &BucketRecord,
+        mode: Option<&str>,
+        until: Option<i64>,
+    ) -> Result<(Option<String>, Option<i64>)> {
+        let cfg = lock::decode(bucket.object_lock.as_deref());
+        match (mode, until) {
+            (Some(m), Some(u)) => {
+                if !cfg.enabled {
+                    return Err(StoreError::InvalidRequest(
+                        "the bucket does not have Object Lock enabled".into(),
+                    ));
+                }
+                if !lock::valid_mode(m) {
+                    return Err(StoreError::InvalidArgument(format!(
+                        "invalid retention mode {m}"
+                    )));
+                }
+                Ok((Some(m.to_owned()), Some(u)))
+            }
+            (None, None) => match (cfg.default_mode, cfg.default_days) {
+                (Some(m), Some(days)) if cfg.enabled => {
+                    Ok((Some(m), Some(now_millis() + i64::from(days) * 86_400_000)))
+                }
+                _ => Ok((None, None)),
+            },
+            _ => Err(StoreError::InvalidArgument(
+                "retention needs both a mode and a retain-until date".into(),
+            )),
+        }
+    }
+
+    async fn owned_version(
+        &self,
+        owner: &str,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> Result<StoredObject> {
+        match version_id {
+            Some(v) => self.get_object_version(owner, bucket, key, v).await,
+            None => self.owned_object(owner, bucket, key).await,
+        }
+    }
+
+    /// Sets an object version's retention. COMPLIANCE retention can only be extended;
+    /// GOVERNANCE can be shortened or removed only with `bypass_governance`.
+    pub async fn set_object_retention(
+        &self,
+        owner: &str,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        retention: Option<(String, i64)>,
+        bypass_governance: bool,
+    ) -> Result<()> {
+        let b = self.owned_bucket(owner, bucket).await?;
+        if !lock::decode(b.object_lock.as_deref()).enabled {
+            return Err(StoreError::InvalidRequest(
+                "the bucket does not have Object Lock enabled".into(),
+            ));
+        }
+        let v = self.owned_version(owner, bucket, key, version_id).await?;
+        let o = &v.object;
+        let now = now_millis();
+        if let (Some(mode), Some(until)) = (&o.lock_mode, o.lock_until)
+            && until > now
+        {
+            let weakens = match &retention {
+                None => true,
+                Some((m, u)) => *u < until || (mode == lock::COMPLIANCE && m != lock::COMPLIANCE),
+            };
+            if weakens && (mode == lock::COMPLIANCE || !bypass_governance) {
+                return Err(StoreError::ObjectLocked);
+            }
+        }
+        if let Some((m, _)) = &retention
+            && !lock::valid_mode(m)
+        {
+            return Err(StoreError::InvalidArgument(format!(
+                "invalid retention mode {m}"
+            )));
+        }
+        let (mode, until) = match retention {
+            Some((m, u)) => (Some(m), Some(u)),
+            None => (None, None),
+        };
+        self.meta
+            .set_object_lock(o.id, mode.as_deref(), until)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_legal_hold(
+        &self,
+        owner: &str,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        on: bool,
+    ) -> Result<()> {
+        let b = self.owned_bucket(owner, bucket).await?;
+        if !lock::decode(b.object_lock.as_deref()).enabled {
+            return Err(StoreError::InvalidRequest(
+                "the bucket does not have Object Lock enabled".into(),
+            ));
+        }
+        let v = self.owned_version(owner, bucket, key, version_id).await?;
+        self.meta.set_legal_hold(v.object.id, on).await?;
+        Ok(())
+    }
+
+    /// An object version's retention and legal hold.
+    pub async fn object_lock_state(
+        &self,
+        owner: &str,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> Result<ObjectRecord> {
+        Ok(self
+            .owned_version(owner, bucket, key, version_id)
+            .await?
+            .object)
+    }
+
+    pub async fn set_lifecycle(
+        &self,
+        owner: &str,
+        bucket: &str,
+        rules: Option<&[LifecycleRule]>,
+    ) -> Result<()> {
+        self.owned_bucket(owner, bucket).await?;
+        let value = rules.map(lifecycle::encode);
+        self.meta
+            .set_bucket_setting(bucket, BucketSetting::Lifecycle, value.as_deref())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn lifecycle(&self, owner: &str, bucket: &str) -> Result<Option<Vec<LifecycleRule>>> {
+        let b = self.owned_bucket(owner, bucket).await?;
+        Ok(b.lifecycle.as_deref().map(lifecycle::decode))
+    }
+
+    /// Stores the bucket's CORS rules (opaque JSON, interpreted by the server).
+    pub async fn set_cors(&self, owner: &str, bucket: &str, cors: Option<&str>) -> Result<()> {
+        self.owned_bucket(owner, bucket).await?;
+        self.meta
+            .set_bucket_setting(bucket, BucketSetting::Cors, cors)
+            .await?;
+        Ok(())
+    }
+
+    /// Applies every bucket's lifecycle rules once. Returns (expired, noncurrent deleted,
+    /// uploads aborted).
+    pub async fn apply_lifecycle(&self) -> Result<(u64, u64, u64)> {
+        let now = now_millis();
+        let (mut expired, mut purged, mut aborted) = (0, 0, 0);
+        for b in self.meta.list_all_buckets().await? {
+            let Some(rules) = b.lifecycle.as_deref().map(lifecycle::decode) else {
+                continue;
+            };
+            for rule in rules.iter().filter(|r| r.enabled) {
+                let days = |d: u32| now - i64::from(d) * 86_400_000;
+                if let Some(d) = rule.expiration_days {
+                    for o in self
+                        .lifecycle_scan(&b.name, &rule.prefix, false, days(d))
+                        .await?
+                    {
+                        self.delete_object(&b.owner, &b.name, &o.key).await?;
+                        expired += 1;
+                    }
+                }
+                if let Some(d) = rule.noncurrent_days {
+                    for o in self
+                        .lifecycle_scan(&b.name, &rule.prefix, true, days(d))
+                        .await?
+                    {
+                        match self
+                            .delete_object_version(&b.owner, &b.name, &o.key, &o.version_id, false)
+                            .await
+                        {
+                            Ok(_) => purged += 1,
+                            Err(StoreError::ObjectLocked) => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+                if let Some(d) = rule.abort_multipart_days {
+                    let cutoff = days(d);
+                    let uploads = self
+                        .meta
+                        .list_uploads(&b.name, &rule.prefix, "", "", 1000)
+                        .await?;
+                    for u in uploads.into_iter().filter(|u| u.created_at < cutoff) {
+                        if let Some((upload, parts)) = self.meta.delete_upload(u.id).await? {
+                            self.remove_upload_files(&upload, &parts).await;
+                            aborted += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok((expired, purged, aborted))
+    }
+
+    async fn lifecycle_scan(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        noncurrent: bool,
+        before: i64,
+    ) -> Result<Vec<ObjectRecord>> {
+        let mut out = Vec::new();
+        let (mut after_key, mut after_id) = (String::new(), String::new());
+        loop {
+            let page = self
+                .meta
+                .lifecycle_candidates(
+                    bucket,
+                    prefix,
+                    noncurrent,
+                    before,
+                    (&after_key, &after_id),
+                    PAGE,
+                )
+                .await?;
+            let Some(last) = page.last() else { break };
+            after_key.clone_from(&last.key);
+            after_id = last.id.to_string();
+            let done = page.iter().any(|o| !o.key.starts_with(prefix));
+            out.extend(page.into_iter().filter(|o| o.key.starts_with(prefix)));
+            if done {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Lists a bucket the way S3's ListObjects does: keys under `prefix`, with keys that share

@@ -6,7 +6,9 @@ pub mod cluster;
 pub mod config;
 pub mod disk;
 pub mod error;
+pub mod lifecycle;
 pub mod list;
+pub mod lock;
 pub mod meta;
 pub mod placement;
 mod store;
@@ -17,11 +19,12 @@ pub use crate::{
     error::{Result, StoreError},
     list::{ListPage, ListParams, ListStart},
     meta::{
-        AccessKeyRecord, BucketRecord, ObjectRecord, PartRecord, StorageUsage, TenantRecord,
-        TenantUpdate, UploadRecord, UsageDelta, UsageRow,
+        AccessKeyRecord, BucketRecord, NULL_VERSION, ObjectRecord, PartRecord, StorageUsage,
+        TenantRecord, TenantUpdate, UploadRecord, UsageDelta, UsageRow, VersioningMode,
     },
     store::{
-        CompletedPart, DiskInfo, HEARTBEAT_INTERVAL, MAX_PART_NUMBER, MIN_PART_SIZE, PartsPage,
-        PutObjectRequest, RepairReport, ScrubReport, Store, UploadsPage, hour_of,
+        CompletedPart, DeleteResult, DiskInfo, HEARTBEAT_INTERVAL, MAX_PART_NUMBER, MIN_PART_SIZE,
+        PartsPage, PutObjectRequest, RepairReport, ScrubReport, Store, UploadsPage, VersionsPage,
+        hour_of,
     },
 };

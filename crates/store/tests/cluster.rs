@@ -250,12 +250,10 @@ async fn copies_land_on_three_nodes_and_are_readable_everywhere() {
     }
 
     // Deleting through another node removes the files on every node.
-    assert!(
-        c.nodes[1]
-            .delete_object(OWNER, "data", "obj")
-            .await
-            .unwrap()
-    );
+    c.nodes[1]
+        .delete_object(OWNER, "data", "obj")
+        .await
+        .unwrap();
     for node in ["node1", "node2", "node3"] {
         assert_eq!(c.files_on(node), 0, "{node}");
     }

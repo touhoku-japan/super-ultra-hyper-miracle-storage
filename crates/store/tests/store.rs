@@ -193,9 +193,9 @@ async fn overwrite_and_delete_remove_old_files() {
     assert!(matches!(err, StoreError::BucketNotEmpty(_)), "{err}");
 
     let cur = store.object_locations("bk1", "k").await.unwrap();
-    assert!(store.delete_object(OWNER, "bk1", "k").await.unwrap());
+    store.delete_object(OWNER, "bk1", "k").await.unwrap();
     assert!(cur.iter().all(|p| !p.exists()));
-    assert!(!store.delete_object(OWNER, "bk1", "k").await.unwrap());
+    store.delete_object(OWNER, "bk1", "k").await.unwrap();
     let err = store.get_object(OWNER, "bk1", "k").await.unwrap_err();
     assert!(matches!(err, StoreError::NoSuchKey { .. }), "{err}");
 
@@ -1019,4 +1019,288 @@ async fn usage_meter_accumulates_and_snapshots() {
         .await
         .unwrap();
     assert_eq!((rows[0].stored_objects, rows[0].logical_bytes), (2, 8));
+}
+
+async fn versions(store: &Store, bucket: &str) -> Vec<(String, String, bool, bool)> {
+    store
+        .list_object_versions(OWNER, bucket, "", "", None, 1000)
+        .await
+        .unwrap()
+        .versions
+        .into_iter()
+        .map(|o| (o.key, o.version_id, o.is_latest, o.delete_marker))
+        .collect()
+}
+
+#[tokio::test]
+async fn versioning_keeps_old_versions_and_delete_markers() {
+    let env = Env::new(1).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "ver", Some(1)).await.unwrap();
+    store.set_versioning(OWNER, "ver", "Enabled").await.unwrap();
+
+    let v1 = store
+        .put_object(OWNER, put("ver", "k", None), &b"one"[..])
+        .await
+        .unwrap();
+    let v2 = store
+        .put_object(OWNER, put("ver", "k", None), &b"two"[..])
+        .await
+        .unwrap();
+    assert_ne!(v1.version_id, "null");
+    assert_ne!(v1.version_id, v2.version_id);
+    assert_eq!(read_object(&store, "ver", "k").await, b"two");
+    let old = store
+        .get_object_version(OWNER, "ver", "k", &v1.version_id)
+        .await
+        .unwrap();
+    let mut r = store.read_object(&old, 0..3).await.unwrap();
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).await.unwrap();
+    assert_eq!(buf, b"one");
+
+    // Delete adds a marker; the data stays.
+    let d = store.delete_object(OWNER, "ver", "k").await.unwrap();
+    assert!(d.delete_marker);
+    let err = store.get_object(OWNER, "ver", "k").await.unwrap_err();
+    assert!(matches!(err, StoreError::NoSuchKey { .. }), "{err}");
+    let page = store
+        .list_objects(
+            OWNER,
+            &ListParams {
+                bucket: "ver".into(),
+                prefix: String::new(),
+                delimiter: None,
+                start: ListStart::Beginning,
+                max_keys: 1000,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(page.objects.is_empty(), "deleted keys are not listed");
+    let vs = versions(&store, "ver").await;
+    assert_eq!(vs.len(), 3);
+    assert!(
+        vs[0].2 && vs[0].3,
+        "newest is the latest, a delete marker: {vs:?}"
+    );
+    let err = store
+        .get_object_version(OWNER, "ver", "k", d.version_id.as_deref().unwrap())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::MethodNotAllowed), "{err}");
+
+    // Removing the marker restores the key; removing v2 makes v1 current.
+    store
+        .delete_object_version(OWNER, "ver", "k", d.version_id.as_deref().unwrap(), false)
+        .await
+        .unwrap();
+    assert_eq!(read_object(&store, "ver", "k").await, b"two");
+    store
+        .delete_object_version(OWNER, "ver", "k", &v2.version_id, false)
+        .await
+        .unwrap();
+    assert_eq!(read_object(&store, "ver", "k").await, b"one");
+    assert_eq!(versions(&store, "ver").await.len(), 1);
+    let err = store.delete_bucket(OWNER, "ver").await.unwrap_err();
+    assert!(matches!(err, StoreError::BucketNotEmpty(_)), "{err}");
+}
+
+#[tokio::test]
+async fn suspended_versioning_replaces_only_the_null_version() {
+    let env = Env::new(1).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "sus", Some(1)).await.unwrap();
+    store
+        .put_object(OWNER, put("sus", "k", None), &b"pre"[..])
+        .await
+        .unwrap(); // null version
+    store.set_versioning(OWNER, "sus", "Enabled").await.unwrap();
+    let kept = store
+        .put_object(OWNER, put("sus", "k", None), &b"kept"[..])
+        .await
+        .unwrap();
+    store
+        .set_versioning(OWNER, "sus", "Suspended")
+        .await
+        .unwrap();
+    store
+        .put_object(OWNER, put("sus", "k", None), &b"a"[..])
+        .await
+        .unwrap();
+    store
+        .put_object(OWNER, put("sus", "k", None), &b"b"[..])
+        .await
+        .unwrap();
+    let vs = versions(&store, "sus").await;
+    let ids: Vec<&str> = vs.iter().map(|v| v.1.as_str()).collect();
+    assert_eq!(ids, vec!["null", kept.version_id.as_str()], "{vs:?}");
+    assert_eq!(read_object(&store, "sus", "k").await, b"b");
+    // Only the live files remain on disk (the replaced null versions were removed).
+    let files = walk_files(&env.disks[0].join("objects"));
+    assert_eq!(files, 2);
+}
+
+fn walk_files(p: &std::path::Path) -> usize {
+    std::fs::read_dir(p).map_or(0, |entries| {
+        entries
+            .flatten()
+            .map(|e| {
+                if e.path().is_dir() {
+                    walk_files(&e.path())
+                } else {
+                    1
+                }
+            })
+            .sum()
+    })
+}
+
+#[tokio::test]
+async fn object_lock_protects_versions() {
+    let env = Env::new(1).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "worm", Some(1)).await.unwrap();
+    store.enable_object_lock(OWNER, "worm").await.unwrap();
+    let err = store
+        .set_versioning(OWNER, "worm", "Suspended")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::InvalidRequest(_)), "{err}");
+    store
+        .set_default_retention(OWNER, "worm", Some(("GOVERNANCE".into(), 1)))
+        .await
+        .unwrap();
+
+    let g = store
+        .put_object(OWNER, put("worm", "gov", None), &b"g"[..])
+        .await
+        .unwrap();
+    assert_eq!(g.lock_mode.as_deref(), Some("GOVERNANCE"));
+    let err = store
+        .delete_object_version(OWNER, "worm", "gov", &g.version_id, false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ObjectLocked), "{err}");
+    store
+        .delete_object_version(OWNER, "worm", "gov", &g.version_id, true)
+        .await
+        .unwrap();
+
+    let far = 4_102_444_800_000; // 2100-01-01
+    let mut req = put("worm", "comp", None);
+    req.lock_mode = Some("COMPLIANCE".into());
+    req.lock_until = Some(far);
+    let c = store.put_object(OWNER, req, &b"c"[..]).await.unwrap();
+    let err = store
+        .delete_object_version(OWNER, "worm", "comp", &c.version_id, true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::ObjectLocked),
+        "compliance cannot be bypassed: {err}"
+    );
+    let err = store
+        .set_object_retention(
+            OWNER,
+            "worm",
+            "comp",
+            None,
+            Some(("COMPLIANCE".into(), far - 1)),
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::ObjectLocked),
+        "compliance cannot be shortened: {err}"
+    );
+    store
+        .set_object_retention(
+            OWNER,
+            "worm",
+            "comp",
+            None,
+            Some(("COMPLIANCE".into(), far + 1)),
+            false,
+        )
+        .await
+        .unwrap();
+    // Deleting the key itself only adds a marker, which is allowed.
+    store.delete_object(OWNER, "worm", "comp").await.unwrap();
+
+    let h = store
+        .put_object(OWNER, put("worm", "held", None), &b"h"[..])
+        .await
+        .unwrap();
+    store
+        .set_object_retention(OWNER, "worm", "held", None, None, true)
+        .await
+        .unwrap();
+    store
+        .set_legal_hold(OWNER, "worm", "held", None, true)
+        .await
+        .unwrap();
+    let err = store
+        .delete_object_version(OWNER, "worm", "held", &h.version_id, true)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ObjectLocked), "{err}");
+    store
+        .set_legal_hold(OWNER, "worm", "held", None, false)
+        .await
+        .unwrap();
+    store
+        .delete_object_version(OWNER, "worm", "held", &h.version_id, false)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn lifecycle_expires_and_purges() {
+    use suhms_store::lifecycle::LifecycleRule;
+    let env = Env::new(1).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "lcy", Some(1)).await.unwrap();
+    store.set_versioning(OWNER, "lcy", "Enabled").await.unwrap();
+    for k in ["logs/a", "logs/b", "keep/c"] {
+        store
+            .put_object(OWNER, put("lcy", k, None), &b"x"[..])
+            .await
+            .unwrap();
+    }
+    let rules = vec![LifecycleRule {
+        id: "logs".into(),
+        prefix: "logs/".into(),
+        enabled: true,
+        expiration_days: Some(0),
+        noncurrent_days: None,
+        abort_multipart_days: None,
+    }];
+    store
+        .set_lifecycle(OWNER, "lcy", Some(&rules))
+        .await
+        .unwrap();
+    assert_eq!(store.lifecycle(OWNER, "lcy").await.unwrap().unwrap(), rules);
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let (expired, purged, _) = store.apply_lifecycle().await.unwrap();
+    assert_eq!((expired, purged), (2, 0));
+    assert!(store.get_object(OWNER, "lcy", "logs/a").await.is_err());
+    assert_eq!(read_object(&store, "lcy", "keep/c").await, b"x");
+
+    // Now purge the noncurrent data of expired keys.
+    let mut rules = rules;
+    rules[0].noncurrent_days = Some(0);
+    store
+        .set_lifecycle(OWNER, "lcy", Some(&rules))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let (_, purged, _) = store.apply_lifecycle().await.unwrap();
+    assert_eq!(purged, 2);
+    let vs = versions(&store, "lcy").await;
+    assert!(
+        vs.iter().filter(|v| v.0.starts_with("logs/")).all(|v| v.3),
+        "only markers left: {vs:?}"
+    );
 }
