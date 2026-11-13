@@ -15,8 +15,15 @@ release ビルドは CI 側で行う想定。
 ## 構成
 
 - Cargo workspace。クレートは `crates/*`
-  - `server/` — バイナリ `suhms`。設定（TOML、`deny_unknown_fields`）、tracing、graceful shutdown
-- 予定: `store/`（EC ストレージエンジン、trait で抽象化）、`auth/`（テナント・アクセスキー・SigV4）、`admin-cli/`
+  - `server/` — バイナリ `suhms`。設定（TOML、`deny_unknown_fields`）、tracing、graceful shutdown。まだ store とは未接続
+  - `store/` — ストレージエンジン（Phase 1）
+    - `disk.rs` — ディスク = 既存ディレクトリ。`.suhms/format.json` の UUID で識別（マウント順が変わっても同一視）。
+      ルートが無ければ作らない（未マウント時にルート FS へ書くのを防ぐ）。中身のある未フォーマットのディレクトリは使わない
+    - `placement.rs` — 配置（別ノード優先 → 同ノード別ディスク、空き容量の多い順）と ACK 閾値（過半数）
+    - `blob.rs` — 全レプリカへの同時ストリーミング書き込み（MD5=ETag と BLAKE3 を同時計算）、検証付きコピー
+    - `meta/` — `MetadataStore` trait と SQLite 実装（`sqlite_schema.sql`）
+    - `store.rs` — `Store`: バケット/オブジェクト操作、`scrub()`（ハッシュ照合で壊れたコピーを除去）、`repair()`（不足分を複製・過剰分を削除）
+- 予定: `auth/`（テナント・アクセスキー・SigV4）、`admin-cli/`
 - S3 プロトコル層は `s3s` クレートを採用（決定済み、Apache-2.0。`openssl` feature は使わない）
 
 ## ライセンス
@@ -47,6 +54,15 @@ MIT ライセンス。依存クレートは `deny.toml` の許可リスト（MIT
 - **メタデータ**: `trait MetadataStore` で抽象化し、SQLite / PostgreSQL / MariaDB を設定で選べるようにする（`sqlx` を想定）。
   SQLite は単一ノード構成と開発専用。マルチノードでは PostgreSQL（Patroni 等）か MariaDB（Galera 等）の HA 構成が前提。
   SQL は 3 方言すべてで動くものに限り、テストも 3 バックエンドで実行する。
+
+## 未対応（Phase 1 時点の既知の穴）
+
+- PostgreSQL / MariaDB バックエンド未実装（`meta::connect` がエラーを返す）
+- scrub / repair は呼び出し側が実行する前提で、定期実行の仕組みはまだない
+- メタデータ更新前にクラッシュした場合や、オフラインのディスク上に残った孤立ファイルの GC がない
+- ディスクの恒久撤去（decommission）時に replicas 行を消す管理操作がない
+- `list_misreplicated` は objects の全件走査。数億件規模では見直しが必要
+- マルチノード（ノード間転送）は Phase 4
 
 ## 設計上の注意
 
