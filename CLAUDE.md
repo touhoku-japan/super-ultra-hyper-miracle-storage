@@ -7,7 +7,7 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
 
 - テスト: `CARGO_BUILD_JOBS=1 cargo test --workspace`
 - Lint: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings`
-- 起動: `cargo run -p suhms-server -- -c config.toml serve`（`GET /_suhms/health` で疎通確認。認証不要）
+- 起動: `cargo run -p suhms-server -- -c config.toml serve`（`GET /suhms/health` で疎通確認。認証不要）
 - 管理: `suhms gen-master-key` / `suhms tenant create|list` / `suhms key create|list|disable|enable` /
   `suhms bucket set-replicas <bucket> <n|default>` / `suhms scrub` / `suhms repair`
   - tenant/key 系はメタデータ DB だけを触るので、サーバ稼働中に実行してよい
@@ -25,8 +25,14 @@ release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレ
     - `s3.rs` — `s3s::S3` 実装。リクエストごとに検証済みアクセスキー → テナント ID を引き、store にテナントを渡す。
       `KeyStore`（`S3Auth`）が SigV4 用にシークレットを復号して返す。body 読み取り中の s3s エラー（SHA-256 不一致等）は `body_error` で S3 エラーに戻す
     - `crypto.rs` — アクセスキーのシークレットを AES-256-GCM で暗号化（AAD = アクセスキー ID）。マスターキーは `SUHMS_MASTER_KEY` か `[auth] master_key_file`
-    - `checksum.rs` — `x-amz-checksum-*`（ヘッダ、または aws-chunked のトレーラ）を body を流しながら検証する reader。
-      不一致は EOF で読み取りエラーにし、store がコミット前に書き込みを捨てる
+    - `checksum.rs` — `x-amz-checksum-*`（ヘッダ、または aws-chunked のトレーラ）を body を流しながら検証・計算する reader。
+      不一致は EOF で読み取りエラーにし、store がコミット前に書き込みを捨てる。計算結果は `ChecksumSlot` 経由で
+      store に渡り、objects / multipart_parts の `checksum` 列に JSON（algorithm / type / value）で保存。
+      GET/HEAD は `x-amz-checksum-mode: ENABLED` のときだけ返す（Range 付きは返さない）。
+      マルチパートは作成時にアルゴリズムと型を決め（upload の `checksum` 列）、各パートはサーバ側でも計算する。
+      完了時に COMPOSITE（パートのチェックサムを連結してハッシュ + `-N`）か FULL_OBJECT（CRC をパートから
+      `crc_fast::checksum_combine` で合成。データは読み直さない）を求める。コピーは要求されたアルゴリズム、
+      無ければコピー元のアルゴリズムで計算し直す
     - `cluster.rs` — ノード間 API（`[cluster] listen` の別リスナー、`x-suhms-node-auth` の HMAC 認証）と
       `HttpPeer`（`reqwest`、TLS なし。プライベートネットワーク前提）。`open_store` がクラスタ構成ならピア付きで Store を開く
     - `tenancy.rs` — アクセスキー/テナントの 10 秒キャッシュ（`Directory`。管理 API での変更は同ノードで即時無効化）、
@@ -66,15 +72,29 @@ release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレ
 - Object Lock（`store/src/lock.rs`）: バケット作成時の `x-amz-bucket-object-lock-enabled`、既定保持期間、オブジェクト単位の
   retention（GOVERNANCE はバイパスヘッダで解除可、COMPLIANCE は短縮・削除不可）と legal hold。保護対象は「版の削除」で、
   キーの DELETE（削除マーカー追加）は可能
-- ライフサイクル（`store/src/lifecycle.rs`）: 期限切れ（現行版）、非現行版の削除、未完了マルチパートの中止。prefix 単位。
-  leader が 1 時間ごとに `Store::apply_lifecycle`。transition（ストレージクラス移行）は未対応
+- ライフサイクル（`store/src/lifecycle.rs`）: 期限切れ（現行版）、非現行版の削除、ExpiredObjectDeleteMarker
+  （他の版が無い削除マーカーの削除）、transition / noncurrent transition、未完了マルチパートの中止。prefix 単位。
+  leader が 1 時間ごとに `Store::apply_lifecycle`。transition は「ストレージクラス＝レプリカ数」の変更
+  （`set_object_storage_class` で desired_replicas を変え、repair がコピーを増減）。複数の transition は日数が最大の
+  ものだけを適用。設定時に未知のストレージクラスは InvalidStorageClass。Date 指定（日付での期限・移行）は未対応
+- 書き込みの前提条件（`meta::WriteCondition`）: PUT / CompleteMultipartUpload の `If-None-Match: *` と `If-Match`
+  （ETag か `*`）。メタデータのトランザクション内で最新版に対して判定（無ければ NoSuchKey、不一致は 412）
+- versionId 付きのコピー元（CopyObject / UploadPartCopy）。応答に `x-amz-copy-source-version-id`。
+  削除マーカーは MethodNotAllowed。同じキーへの旧版コピー（復元）は可
+- ListObjectVersions / ListMultipartUploads の delimiter（CommonPrefixes）。store 側で `list.rs` と同じく
+  共通プレフィックスの後ろ（`PREFIX_SKIP`）へカーソルを飛ばして読む。key-marker だけ指定した ListMultipartUploads は
+  そのキーのアップロードを含めない（S3 と同じ）
+- 予約バケット名 `suhms`（`RESERVED_BUCKETS`）: ヘルスチェック `/suhms/health` 用。パス形式のときだけヘルスチェックとして扱い、
+  仮想ホスト形式（`<bucket>.<domain>/suhms/health`）はそのバケットのオブジェクトへのリクエストとして S3 に回す
 - CORS（`server/src/cors.rs`）: ルールはバケットに JSON で保存し、ミドルウェアがプリフライト（OPTIONS）と応答ヘッダを処理
 - SQLite のマイグレーションは外部キーを無効化して実行する（`objects` の再作成で replicas が CASCADE 削除されないように）
 - サーバ側暗号化（SSE）は実装しない: 「ファイルをそのまま置く」方針と矛盾するため。保存時暗号化はディスク側（LUKS 等）で行う
 - 対応済み S3 操作: ListBuckets, Create/Head/Delete Bucket, GetBucketLocation, GetBucketVersioning,
   Put/Get（Range）/Head/Delete Object, DeleteObjects, ListObjects V1/V2（encoding-type=url 対応）, presigned URL,
   CopyObject（COPY/REPLACE）, Create/UploadPart/UploadPartCopy/Complete/Abort MultipartUpload, ListParts, ListMultipartUploads,
-  条件付きリクエスト（GET/HEAD の If-Match / If-None-Match / If-(Un)Modified-Since、PUT の If-None-Match: *）,
+  条件付きリクエスト（GET/HEAD の If-Match / If-None-Match / If-(Un)Modified-Since、PUT / CompleteMultipartUpload の
+  If-Match / If-None-Match: *）, チェックサム（CRC32 / CRC32C / CRC64NVME / SHA1 / SHA256、マルチパートの COMPOSITE /
+  FULL_OBJECT）, versionId 付きコピー元, ListObjectVersions / ListMultipartUploads の delimiter,
   Put/GetBucketVersioning, ListObjectVersions, versionId 付き GET/HEAD/DELETE, Put/Get/DeleteBucketLifecycleConfiguration,
   Put/GetObjectLockConfiguration, Put/GetObjectRetention, Put/GetObjectLegalHold, Put/Get/DeleteBucketCors
 
@@ -120,9 +140,9 @@ MIT ライセンス。依存クレートは `deny.toml` の許可リスト（MIT
 - PostgreSQL / MariaDB はこのホストでは未検証（CI の `metadata-backends` ジョブでサービスコンテナに対して store のテストを実行）。
   ローカルで試すなら `SUHMS_TEST_POSTGRES=postgres://... cargo test -p suhms-store`（テストごとに DB を作る）
 - ノード間通信は平文 HTTP（HMAC 認証のみ）。ノード間はプライベートネットワークか WireGuard 等で保護すること
-- チェックサムは検証するが保存しないので、GET で `x-amz-checksum-*` を返さない。マルチパート全体のチェックサム（COMPOSITE / FULL_OBJECT）も未対応
-- PUT の If-Match、ListMultipartUploads / ListObjectVersions の delimiter、versionId 指定のコピー元は未対応
-- 削除マーカーだけが残ったキーの自動掃除（ExpiredObjectDeleteMarker）、ライフサイクルの transition は未対応
+- チェックサムを指定しないアップロードにはチェックサムを付けない（AWS の既定 CRC64NVME 自動付与はしない）。
+  アルゴリズム未指定のマルチパートも同様。MD5 / SHA512 / xxHash 系のチェックサムは未対応
+- ライフサイクルの Date 指定、NewerNoncurrentVersions、タグ・サイズによるフィルタは未対応
 - メタデータ更新前にクラッシュした場合や、オフラインのディスク上に残った孤立ファイルの GC がない
 - ディスクの恒久撤去（decommission）時に replicas 行を消す管理操作がない
 - `list_misreplicated` は objects の全件走査。数億件規模では見直しが必要

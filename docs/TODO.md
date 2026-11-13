@@ -12,6 +12,7 @@
 4. **dev-sorahost（ポータル）側の実装** — 申込、アクセスキー発行、使用量取得、Stripe 課金連携。
    仕様は `docs/sorahost-integration.md`、PHP クライアント例は `docs/examples/SuhmsAdminClient.php`
 5. **RUSTSEC-2026-0459 の一時除外を外す** — sqlx が libsqlite3-sys >= 0.39 を許容したら更新して `deny.toml` から除外を削除
+   （2026-11-13 確認: 最新の sqlx 0.9.0 / sqlx-sqlite 0.9.0 は `libsqlite3-sys >=0.30.1, <0.38.0` のままで未対応）
 
 ## 運用面
 
@@ -23,14 +24,17 @@
 
 ## S3 互換性
 
-11. **チェックサムの保存と返却** — `x-amz-checksum-*` を検証するが保存しないので GET/HEAD で返せない。
-    マルチパート全体のチェックサム（COMPOSITE / FULL_OBJECT）も未対応
-12. **PUT の If-Match** — 条件付き書き込み（If-None-Match: * のみ対応済み）
-13. **ListMultipartUploads / ListObjectVersions の delimiter**（CommonPrefixes）
-14. **versionId 指定のコピー元** — CopyObject / UploadPartCopy の `x-amz-copy-source: bucket/key?versionId=...`
-15. **ライフサイクルの残り** — 削除マーカーだけが残ったキーの自動削除（ExpiredObjectDeleteMarker）、
-    ストレージクラス移行（transition）
 16. **AWS CLI での互換確認** — このホストに未インストールのため rclone でのみ確認済み
+17. **チェックサムの残り** — 未指定のアップロードへの CRC64NVME 自動付与（AWS の既定動作）、MD5 / SHA512 / xxHash 系
+18. **ライフサイクルの残り** — Date 指定、NewerNoncurrentVersions、タグ・サイズによるフィルタ
+
+## 済
+
+- ~~11. チェックサムの保存と返却（COMPOSITE / FULL_OBJECT 含む）~~
+- ~~12. PUT の If-Match~~（CompleteMultipartUpload の If-Match / If-None-Match も）
+- ~~13. ListMultipartUploads / ListObjectVersions の delimiter~~
+- ~~14. versionId 指定のコピー元~~
+- ~~15. ExpiredObjectDeleteMarker、transition（ストレージクラス＝レプリカ数の変更）~~
 
 ## 実装しないと決めたもの
 

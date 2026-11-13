@@ -23,6 +23,14 @@ async fn health_needs_no_auth() {
 }
 
 #[tokio::test]
+async fn reserved_bucket_name_is_rejected() {
+    let srv = Server::start(1).await;
+    let (_, c) = srv.tenant("alice").await;
+    let resp = srv.s3(&c, "PUT", "/suhms", &[], &[], vec![]).await;
+    assert_eq!(resp.error_code().as_deref(), Some("InvalidBucketName"));
+}
+
+#[tokio::test]
 async fn rejects_anonymous_and_badly_signed_requests() {
     let srv = Server::start(1).await;
     let (_, creds) = srv.tenant("alice").await;
