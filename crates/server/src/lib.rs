@@ -10,6 +10,7 @@ pub mod cors;
 pub mod crypto;
 pub mod s3;
 pub mod tenancy;
+pub mod tls;
 
 use std::{convert::Infallible, sync::Arc};
 

@@ -46,16 +46,25 @@ master_key_file = "/etc/suhms/master.key"
 # 複数ノード構成。単一ノードなら nodes を空のままにする（このセクションごと省略してよい）。
 # 全ノードで同じ metadata_url（PostgreSQL / MariaDB の HA 構成）と同じ secret を使う。
 [cluster]
-# ノード間通信の待ち受け。プライベートネットワーク上のアドレスにすること（HTTP。暗号化はしない）
+# ノード間通信の待ち受け。プライベートネットワーク上のアドレスにすること
 # listen = "10.0.0.1:9100"
 # ノード間リクエストの認証に使う共有シークレット（32 文字以上）。環境変数 SUHMS_CLUSTER_SECRET が優先
 # secret_file = "/etc/suhms/cluster.key"
-# 全ノード（自分を含む）。id は各ノードの [storage] node_id
+# 全ノード（自分を含む）。id は各ノードの [storage] node_id。
+# [cluster.tls] を設定したら https://、しないなら http://（混在は起動時にエラー）
 # nodes = [
-#   { id = "node1", url = "http://10.0.0.1:9100" },
-#   { id = "node2", url = "http://10.0.0.2:9100" },
-#   { id = "node3", url = "http://10.0.0.3:9100" },
+#   { id = "node1", url = "https://10.0.0.1:9100" },
+#   { id = "node2", url = "https://10.0.0.2:9100" },
+#   { id = "node3", url = "https://10.0.0.3:9100" },
 # ]
+
+# ノード間の相互 TLS（推奨）。クラスタ専用の CA で署名した証明書を各ノードに置く。
+# 証明書には他ノードが url で使うホスト名か IP を SAN として入れる。作り方は docs/cluster-tls.md
+# 設定しない場合、ノード間は平文 HTTP（HMAC 認証のみ）になるので、プライベートネットワークか WireGuard で守ること
+# [cluster.tls]
+# cert_file = "/etc/suhms/tls/node1.pem"
+# key_file = "/etc/suhms/tls/node1.key"
+# ca_file = "/etc/suhms/tls/cluster-ca.pem"
 
 # 管理 API（SoraHost ポータル用）。listen を設定したときだけ有効。プライベートネットワークに置くこと
 [admin]

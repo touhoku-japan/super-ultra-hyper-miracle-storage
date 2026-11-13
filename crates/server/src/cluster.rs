@@ -443,10 +443,15 @@ pub struct HttpPeers {
 
 impl HttpPeers {
     pub fn new(config: &ClusterConfig, self_id: &str, secret: &str) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
+        config.validate()?;
+        crate::tls::install_provider();
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
-            .tcp_keepalive(Duration::from_secs(30))
-            .build()?;
+            .tcp_keepalive(Duration::from_secs(30));
+        if let Some(tls) = &config.tls {
+            builder = builder.tls_backend_preconfigured(crate::tls::client_config(tls)?);
+        }
+        let client = builder.build()?;
         let secret: Arc<str> = Arc::from(secret);
         let peers = config
             .nodes

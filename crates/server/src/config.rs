@@ -112,19 +112,59 @@ pub struct ClusterConfig {
     pub secret_file: Option<PathBuf>,
     /// Every node of the cluster (including this one), by `[storage] node_id`.
     pub nodes: Vec<NodeConfig>,
+    /// Mutual TLS between nodes. Without it node-to-node traffic is plain HTTP and must be
+    /// protected by the network (private network or WireGuard).
+    pub tls: Option<ClusterTls>,
+}
+
+/// Certificates for node-to-node TLS (PEM files).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterTls {
+    /// This node's certificate (chain), signed by the cluster CA. It must name the host or IP
+    /// that other nodes use in its `url`.
+    pub cert_file: PathBuf,
+    pub key_file: PathBuf,
+    /// The cluster CA. Only certificates it signed are accepted, on both sides.
+    pub ca_file: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     pub id: String,
-    /// Base URL of the node's cluster listener, e.g. `http://10.0.0.2:9100`.
+    /// Base URL of the node's cluster listener, e.g. `https://10.0.0.2:9100` (`http://`
+    /// without `[cluster.tls]`).
     pub url: String,
 }
 
 impl ClusterConfig {
     pub fn is_enabled(&self) -> bool {
         !self.nodes.is_empty()
+    }
+
+    /// Node URLs must all use `https://` with `[cluster.tls]` and `http://` without it, so a
+    /// half-configured cluster fails at startup instead of on the first request.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let scheme = if self.tls.is_some() {
+            "https://"
+        } else {
+            "http://"
+        };
+        for n in &self.nodes {
+            anyhow::ensure!(
+                n.url.starts_with(scheme),
+                "[cluster] node {} url {} must start with {scheme} ({})",
+                n.id,
+                n.url,
+                if self.tls.is_some() {
+                    "[cluster.tls] is configured"
+                } else {
+                    "[cluster.tls] is not configured"
+                }
+            );
+        }
+        Ok(())
     }
 
     pub fn load_secret(&self) -> anyhow::Result<String> {

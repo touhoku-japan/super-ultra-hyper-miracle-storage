@@ -98,15 +98,32 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         let secret = config.cluster.load_secret()?;
         let internal = suhms_server::cluster::internal_router(Arc::clone(&store), &secret);
         let listener = TcpListener::bind(addr).await?;
-        tracing::info!(%addr, "cluster listener up");
-        tokio::spawn(async move {
-            if let Err(error) = axum::serve(listener, internal)
-                .with_graceful_shutdown(shutdown_signal())
-                .await
-            {
-                tracing::error!(%error, "cluster listener failed");
+        match &config.cluster.tls {
+            Some(tls) => {
+                let tls_config = suhms_server::tls::server_config(tls)?;
+                let listener = suhms_server::tls::TlsListener::new(listener, tls_config)?;
+                tracing::info!(%addr, "cluster listener up (mutual TLS)");
+                tokio::spawn(async move {
+                    if let Err(error) = axum::serve(listener, internal)
+                        .with_graceful_shutdown(shutdown_signal())
+                        .await
+                    {
+                        tracing::error!(%error, "cluster listener failed");
+                    }
+                });
             }
-        });
+            None => {
+                tracing::warn!(%addr, "cluster listener up WITHOUT TLS; protect node-to-node traffic with a private network");
+                tokio::spawn(async move {
+                    if let Err(error) = axum::serve(listener, internal)
+                        .with_graceful_shutdown(shutdown_signal())
+                        .await
+                    {
+                        tracing::error!(%error, "cluster listener failed");
+                    }
+                });
+            }
+        }
     }
 
     let app = app(Arc::clone(&store), Arc::clone(&tenancy), cipher, &config)?;
