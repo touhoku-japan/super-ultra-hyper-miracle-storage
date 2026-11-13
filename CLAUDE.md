@@ -27,6 +27,8 @@ release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレ
     - `crypto.rs` — アクセスキーのシークレットを AES-256-GCM で暗号化（AAD = アクセスキー ID）。マスターキーは `SUHMS_MASTER_KEY` か `[auth] master_key_file`
     - `checksum.rs` — `x-amz-checksum-*`（ヘッダ、または aws-chunked のトレーラ）を body を流しながら検証する reader。
       不一致は EOF で読み取りエラーにし、store がコミット前に書き込みを捨てる
+    - `cluster.rs` — ノード間 API（`[cluster] listen` の別リスナー、`x-suhms-node-auth` の HMAC 認証）と
+      `HttpPeer`（`reqwest`、TLS なし。プライベートネットワーク前提）。`open_store` がクラスタ構成ならピア付きで Store を開く
     - `admin.rs` — 管理サブコマンド
     - `tests/` — `common/mod.rs` の自前 SigV4 署名器で、実ルータを in-process で叩く E2E テスト
   - `store/` — ストレージエンジン
@@ -34,7 +36,14 @@ release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレ
       ルートが無ければ作らない（未マウント時にルート FS へ書くのを防ぐ）。中身のある未フォーマットのディレクトリは使わない
     - `placement.rs` — 配置（別ノード優先 → 同ノード別ディスク、空き容量の多い順）と ACK 閾値（過半数）
     - `blob.rs` — 全レプリカへの同時ストリーミング書き込み（MD5=ETag と BLAKE3 を同時計算）、検証付きコピー
-    - `meta/` — `MetadataStore` trait と SQLite 実装。スキーマは `meta/migrations/<backend>/NNNN_*.sql`（リリース済みのマイグレーションは編集しない）
+    - `cluster.rs` — `Peer`（他ノードのディスク操作）/ `Peers` / `ReplicaSink` / `DiskRef`（ローカルかリモートかを隠す）
+    - `meta/` — `MetadataStore` trait と SQLite / PostgreSQL / MariaDB(MySQL) 実装。スキーマは `meta/migrations/<backend>/NNNN_*.sql`
+      （リリース済みのマイグレーションは編集しない。バックエンドごとに番号は独立）。
+      `postgres.rs` / `mysql.rs` は `sqlite.rs` と同じ構造（SQL の差分: プレースホルダ `$n`、`ON DUPLICATE KEY UPDATE`、
+      MySQL の object_key は `VARBINARY(1024)`、PG は `COLLATE "C"`）。SQLite 以外は書き込み競合を `is_retryable` で再試行
+    - クラスタ: 各ノードが自ディスクの空き容量と heartbeat を `disks` に書く（`HEARTBEAT_INTERVAL`）。30 秒更新がないディスクは offline 扱い。
+      `Store::cluster_disks()` が全ノードのディスク一覧（2 秒キャッシュ）。レプリカ上限は「登録済み」ディスク/ノード数で判定するので、
+      ノード障害中も書き込みは過半数で成功し、復旧後に repair で補う。複数ノード構成では同一ノードに 2 コピー置かない
     - `list.rs` — S3 の ListObjects 意味論（prefix / delimiter / marker / continuation）。キー順は UTF-8 バイト順
     - `store.rs` — `Store`: テナント・バケット・オブジェクト操作（すべて owner = テナント ID でスコープ。他テナントのバケットは AccessDenied）、
       コピー、マルチパート、`scrub()`、`repair()`
@@ -79,7 +88,9 @@ MIT ライセンス。依存クレートは `deny.toml` の許可リスト（MIT
 ## 未対応（既知の穴）
 
 - `deny.toml` で RUSTSEC-2026-0459（同梱 SQLite の脆弱性）を一時除外中。sqlx が libsqlite3-sys >= 0.39 を許容したら更新して除外を外す
-- PostgreSQL / MariaDB バックエンド未実装（`meta::connect` がエラーを返す）
+- PostgreSQL / MariaDB はこのホストでは未検証（CI の `metadata-backends` ジョブでサービスコンテナに対して store のテストを実行）。
+  ローカルで試すなら `SUHMS_TEST_POSTGRES=postgres://... cargo test -p suhms-store`（テストごとに DB を作る）
+- ノード間通信は平文 HTTP（HMAC 認証のみ）。ノード間はプライベートネットワークか WireGuard 等で保護すること
 - チェックサムは検証するが保存しないので、GET で `x-amz-checksum-*` を返さない。マルチパート全体のチェックサム（COMPOSITE / FULL_OBJECT）も未対応
 - PUT の If-Match、ListMultipartUploads の delimiter は未対応
 - 放置されたマルチパートアップロードの自動削除なし（バケット削除時のみ中止される）
@@ -87,7 +98,8 @@ MIT ライセンス。依存クレートは `deny.toml` の許可リスト（MIT
 - メタデータ更新前にクラッシュした場合や、オフラインのディスク上に残った孤立ファイルの GC がない
 - ディスクの恒久撤去（decommission）時に replicas 行を消す管理操作がない
 - `list_misreplicated` は objects の全件走査。数億件規模では見直しが必要
-- マルチノード（ノード間転送）は Phase 4
+- repair は 1 ノードで実行する前提（複数ノードで同時実行しても壊れないが、余分なコピーが一時的にできうる）
+- ノードの恒久撤去・リバランス（既存データの移動）は未対応
 
 ## 設計上の注意
 

@@ -19,14 +19,16 @@ pub struct Candidate<'a> {
 
 /// Picks up to `count` disks for new copies.
 ///
-/// Disks already holding a copy (`existing`) are never picked. Disks on nodes that hold no copy
-/// yet are preferred, so copies land on distinct nodes whenever possible; only when there are not
-/// enough nodes does a node get a second copy (on a different disk). Within each tier, disks
-/// with more free space win.
+/// Disks already holding a copy (`existing`) are never picked, and copies go to distinct nodes.
+/// Only with `allow_same_node` (single-node deployments) may a node get several copies, on
+/// different disks. In a cluster that is short of live nodes this returns fewer disks than
+/// requested: a second copy on the same node would never be moved once the missing node is back.
+/// Disks with more free space win.
 pub fn choose(
     mut candidates: Vec<Candidate<'_>>,
     existing: &[(DiskId, &str)],
     count: usize,
+    allow_same_node: bool,
 ) -> Vec<DiskId> {
     let mut used_disks: HashSet<DiskId> = existing.iter().map(|(d, _)| *d).collect();
     let mut used_nodes: HashSet<&str> = existing.iter().map(|(_, n)| *n).collect();
@@ -43,6 +45,9 @@ pub fn choose(
             used_disks.insert(c.disk_id);
             picked.push(c.disk_id);
         }
+    }
+    if !allow_same_node {
+        return picked;
     }
     for c in &candidates {
         if picked.len() == count {
@@ -87,7 +92,7 @@ mod tests {
             cand("c", 50),
         ];
         let ids: Vec<_> = cs.iter().map(|c| c.disk_id).collect();
-        let picked = choose(cs, &[], 3);
+        let picked = choose(cs, &[], 3, false);
         assert_eq!(picked, vec![ids[0], ids[2], ids[3]]);
     }
 
@@ -95,7 +100,7 @@ mod tests {
     fn falls_back_to_distinct_disks_on_one_node() {
         let cs = vec![cand("a", 1), cand("a", 3), cand("a", 2)];
         let ids: Vec<_> = cs.iter().map(|c| c.disk_id).collect();
-        let picked = choose(cs, &[], 3);
+        let picked = choose(cs, &[], 3, true);
         assert_eq!(picked, vec![ids[1], ids[2], ids[0]]);
     }
 
@@ -103,13 +108,21 @@ mod tests {
     fn skips_disks_and_nodes_that_already_hold_a_copy() {
         let cs = vec![cand("a", 9), cand("b", 5), cand("c", 1)];
         let ids: Vec<_> = cs.iter().map(|c| c.disk_id).collect();
-        let picked = choose(cs, &[(ids[0], "a")], 1);
+        let picked = choose(cs, &[(ids[0], "a")], 1, false);
         assert_eq!(picked, vec![ids[1]]);
+    }
+
+    #[test]
+    fn never_doubles_up_on_a_node_in_a_cluster() {
+        // node c is down: only a and b are candidates.
+        let cs = vec![cand("a", 9), cand("a", 8), cand("b", 1)];
+        let ids: Vec<_> = cs.iter().map(|c| c.disk_id).collect();
+        assert_eq!(choose(cs, &[], 3, false), vec![ids[0], ids[2]]);
     }
 
     #[test]
     fn returns_fewer_when_not_enough_disks() {
         let cs = vec![cand("a", 1)];
-        assert_eq!(choose(cs, &[], 3).len(), 1);
+        assert_eq!(choose(cs, &[], 3, true).len(), 1);
     }
 }

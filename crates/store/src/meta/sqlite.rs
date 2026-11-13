@@ -9,9 +9,9 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::{
-    AccessKeyRecord, BucketRecord, DeleteBucketOutcome, MetadataStore, ObjectRecord, PartRecord,
-    ReplicaEntry, StoredObject, TenantRecord, UploadRecord, decode_disks, decode_user_metadata,
-    encode_disks, encode_user_metadata,
+    AccessKeyRecord, BucketRecord, DeleteBucketOutcome, DiskRecord, MetadataStore, ObjectRecord,
+    PartRecord, ReplicaEntry, StoredObject, TenantRecord, UploadRecord, decode_disks,
+    decode_user_metadata, encode_disks, encode_user_metadata,
 };
 use crate::{
     disk::DiskId,
@@ -22,6 +22,7 @@ use crate::{
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("migrations/sqlite/0001_init.sql")),
     (2, include_str!("migrations/sqlite/0002_multipart.sql")),
+    (3, include_str!("migrations/sqlite/0003_cluster.sql")),
 ];
 
 macro_rules! object_select {
@@ -397,26 +398,68 @@ impl MetadataStore for SqliteMetadata {
 
     async fn set_node_disks_offline(&self, node_id: &str) -> Result<()> {
         let _guard = self.write_lock.lock().await;
-        sqlx::query("UPDATE disks SET online = 0 WHERE node_id = ?")
+        sqlx::query("UPDATE disks SET online = FALSE WHERE node_id = ?")
             .bind(node_id)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
-    async fn register_disk(&self, disk_id: DiskId, node_id: &str, path: &str) -> Result<()> {
+    async fn register_disk(
+        &self,
+        disk_id: DiskId,
+        node_id: &str,
+        path: &str,
+        free_bytes: u64,
+        now: i64,
+    ) -> Result<()> {
         let _guard = self.write_lock.lock().await;
         sqlx::query(
-            "INSERT INTO disks (id, node_id, path, online) VALUES (?, ?, ?, 1) \
-             ON CONFLICT (id) DO UPDATE SET node_id = excluded.node_id, \
-             path = excluded.path, online = 1",
+            "INSERT INTO disks (id, node_id, path, online, free_bytes, heartbeat_at) \
+             VALUES (?, ?, ?, TRUE, ?, ?) \
+             ON CONFLICT (id) DO UPDATE SET node_id = excluded.node_id, path = excluded.path, \
+             online = TRUE, free_bytes = excluded.free_bytes, heartbeat_at = excluded.heartbeat_at",
         )
         .bind(disk_id.to_string())
         .bind(node_id)
         .bind(path)
+        .bind(i64_of(free_bytes)?)
+        .bind(now)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn heartbeat_disk(&self, disk_id: DiskId, free_bytes: u64, now: i64) -> Result<()> {
+        let _guard = self.write_lock.lock().await;
+        sqlx::query("UPDATE disks SET free_bytes = ?, heartbeat_at = ? WHERE id = ?")
+            .bind(i64_of(free_bytes)?)
+            .bind(now)
+            .bind(disk_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_disks(&self) -> Result<Vec<DiskRecord>> {
+        sqlx::query(
+            "SELECT id, node_id, path, online, free_bytes, heartbeat_at FROM disks \
+             ORDER BY node_id, path",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|r| {
+            Ok(DiskRecord {
+                id: parse_uuid(r.try_get("id")?)?,
+                node_id: r.try_get("node_id")?,
+                path: r.try_get("path")?,
+                online: r.try_get("online")?,
+                free_bytes: u64::try_from(r.try_get::<i64, _>("free_bytes")?).unwrap_or(0),
+                heartbeat_at: r.try_get("heartbeat_at")?,
+            })
+        })
+        .collect()
     }
 
     async fn create_bucket(&self, bucket: &BucketRecord) -> Result<bool> {
@@ -473,7 +516,7 @@ impl MetadataStore for SqliteMetadata {
             return Ok(false);
         }
         sqlx::query(
-            "UPDATE objects SET desired_replicas = ? WHERE bucket = ? AND replicas_explicit = 0",
+            "UPDATE objects SET desired_replicas = ? WHERE bucket = ? AND replicas_explicit = FALSE",
         )
         .bind(i64::from(effective))
         .bind(name)
@@ -796,14 +839,20 @@ impl MetadataStore for SqliteMetadata {
             .collect()
     }
 
-    async fn list_misreplicated(&self, after: Option<Uuid>, limit: u32) -> Result<Vec<Uuid>> {
+    async fn list_misreplicated(
+        &self,
+        after: Option<Uuid>,
+        limit: u32,
+        alive_since: i64,
+    ) -> Result<Vec<Uuid>> {
         let rows = sqlx::query(
             "SELECT o.id FROM objects o WHERE o.id > ? AND o.desired_replicas <> ( \
                SELECT COUNT(*) FROM replicas r JOIN disks d ON d.id = r.disk_id \
-               WHERE r.object_id = o.id AND d.online = 1) \
+               WHERE r.object_id = o.id AND d.online = TRUE AND d.heartbeat_at >= ?) \
              ORDER BY o.id LIMIT ?",
         )
         .bind(after.map(|u| u.to_string()).unwrap_or_default())
+        .bind(alive_since)
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await?;

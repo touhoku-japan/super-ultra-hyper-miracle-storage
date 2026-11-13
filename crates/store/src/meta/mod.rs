@@ -3,6 +3,8 @@
 //! Backends implement [`MetadataStore`]. SQLite is for single-node deployments and development;
 //! multi-node clusters need a shared, highly available PostgreSQL or MariaDB.
 
+mod mysql;
+mod postgres;
 mod sqlite;
 
 use std::{collections::BTreeMap, sync::Arc};
@@ -10,7 +12,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use async_trait::async_trait;
 use uuid::Uuid;
 
-pub use self::sqlite::SqliteMetadata;
+pub use self::{mysql::MysqlMetadata, postgres::PostgresMetadata, sqlite::SqliteMetadata};
 use crate::{
     disk::DiskId,
     error::{Result, StoreError},
@@ -113,6 +115,17 @@ pub struct ReplicaEntry {
     pub blake3: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskRecord {
+    pub id: DiskId,
+    pub node_id: String,
+    pub path: String,
+    pub online: bool,
+    pub free_bytes: u64,
+    /// Unix time in milliseconds of the owning node's last heartbeat for this disk.
+    pub heartbeat_at: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteBucketOutcome {
     Deleted,
@@ -141,7 +154,18 @@ pub trait MetadataStore: Send + Sync {
     /// actually opened.
     async fn set_node_disks_offline(&self, node_id: &str) -> Result<()>;
     /// Records a disk and marks it online.
-    async fn register_disk(&self, disk_id: DiskId, node_id: &str, path: &str) -> Result<()>;
+    async fn register_disk(
+        &self,
+        disk_id: DiskId,
+        node_id: &str,
+        path: &str,
+        free_bytes: u64,
+        now: i64,
+    ) -> Result<()>;
+    /// Refreshes a disk's free space and liveness.
+    async fn heartbeat_disk(&self, disk_id: DiskId, free_bytes: u64, now: i64) -> Result<()>;
+    /// Every disk of every node.
+    async fn list_disks(&self) -> Result<Vec<DiskRecord>>;
 
     // ---- buckets ----
 
@@ -231,9 +255,14 @@ pub trait MetadataStore: Send + Sync {
         after: Option<(Uuid, DiskId)>,
         limit: u32,
     ) -> Result<Vec<ReplicaEntry>>;
-    /// Ids of objects whose number of copies on online disks differs from `desired_replicas`,
-    /// in id order, starting after `after`.
-    async fn list_misreplicated(&self, after: Option<Uuid>, limit: u32) -> Result<Vec<Uuid>>;
+    /// Ids of objects whose number of copies on live disks (online, with a heartbeat newer than
+    /// `alive_since`) differs from `desired_replicas`, in id order, starting after `after`.
+    async fn list_misreplicated(
+        &self,
+        after: Option<Uuid>,
+        limit: u32,
+        alive_since: i64,
+    ) -> Result<Vec<Uuid>>;
 }
 
 /// Opens the backend named by the URL scheme.
@@ -241,9 +270,10 @@ pub async fn connect(url: &str) -> Result<Arc<dyn MetadataStore>> {
     let scheme = url.split(':').next().unwrap_or_default();
     match scheme {
         "sqlite" => Ok(Arc::new(SqliteMetadata::connect(url).await?)),
-        "postgres" | "postgresql" | "mysql" | "mariadb" => Err(StoreError::Config(format!(
-            "metadata backend {scheme} is not implemented yet"
-        ))),
+        "postgres" | "postgresql" => Ok(Arc::new(PostgresMetadata::connect(url).await?)),
+        "mysql" | "mariadb" => Ok(Arc::new(
+            MysqlMetadata::connect(&url.replacen("mariadb:", "mysql:", 1)).await?,
+        )),
         _ => Err(StoreError::Config(format!(
             "unsupported metadata URL scheme {scheme:?} (expected sqlite, postgres or mysql)"
         ))),
@@ -252,6 +282,18 @@ pub async fn connect(url: &str) -> Result<Arc<dyn MetadataStore>> {
 
 pub(crate) fn encode_user_metadata(m: &BTreeMap<String, String>) -> String {
     serde_json::to_string(m).expect("string map serializes")
+}
+
+/// Whether a failed transaction is worth retrying: another writer won a race (unique key),
+/// or the database aborted it to resolve a conflict (serialization failure, deadlock).
+pub(crate) fn is_retryable(e: &StoreError) -> bool {
+    let StoreError::Metadata(inner) = e else {
+        return false;
+    };
+    let Some(sqlx::Error::Database(db)) = inner.downcast_ref::<sqlx::Error>() else {
+        return false;
+    };
+    db.is_unique_violation() || matches!(db.code().as_deref(), Some("40001" | "40P01"))
 }
 
 pub(crate) fn encode_disks(d: &[DiskId]) -> String {

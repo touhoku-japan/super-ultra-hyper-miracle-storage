@@ -3,18 +3,20 @@
 use std::{
     io,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
+use async_trait::async_trait;
+use bytes::Bytes;
 use futures::future::join_all;
 use md5::{Digest, Md5};
 use tokio::{
     fs::{self, File},
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
 };
 use uuid::Uuid;
 
 use crate::{
+    cluster::{BoxReader, DiskRef, ReplicaSink},
     disk::{Disk, DiskId},
     error::{Result, StoreError},
 };
@@ -48,80 +50,129 @@ pub struct WriteOutcome {
     pub written: Vec<DiskId>,
 }
 
-struct Slot {
-    disk: Arc<Disk>,
+/// A write to a temp file on a local disk, published under its final name on commit.
+pub struct LocalSink {
+    file: File,
     tmp: PathBuf,
-    file: Option<File>,
+    final_path: PathBuf,
 }
 
-impl Slot {
-    async fn fail(&mut self, error: &io::Error) {
-        tracing::warn!(disk = %self.disk.root.display(), %error, "replica write failed");
-        self.file = None;
+impl LocalSink {
+    pub async fn create(disk: &Disk, dest: Dest) -> io::Result<Self> {
+        let tmp = disk.tmp_path();
+        let file = File::create_new(&tmp).await?;
+        Ok(Self {
+            file,
+            tmp,
+            final_path: dest.path(disk),
+        })
+    }
+}
+
+#[async_trait]
+impl ReplicaSink for LocalSink {
+    async fn write(&mut self, chunk: Bytes) -> io::Result<()> {
+        self.file.write_all(&chunk).await
+    }
+
+    async fn commit(self: Box<Self>) -> io::Result<()> {
+        let Self {
+            mut file,
+            tmp,
+            final_path,
+        } = *self;
+        let result = async {
+            file.flush().await?;
+            file.sync_all().await?;
+            drop(file);
+            publish(&tmp, &final_path).await
+        }
+        .await;
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp).await;
+        }
+        result
+    }
+
+    async fn abort(self: Box<Self>) {
+        drop(self.file);
         let _ = fs::remove_file(&self.tmp).await;
     }
 }
 
-/// Streams `body` into a new copy on every target disk at once, without buffering the object.
+struct Slot {
+    disk: DiskRef,
+    sink: Option<Box<dyn ReplicaSink>>,
+}
+
+impl Slot {
+    async fn fail(&mut self, error: &io::Error) {
+        tracing::warn!(disk = %self.disk.label(), %error, "replica write failed");
+        if let Some(sink) = self.sink.take() {
+            sink.abort().await;
+        }
+    }
+}
+
+/// Streams `body` into a new copy on every target disk at once (local or remote), without
+/// buffering the object.
 ///
 /// A disk that fails is dropped from the write; the write as a whole fails only when fewer than
 /// `required` copies survive, in which case nothing is left behind.
 pub async fn write_replicas<R: AsyncRead + Unpin>(
-    targets: &[Arc<Disk>],
+    targets: &[DiskRef],
     dest: Dest,
     required: usize,
     mut body: R,
 ) -> Result<WriteOutcome> {
-    let mut slots = Vec::with_capacity(targets.len());
-    for disk in targets {
-        let tmp = disk.tmp_path();
-        let file = match File::create_new(&tmp).await {
-            Ok(f) => Some(f),
-            Err(error) => {
-                tracing::warn!(disk = %disk.root.display(), %error, "cannot create replica file");
-                None
-            }
-        };
-        slots.push(Slot {
-            disk: Arc::clone(disk),
-            tmp,
-            file,
-        });
-    }
+    let opened = join_all(targets.iter().map(|d| d.open_sink(dest))).await;
+    let mut slots: Vec<Slot> = targets
+        .iter()
+        .zip(opened)
+        .map(|(disk, sink)| Slot {
+            disk: disk.clone(),
+            sink: match sink {
+                Ok(s) => Some(s),
+                Err(error) => {
+                    tracing::warn!(disk = %disk.label(), %error, "cannot open replica for writing");
+                    None
+                }
+            },
+        })
+        .collect();
 
-    let result = stream_into(&mut slots, required, &mut body).await;
-    let (size, md5, blake3) = match result {
+    let (size, md5, blake3) = match stream_into(&mut slots, required, &mut body).await {
         Ok(v) => v,
         Err(e) => {
-            discard(&mut slots).await;
+            for slot in &mut slots {
+                if let Some(sink) = slot.sink.take() {
+                    sink.abort().await;
+                }
+            }
             return Err(e);
         }
     };
 
+    let committing: Vec<(DiskRef, Box<dyn ReplicaSink>)> = slots
+        .into_iter()
+        .filter_map(|s| s.sink.map(|sink| (s.disk, sink)))
+        .collect();
+    let results = join_all(committing.into_iter().map(|(disk, sink)| async move {
+        let r = sink.commit().await;
+        (disk, r)
+    }))
+    .await;
     let mut written = Vec::new();
-    for slot in &mut slots {
-        let Some(mut file) = slot.file.take() else {
-            continue;
-        };
-        let final_path = dest.path(&slot.disk);
-        let persisted = async {
-            file.flush().await?;
-            file.sync_all().await?;
-            drop(file);
-            publish(&slot.tmp, &final_path).await
-        }
-        .await;
-        match persisted {
-            Ok(()) => written.push(slot.disk.id),
-            Err(error) => slot.fail(&error).await,
+    for (disk, r) in results {
+        match r {
+            Ok(()) => written.push(disk),
+            Err(error) => tracing::warn!(disk = %disk.label(), %error, "replica commit failed"),
         }
     }
 
     if written.len() < required {
-        for slot in &slots {
-            if written.contains(&slot.disk.id) {
-                remove_path(&dest.path(&slot.disk)).await;
-            }
+        for disk in &written {
+            disk.remove(dest).await;
         }
         return Err(StoreError::WriteQuorum {
             required,
@@ -133,7 +184,7 @@ pub async fn write_replicas<R: AsyncRead + Unpin>(
         size,
         md5,
         blake3,
-        written,
+        written: written.iter().map(DiskRef::id).collect(),
     })
 }
 
@@ -142,9 +193,8 @@ async fn stream_into<R: AsyncRead + Unpin>(
     required: usize,
     body: &mut R,
 ) -> Result<(u64, String, String)> {
-    let live = |slots: &[Slot]| slots.iter().filter(|s| s.file.is_some()).count();
     let check = |slots: &[Slot]| {
-        let written = live(slots);
+        let written = slots.iter().filter(|s| s.sink.is_some()).count();
         if written < required {
             Err(StoreError::WriteQuorum { required, written })
         } else {
@@ -162,15 +212,18 @@ async fn stream_into<R: AsyncRead + Unpin>(
         if n == 0 {
             break;
         }
-        let chunk = &buf[..n];
-        md5.update(chunk);
-        b3.update(chunk);
+        let chunk = Bytes::copy_from_slice(&buf[..n]);
+        md5.update(&chunk);
+        b3.update(&chunk);
         size += n as u64;
 
-        let results = join_all(slots.iter_mut().map(|s| async move {
-            match s.file.as_mut() {
-                Some(f) => f.write_all(chunk).await,
-                None => Ok(()),
+        let results = join_all(slots.iter_mut().map(|s| {
+            let chunk = chunk.clone();
+            async move {
+                match s.sink.as_mut() {
+                    Some(sink) => sink.write(chunk).await,
+                    None => Ok(()),
+                }
             }
         }))
         .await;
@@ -188,11 +241,29 @@ async fn stream_into<R: AsyncRead + Unpin>(
     ))
 }
 
-async fn discard(slots: &mut [Slot]) {
-    for slot in slots {
-        slot.file = None;
-        let _ = fs::remove_file(&slot.tmp).await;
+/// Opens `range` of a local object file, checking that the file has the expected size.
+pub async fn read_local(
+    disk: &Disk,
+    blob: Uuid,
+    size: u64,
+    range: std::ops::Range<u64>,
+) -> io::Result<BoxReader> {
+    let mut file = File::open(disk.object_path(blob)).await?;
+    let len = file.metadata().await?.len();
+    if len != size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("replica has {len} bytes, expected {size}"),
+        ));
     }
+    if range.start > range.end || range.end > size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "range out of bounds",
+        ));
+    }
+    file.seek(io::SeekFrom::Start(range.start)).await?;
+    Ok(Box::new(file.take(range.end - range.start)))
 }
 
 /// Atomically moves a fully synced temp file to its final path and syncs the directory entry.
@@ -228,52 +299,53 @@ pub enum CopyOutcome {
     Copied,
     /// The source's contents did not match the expected hash; nothing was written.
     SourceCorrupt,
-    /// The source file could not be opened; nothing was written.
+    /// The source could not be read; nothing was written.
     SourceUnreadable,
 }
 
-/// Copies a blob between disks, verifying the contents against `expected_blake3` before the
-/// copy becomes visible.
+/// Copies an object file between disks (on any nodes), verifying the contents against
+/// `expected_blake3` before the copy becomes visible.
 pub async fn copy_replica(
-    src: &Disk,
-    dst: &Disk,
+    src: &DiskRef,
+    dst: &DiskRef,
     blob: Uuid,
+    size: u64,
     expected_blake3: &str,
 ) -> io::Result<CopyOutcome> {
-    let mut input = match File::open(src.object_path(blob)).await {
-        Ok(f) => f,
+    let mut input = match src.read(blob, size, 0..size).await {
+        Ok(r) => r,
         Err(error) => {
-            tracing::warn!(disk = %src.root.display(), %blob, %error, "cannot open source replica");
+            tracing::warn!(disk = %src.label(), %blob, %error, "cannot read source replica");
             return Ok(CopyOutcome::SourceUnreadable);
         }
     };
-    let tmp = dst.tmp_path();
-    let result = async {
-        let mut output = File::create_new(&tmp).await?;
-        let mut hasher = blake3::Hasher::new();
-        let mut buf = vec![0u8; CHUNK];
-        loop {
-            let n = input.read(&mut buf).await?;
-            if n == 0 {
-                break;
+    let mut sink = dst.open_sink(Dest::Object(blob)).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        let n = match input.read(&mut buf).await {
+            Ok(n) => n,
+            Err(error) => {
+                tracing::warn!(disk = %src.label(), %blob, %error, "source replica read failed");
+                sink.abort().await;
+                return Ok(CopyOutcome::SourceUnreadable);
             }
-            hasher.update(&buf[..n]);
-            output.write_all(&buf[..n]).await?;
+        };
+        if n == 0 {
+            break;
         }
-        if hasher.finalize().to_hex().as_str() != expected_blake3 {
-            return Ok(CopyOutcome::SourceCorrupt);
+        hasher.update(&buf[..n]);
+        if let Err(e) = sink.write(Bytes::copy_from_slice(&buf[..n])).await {
+            sink.abort().await;
+            return Err(e);
         }
-        output.flush().await?;
-        output.sync_all().await?;
-        drop(output);
-        publish(&tmp, &dst.object_path(blob)).await?;
-        Ok(CopyOutcome::Copied)
     }
-    .await;
-    if !matches!(result, Ok(CopyOutcome::Copied)) {
-        let _ = fs::remove_file(&tmp).await;
+    if hasher.finalize().to_hex().as_str() != expected_blake3 {
+        sink.abort().await;
+        return Ok(CopyOutcome::SourceCorrupt);
     }
-    result
+    sink.commit().await?;
+    Ok(CopyOutcome::Copied)
 }
 
 /// Concatenates parts stored on `disk` into a new object file, verifying each part against its

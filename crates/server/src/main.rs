@@ -6,7 +6,6 @@ use suhms_server::{
     config::{Config, LogFormat},
     crypto::SecretCipher,
 };
-use suhms_store::Store;
 use tokio::net::TcpListener;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -64,10 +63,40 @@ async fn main() -> anyhow::Result<()> {
 
 async fn serve(config: Config) -> anyhow::Result<()> {
     let cipher = Arc::new(SecretCipher::load(&config.auth)?);
-    let store = Arc::new(Store::open(config.storage.clone()).await?);
+    let store = Arc::new(suhms_server::cluster::open_store(&config).await?);
     store.clear_tmp().await;
-    let app = app(store, cipher, &config)?;
 
+    let heartbeat_store = Arc::clone(&store);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(suhms_store::HEARTBEAT_INTERVAL);
+        loop {
+            tick.tick().await;
+            if let Err(error) = heartbeat_store.heartbeat().await {
+                tracing::warn!(%error, "heartbeat failed");
+            }
+        }
+    });
+
+    if config.cluster.is_enabled() {
+        let addr = config
+            .cluster
+            .listen
+            .ok_or_else(|| anyhow::anyhow!("[cluster] listen is required in cluster mode"))?;
+        let secret = config.cluster.load_secret()?;
+        let internal = suhms_server::cluster::internal_router(Arc::clone(&store), &secret);
+        let listener = TcpListener::bind(addr).await?;
+        tracing::info!(%addr, "cluster listener up");
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, internal)
+                .with_graceful_shutdown(shutdown_signal())
+                .await
+            {
+                tracing::error!(%error, "cluster listener failed");
+            }
+        });
+    }
+
+    let app = app(store, cipher, &config)?;
     let listener = TcpListener::bind(config.server.listen).await?;
     tracing::info!(addr = %listener.local_addr()?, "listening");
     axum::serve(listener, app)

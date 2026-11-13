@@ -15,6 +15,52 @@ pub struct Config {
     pub storage: StoreConfig,
     pub s3: S3Config,
     pub auth: AuthConfig,
+    pub cluster: ClusterConfig,
+}
+
+/// Multi-node operation. Leave `nodes` empty for a single-node deployment.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClusterConfig {
+    /// Address for node-to-node traffic. Keep it on a private network.
+    pub listen: Option<SocketAddr>,
+    /// File holding the shared secret that authenticates node-to-node requests. The
+    /// `SUHMS_CLUSTER_SECRET` environment variable takes precedence.
+    pub secret_file: Option<PathBuf>,
+    /// Every node of the cluster (including this one), by `[storage] node_id`.
+    pub nodes: Vec<NodeConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeConfig {
+    pub id: String,
+    /// Base URL of the node's cluster listener, e.g. `http://10.0.0.2:9100`.
+    pub url: String,
+}
+
+impl ClusterConfig {
+    pub fn is_enabled(&self) -> bool {
+        !self.nodes.is_empty()
+    }
+
+    pub fn load_secret(&self) -> anyhow::Result<String> {
+        if let Ok(s) = std::env::var("SUHMS_CLUSTER_SECRET") {
+            return Ok(s.trim().to_owned());
+        }
+        let path = self
+            .secret_file
+            .as_ref()
+            .context("cluster mode needs SUHMS_CLUSTER_SECRET or [cluster] secret_file")?;
+        let s = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let s = s.trim().to_owned();
+        anyhow::ensure!(
+            s.len() >= 32,
+            "cluster secret must be at least 32 characters"
+        );
+        Ok(s)
+    }
 }
 
 #[derive(Debug, Deserialize)]

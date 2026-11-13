@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::{Context, bail};
 use clap::Subcommand;
 use suhms_store::{
-    AccessKeyRecord, Store,
+    AccessKeyRecord,
     meta::{self, MetadataStore},
 };
 
@@ -141,7 +141,7 @@ async fn set_active(meta: &dyn MetadataStore, key_id: &str, active: bool) -> any
 }
 
 pub async fn bucket(config: Config, cmd: BucketCmd) -> anyhow::Result<()> {
-    let store = Store::open(config.storage).await?;
+    let store = crate::cluster::open_store(&config).await?;
     match cmd {
         BucketCmd::SetReplicas { bucket, replicas } => {
             let n = match replicas.as_str() {
@@ -159,7 +159,7 @@ pub async fn bucket(config: Config, cmd: BucketCmd) -> anyhow::Result<()> {
 }
 
 pub async fn scrub(config: Config) -> anyhow::Result<()> {
-    let store = Store::open(config.storage).await?;
+    let store = crate::cluster::open_store(&config).await?;
     let r = store.scrub().await?;
     println!(
         "checked {} copies, removed {} bad copies",
@@ -169,7 +169,7 @@ pub async fn scrub(config: Config) -> anyhow::Result<()> {
 }
 
 pub async fn repair(config: Config) -> anyhow::Result<()> {
-    let store = Store::open(config.storage).await?;
+    let store = crate::cluster::open_store(&config).await?;
     let r = store.repair().await?;
     println!(
         "copied {}, trimmed {}, unrecoverable {}",

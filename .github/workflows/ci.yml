@@ -26,3 +26,36 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # The storage engine's tests (single node and in-process cluster) against the shared
+  # metadata backends used in multi-node deployments.
+  metadata-backends:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: pw
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-retries 20
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: pw
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: PostgreSQL
+        run: cargo test -p suhms-store
+        env:
+          SUHMS_TEST_POSTGRES: postgres://postgres:pw@127.0.0.1:5432
+      - name: MariaDB
+        run: cargo test -p suhms-store
+        env:
+          SUHMS_TEST_MYSQL: mysql://root:pw@127.0.0.1:3306

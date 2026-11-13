@@ -6,7 +6,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    io::{self, SeekFrom},
+    io,
     sync::Arc,
     time::{Duration, UNIX_EPOCH},
 };
@@ -42,7 +42,7 @@ use suhms_store::{
     CompletedPart, ListPage, ListParams, ListStart, ObjectRecord, PutObjectRequest, Store,
     StoreError,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
+use tokio::io::AsyncRead;
 use tokio_util::io::{ReaderStream, StreamReader};
 use uuid::Uuid;
 
@@ -853,13 +853,14 @@ impl S3 for S3Service {
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let tenant = self.tenant(&req).await?;
         let input = req.input;
-        let (rec, mut file) = self
+        let stored = self
             .store
             .get_object(&tenant, &input.bucket, &input.key)
             .await
             .map_err(s3_err)?;
+        let rec = &stored.object;
         check_preconditions(
-            &rec,
+            rec,
             input.if_match.as_ref(),
             input.if_none_match.as_ref(),
             input.if_modified_since.as_ref(),
@@ -874,20 +875,22 @@ impl S3 for S3Service {
                 (r.start, r.end - r.start, Some(range_header))
             }
         };
-        if start > 0 {
-            file.seek(SeekFrom::Start(start)).await.map_err(internal)?;
-        }
-        let body = ReaderStream::with_capacity(file.take(len), READ_CHUNK);
+        let reader = self
+            .store
+            .read_object(&stored, start..start + len)
+            .await
+            .map_err(s3_err)?;
+        let body = ReaderStream::with_capacity(reader, READ_CHUNK);
 
         Ok(S3Response::new(GetObjectOutput {
             body: Some(StreamingBlob::wrap(body)),
             content_length: Some(size_i64(len)),
             content_range,
             accept_ranges: Some("bytes".to_owned()),
-            e_tag: Some(etag(&rec)),
+            e_tag: Some(etag(rec)),
             last_modified: Some(timestamp(rec.created_at)),
             content_type: rec.content_type.clone(),
-            metadata: user_metadata(&rec),
+            metadata: user_metadata(rec),
             ..Default::default()
         }))
     }

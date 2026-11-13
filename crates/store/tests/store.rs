@@ -1,5 +1,7 @@
 use std::{collections::HashSet, path::PathBuf};
 
+mod common;
+
 use md5::{Digest, Md5};
 use suhms_store::{
     ListParams, ListStart, PutObjectRequest, Store, StoreConfig, StoreError, TenantRecord,
@@ -12,10 +14,11 @@ use tokio::io::AsyncReadExt;
 struct Env {
     dir: TempDir,
     disks: Vec<PathBuf>,
+    meta_url: String,
 }
 
 impl Env {
-    fn new(disks: usize) -> Self {
+    async fn new(disks: usize) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let disks = (0..disks)
             .map(|i| {
@@ -24,13 +27,18 @@ impl Env {
                 p
             })
             .collect();
-        Self { dir, disks }
+        let meta_url = common::metadata_url(dir.path()).await;
+        Self {
+            dir,
+            disks,
+            meta_url,
+        }
     }
 
     fn config(&self) -> StoreConfig {
         StoreConfig {
             disks: self.disks.clone(),
-            metadata_url: format!("sqlite://{}", self.dir.path().join("meta.db").display()),
+            metadata_url: self.meta_url.clone(),
             ..StoreConfig::default()
         }
     }
@@ -69,9 +77,13 @@ fn put(bucket: &str, key: &str, class: Option<&str>) -> PutObjectRequest {
 }
 
 async fn read_object(store: &Store, bucket: &str, key: &str) -> Vec<u8> {
-    let (_, mut file) = store.get_object(OWNER, bucket, key).await.unwrap();
+    let stored = store.get_object(OWNER, bucket, key).await.unwrap();
+    let mut reader = store
+        .read_object(&stored, 0..stored.object.size)
+        .await
+        .unwrap();
     let mut out = Vec::new();
-    file.read_to_end(&mut out).await.unwrap();
+    reader.read_to_end(&mut out).await.unwrap();
     out
 }
 
@@ -81,7 +93,7 @@ fn disk_of(path: &std::path::Path, env: &Env) -> usize {
 
 #[tokio::test]
 async fn put_writes_plain_identical_files_on_distinct_disks() {
-    let env = Env::new(4);
+    let env = Env::new(4).await;
     let store = env.open().await;
     store.create_bucket(OWNER, "backups", None).await.unwrap();
     let data = payload();
@@ -109,7 +121,7 @@ async fn put_writes_plain_identical_files_on_distinct_disks() {
 
 #[tokio::test]
 async fn replica_count_follows_class_then_bucket_then_default() {
-    let env = Env::new(4);
+    let env = Env::new(4).await;
     let store = env.open().await;
     store.create_bucket(OWNER, "one", Some(1)).await.unwrap();
     store.create_bucket(OWNER, "dflt", None).await.unwrap();
@@ -158,7 +170,7 @@ async fn replica_count_follows_class_then_bucket_then_default() {
 
 #[tokio::test]
 async fn overwrite_and_delete_remove_old_files() {
-    let env = Env::new(3);
+    let env = Env::new(3).await;
     let store = env.open().await;
     store.create_bucket(OWNER, "bk1", None).await.unwrap();
 
@@ -194,7 +206,7 @@ async fn overwrite_and_delete_remove_old_files() {
 
 #[tokio::test]
 async fn get_falls_back_to_another_copy() {
-    let env = Env::new(3);
+    let env = Env::new(3).await;
     let store = env.open().await;
     store.create_bucket(OWNER, "bk1", None).await.unwrap();
     store
@@ -209,7 +221,7 @@ async fn get_falls_back_to_another_copy() {
 
 #[tokio::test]
 async fn scrub_and_repair_restore_corrupt_and_missing_copies() {
-    let env = Env::new(4);
+    let env = Env::new(4).await;
     let store = env.open().await;
     store.create_bucket(OWNER, "bk1", None).await.unwrap();
     let data = payload();
@@ -250,7 +262,7 @@ async fn scrub_and_repair_restore_corrupt_and_missing_copies() {
 
 #[tokio::test]
 async fn changing_bucket_replicas_adds_or_trims_copies() {
-    let env = Env::new(3);
+    let env = Env::new(3).await;
     let store = env.open().await;
     store.create_bucket(OWNER, "bk1", None).await.unwrap();
     store
@@ -287,7 +299,7 @@ async fn changing_bucket_replicas_adds_or_trims_copies() {
 
 #[tokio::test]
 async fn offline_disk_is_skipped_and_never_created() {
-    let env = Env::new(3);
+    let env = Env::new(3).await;
     {
         let store = env.open().await;
         store.create_bucket(OWNER, "bk1", None).await.unwrap();
@@ -305,7 +317,21 @@ async fn offline_disk_is_skipped_and_never_created() {
     let store = env.open().await;
     assert!(!gone.exists(), "a missing disk root must not be recreated");
     assert_eq!(read_object(&store, "bk1", "k").await, b"data");
-    assert_eq!(store.max_replicas(), 2);
+    // Capacity still counts the registered (offline) disk, so 3-replica writes keep working
+    // with 2 copies until it returns.
+    assert_eq!(store.max_replicas().await.unwrap(), 3);
+    store
+        .put_object(OWNER, put("bk1", "while-degraded", None), &b"d"[..])
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .object_locations("bk1", "while-degraded")
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
     // With one disk offline only 2 online copies remain and there is nowhere to add a third.
     let r = store.repair().await.unwrap();
     assert_eq!(r.copied, 0);
@@ -315,21 +341,35 @@ async fn offline_disk_is_skipped_and_never_created() {
     std::fs::rename(&moved, &gone).unwrap();
     let store = env.open().await;
     assert_eq!(store.object_locations("bk1", "k").await.unwrap().len(), 3);
-    assert_eq!(store.repair().await.unwrap(), Default::default());
+    // The object written while degraded gets its third copy.
+    let r = store.repair().await.unwrap();
+    assert_eq!((r.copied, r.trimmed, r.unrecoverable), (1, 0, 0));
+    assert_eq!(
+        store
+            .object_locations("bk1", "while-degraded")
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
 }
 
 #[tokio::test]
 async fn refuses_to_format_a_non_empty_directory() {
-    let env = Env::new(2);
+    let env = Env::new(2).await;
     std::fs::write(env.disks[1].join("someone-elses-file"), b"x").unwrap();
     let store = env.open().await;
-    assert_eq!(store.max_replicas(), 1, "the foreign directory is not used");
+    assert_eq!(
+        store.max_replicas().await.unwrap(),
+        1,
+        "the foreign directory is not used"
+    );
     assert!(!env.disks[1].join(".suhms").exists());
 }
 
 #[tokio::test]
 async fn rejects_invalid_names() {
-    let env = Env::new(1);
+    let env = Env::new(1).await;
     let store = env.open().await;
     for bad in ["ab", "UPPER", "-start", "end-", "a..b", "has_underscore"] {
         assert!(
@@ -353,7 +393,7 @@ async fn rejects_invalid_names() {
 
 #[tokio::test]
 async fn tenants_cannot_touch_each_others_buckets() {
-    let env = Env::new(3);
+    let env = Env::new(3).await;
     let store = env.open().await;
     let other = store.create_tenant("other-customer").await.unwrap();
     let err = store.create_tenant("other-customer").await.unwrap_err();
@@ -421,7 +461,7 @@ async fn tenants_cannot_touch_each_others_buckets() {
 
 #[tokio::test]
 async fn content_md5_mismatch_is_rejected_and_leaves_nothing() {
-    let env = Env::new(3);
+    let env = Env::new(3).await;
     let store = env.open().await;
     store.create_bucket(OWNER, "bk1", None).await.unwrap();
     store
@@ -498,7 +538,7 @@ async fn list_all(
 
 #[tokio::test]
 async fn list_objects_follows_s3_semantics() {
-    let env = Env::new(1);
+    let env = Env::new(1).await;
     let store = env.open().await;
     store.create_bucket(OWNER, "lst", Some(1)).await.unwrap();
     let keys = [
@@ -559,7 +599,7 @@ fn part_data(seed: u8, len: usize) -> Vec<u8> {
 #[tokio::test]
 async fn multipart_upload_assembles_one_plain_file_per_disk() {
     use suhms_store::{CompletedPart, MIN_PART_SIZE};
-    let env = Env::new(3);
+    let env = Env::new(3).await;
     let store = env.open().await;
     store.create_bucket(OWNER, "mp1", None).await.unwrap();
     let mut req = put("mp1", "big.bin", None);
@@ -642,7 +682,7 @@ async fn multipart_upload_assembles_one_plain_file_per_disk() {
 #[tokio::test]
 async fn multipart_completion_is_validated() {
     use suhms_store::CompletedPart;
-    let env = Env::new(1);
+    let env = Env::new(1).await;
     let store = env.open().await;
     store.create_bucket(OWNER, "mp1", Some(1)).await.unwrap();
     let upload = store
@@ -709,7 +749,7 @@ async fn multipart_completion_is_validated() {
 
 #[tokio::test]
 async fn abort_and_bucket_delete_clean_up_uploads() {
-    let env = Env::new(2);
+    let env = Env::new(2).await;
     let store = env.open().await;
     store.create_bucket(OWNER, "mp1", Some(2)).await.unwrap();
     let u1 = store
@@ -750,7 +790,7 @@ async fn abort_and_bucket_delete_clean_up_uploads() {
 
 #[tokio::test]
 async fn copy_object_and_conditional_put() {
-    let env = Env::new(2);
+    let env = Env::new(2).await;
     let store = env.open().await;
     store.create_bucket(OWNER, "src1", Some(2)).await.unwrap();
     store.create_bucket(OWNER, "dst1", Some(1)).await.unwrap();

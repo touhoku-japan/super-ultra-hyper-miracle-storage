@@ -3,6 +3,7 @@
 
 pub mod admin;
 pub mod checksum;
+pub mod cluster;
 pub mod config;
 pub mod crypto;
 pub mod s3;

@@ -40,3 +40,17 @@ max_object_size = 5368709120
 # アクセスキーのシークレットを暗号化するマスターキー（`suhms gen-master-key` で生成した 64 桁 hex）。
 # 環境変数 SUHMS_MASTER_KEY が優先される。紛失すると既存のアクセスキーはすべて使えなくなる
 master_key_file = "/etc/suhms/master.key"
+
+# 複数ノード構成。単一ノードなら nodes を空のままにする（このセクションごと省略してよい）。
+# 全ノードで同じ metadata_url（PostgreSQL / MariaDB の HA 構成）と同じ secret を使う。
+[cluster]
+# ノード間通信の待ち受け。プライベートネットワーク上のアドレスにすること（HTTP。暗号化はしない）
+# listen = "10.0.0.1:9100"
+# ノード間リクエストの認証に使う共有シークレット（32 文字以上）。環境変数 SUHMS_CLUSTER_SECRET が優先
+# secret_file = "/etc/suhms/cluster.key"
+# 全ノード（自分を含む）。id は各ノードの [storage] node_id
+# nodes = [
+#   { id = "node1", url = "http://10.0.0.1:9100" },
+#   { id = "node2", url = "http://10.0.0.2:9100" },
+#   { id = "node3", url = "http://10.0.0.3:9100" },
+# ]
