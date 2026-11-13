@@ -18,6 +18,13 @@ confidence-threshold = 0.9
 
 [advisories]
 yanked = "deny"
+ignore = [
+    # SQLite < 3.54 can leak stale memory when opening a crafted database + -wal pair.
+    # Bundled via sqlx-sqlite 0.9.0, which pins libsqlite3-sys < 0.38 (fix is in 0.39).
+    # Not exploitable here: suhms only opens the metadata DB it created itself, and SQLite is
+    # for single-node/dev only. Remove this once sqlx allows libsqlite3-sys >= 0.39.
+    { id = "RUSTSEC-2026-0459", reason = "metadata DB is never attacker-supplied; blocked on sqlx bumping libsqlite3-sys" },
+]
 
 [bans]
 multiple-versions = "warn"

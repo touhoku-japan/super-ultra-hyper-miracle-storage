@@ -57,6 +57,7 @@ MIT ライセンス。依存クレートは `deny.toml` の許可リスト（MIT
 
 ## 未対応（Phase 1 時点の既知の穴）
 
+- `deny.toml` で RUSTSEC-2026-0459（同梱 SQLite の脆弱性）を一時除外中。sqlx が libsqlite3-sys >= 0.39 を許容したら更新して除外を外す
 - PostgreSQL / MariaDB バックエンド未実装（`meta::connect` がエラーを返す）
 - scrub / repair は呼び出し側が実行する前提で、定期実行の仕組みはまだない
 - メタデータ更新前にクラッシュした場合や、オフラインのディスク上に残った孤立ファイルの GC がない
