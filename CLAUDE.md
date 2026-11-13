@@ -17,12 +17,24 @@ release ビルドは CI 側で行う想定。
 - Cargo workspace。クレートは `crates/*`
   - `server/` — バイナリ `suhms`。設定（TOML、`deny_unknown_fields`）、tracing、graceful shutdown
 - 予定: `store/`（EC ストレージエンジン、trait で抽象化）、`auth/`（テナント・アクセスキー・SigV4）、`admin-cli/`
-- S3 プロトコル層は `s3s` クレートを採用（決定済み、Apache-2.0。`openssl` feature は使わない）。メタデータは PostgreSQL HA が推奨案（未確定）
+- S3 プロトコル層は `s3s` クレートを採用（決定済み、Apache-2.0。`openssl` feature は使わない）
 
 ## ライセンス
 
-BSD ライセンスで配布予定。依存クレートは `deny.toml` の許可リスト（MIT / Apache-2.0 / BSD 等の寛容なもの）に限る。
+MIT ライセンス。依存クレートは `deny.toml` の許可リスト（MIT / Apache-2.0 / BSD 等の寛容なもの）に限る。
 コピーレフト（GPL / AGPL / LGPL）の依存は追加しないこと。CI の cargo-deny がこれを検査する。
+
+## 決定済みの設計方針
+
+- **初期ハードウェア**: 3 ノード × 各 4 ディスク（計 12 ドライブ）。ノード間は 1〜10Gbps。
+  ディスク・ノードの追加に対応すること（ハードコード禁止）。
+- **Erasure Coding**: 初期構成のデフォルトは 12 ドライブで 1 セットの 8+4（容量効率 67%）。
+  各ノードに 4 シャードずつ配置するので、1 ノード全損またはディスク 4 本の故障まで読める。
+  データ:パリティ比とセット幅は設定で変えられるようにし、シャードはノード間に均等に配置する。
+  増設は「プール」単位で行い、既存データのリバランスはしない。
+- **メタデータ**: `trait MetadataStore` で抽象化し、SQLite / PostgreSQL / MariaDB を設定で選べるようにする（`sqlx` を想定）。
+  SQLite は単一ノード構成と開発専用。マルチノードでは PostgreSQL（Patroni 等）か MariaDB（Galera 等）の HA 構成が前提。
+  SQL は 3 方言すべてで動くものに限り、テストも 3 バックエンドで実行する。
 
 ## 設計上の注意
 
