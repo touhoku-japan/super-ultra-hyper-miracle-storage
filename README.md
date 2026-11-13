@@ -2,7 +2,7 @@
 Super-Ultra-Hyper-Miracle Storage is HTTP Storage Server
 
 S3 互換のオブジェクトストレージ（Rust 製）。SoraHost の社内バックアップおよび顧客向けの外販を想定し、
-マルチテナント・Erasure Coding による複数ディスク/複数ノードの冗長化を目標とする。
+マルチテナントと、複数ディスク/複数ノードへのレプリケーション（ファイルを丸ごとコピー。Erasure Coding は使わない）による冗長化を特徴とする。
 
 ## 機能
 

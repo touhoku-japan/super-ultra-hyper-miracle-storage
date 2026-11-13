@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 S3 互換オブジェクトストレージの Rust 実装（旧 Laravel スケルトンからの置き換え）。
-SoraHost の社内バックアップ＋顧客向け外販が目的。マルチテナントと、Erasure Coding による複数ディスク/複数ノードの冗長化が必須要件。
+SoraHost の社内バックアップ＋顧客向け外販が目的。マルチテナントと、複数ディスク/複数ノードへのレプリケーション（ファイルを丸ごとコピー）による冗長化が必須要件。
 
 ## コマンド
 
@@ -21,7 +21,7 @@ release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレ
 
 - Cargo workspace。クレートは `crates/*`
   - `server/` — lib + バイナリ `suhms`
-    - `lib.rs` — `app()`: axum ルータ（ヘルスチェック + それ以外は s3s の S3 サービス）
+    - `lib.rs` — `app()`: axum ルータ（ヘルスチェック + それ以外は s3s の S3 サービス）。外側から CORS → 監査ログ → TraceLayer の順にレイヤーを重ねる
     - `s3.rs` — `s3s::S3` 実装。リクエストごとに検証済みアクセスキー → テナント ID を引き、store にテナントを渡す。
       `KeyStore`（`S3Auth`）が SigV4 用にシークレットを復号して返す。body 読み取り中の s3s エラー（SHA-256 不一致等）は `body_error` で S3 エラーに戻す
     - `crypto.rs` — アクセスキーのシークレットを AES-256-GCM で暗号化（AAD = アクセスキー ID）。マスターキーは `SUHMS_MASTER_KEY` か `[auth] master_key_file`
@@ -71,7 +71,7 @@ release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレ
 - CORS（`server/src/cors.rs`）: ルールはバケットに JSON で保存し、ミドルウェアがプリフライト（OPTIONS）と応答ヘッダを処理
 - SQLite のマイグレーションは外部キーを無効化して実行する（`objects` の再作成で replicas が CASCADE 削除されないように）
 - サーバ側暗号化（SSE）は実装しない: 「ファイルをそのまま置く」方針と矛盾するため。保存時暗号化はディスク側（LUKS 等）で行う
-- 対応済み S3 操作: ListBuckets, Create/Head/Delete Bucket, GetBucketLocation, GetBucketVersioning（常に未設定）,
+- 対応済み S3 操作: ListBuckets, Create/Head/Delete Bucket, GetBucketLocation, GetBucketVersioning,
   Put/Get（Range）/Head/Delete Object, DeleteObjects, ListObjects V1/V2（encoding-type=url 対応）, presigned URL,
   CopyObject（COPY/REPLACE）, Create/UploadPart/UploadPartCopy/Complete/Abort MultipartUpload, ListParts, ListMultipartUploads,
   条件付きリクエスト（GET/HEAD の If-Match / If-None-Match / If-(Un)Modified-Since、PUT の If-None-Match: *）,
