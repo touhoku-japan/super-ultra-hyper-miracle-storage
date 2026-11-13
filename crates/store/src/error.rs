@@ -52,6 +52,24 @@ pub enum StoreError {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+
+    #[error("multipart upload does not exist")]
+    NoSuchUpload,
+
+    #[error("invalid part: {0}")]
+    InvalidPart(String),
+
+    #[error("parts must be listed in ascending order")]
+    InvalidPartOrder,
+
+    #[error("a part other than the last is smaller than the minimum part size")]
+    EntityTooSmall,
+
+    #[error("precondition failed")]
+    PreconditionFailed,
+
     #[error("bucket {0} is not empty")]
     BucketNotEmpty(String),
 

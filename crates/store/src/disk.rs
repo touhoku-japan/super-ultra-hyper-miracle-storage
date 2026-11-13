@@ -4,6 +4,7 @@
 //! ```text
 //! <root>/.suhms/format.json      disk identity (stable across remounts/reordering)
 //! <root>/.suhms/tmp/<uuid>        in-progress writes, cleared on startup
+//! <root>/.suhms/multipart/<upload>/<blob-id>  parts of an in-progress multipart upload
 //! <root>/objects/ab/cd/<blob-id>  object contents, stored verbatim
 //! ```
 
@@ -23,6 +24,7 @@ const META_DIR: &str = ".suhms";
 const FORMAT_FILE: &str = "format.json";
 const TMP_DIR: &str = "tmp";
 const OBJECTS_DIR: &str = "objects";
+const MULTIPART_DIR: &str = "multipart";
 const FORMAT_VERSION: u32 = 1;
 
 #[derive(Serialize, Deserialize)]
@@ -153,6 +155,19 @@ impl Disk {
             .join(&name[0..2])
             .join(&name[2..4])
             .join(name)
+    }
+
+    /// Directory holding the parts of one multipart upload on this disk.
+    pub fn upload_dir(&self, upload: Uuid) -> PathBuf {
+        self.root
+            .join(META_DIR)
+            .join(MULTIPART_DIR)
+            .join(upload.simple().to_string())
+    }
+
+    /// Location of one uploaded part's file.
+    pub fn part_path(&self, upload: Uuid, blob: Uuid) -> PathBuf {
+        self.upload_dir(upload).join(blob.simple().to_string())
     }
 
     /// A fresh temporary path for an in-progress write.

@@ -21,24 +21,32 @@ use s3s::{
     S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     auth::{S3Auth, SecretKey},
     dto::{
-        Bucket, BucketLocationConstraint, CommonPrefix, CreateBucketInput, CreateBucketOutput,
-        DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput,
-        DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag, GetBucketLocationInput,
-        GetBucketLocationOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
-        GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
-        HeadObjectOutput, ListBucketsInput, ListBucketsOutput, ListObjectsInput, ListObjectsOutput,
-        ListObjectsV2Input, ListObjectsV2Output, Object, ObjectStorageClass, Owner, PutObjectInput,
-        PutObjectOutput, StreamingBlob, Timestamp,
+        AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketLocationConstraint,
+        Checksum, CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
+        CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopyPartResult, CopySource,
+        CreateBucketInput, CreateBucketOutput, CreateMultipartUploadInput,
+        CreateMultipartUploadOutput, DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput,
+        DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
+        ETagCondition, GetBucketLocationInput, GetBucketLocationOutput, GetBucketVersioningInput,
+        GetBucketVersioningOutput, GetObjectInput, GetObjectOutput, HeadBucketInput,
+        HeadBucketOutput, HeadObjectInput, HeadObjectOutput, Initiator, ListBucketsInput,
+        ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput, ListObjectsInput,
+        ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, ListPartsInput,
+        ListPartsOutput, MultipartUpload, Object, ObjectStorageClass, Owner, Part, PutObjectInput,
+        PutObjectOutput, StorageClass, StreamingBlob, Timestamp, UploadPartCopyInput,
+        UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
     },
     s3_error,
 };
 use suhms_store::{
-    ListPage, ListParams, ListStart, ObjectRecord, PutObjectRequest, Store, StoreError,
+    CompletedPart, ListPage, ListParams, ListStart, ObjectRecord, PutObjectRequest, Store,
+    StoreError,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::{ReaderStream, StreamReader};
+use uuid::Uuid;
 
-use crate::crypto::SecretCipher;
+use crate::{checksum, crypto::SecretCipher};
 
 const READ_CHUNK: usize = 256 * 1024;
 
@@ -120,6 +128,12 @@ fn s3_err(e: StoreError) -> S3Error {
         StoreError::AccessDenied => s3_error!(AccessDenied),
         StoreError::UnknownStorageClass(_) => s3_error!(InvalidStorageClass),
         StoreError::BadDigest => s3_error!(BadDigest),
+        StoreError::NoSuchUpload => s3_error!(NoSuchUpload),
+        StoreError::InvalidPart(m) => S3Error::with_message(S3ErrorCode::InvalidPart, m),
+        StoreError::InvalidPartOrder => s3_error!(InvalidPartOrder),
+        StoreError::EntityTooSmall => s3_error!(EntityTooSmall),
+        StoreError::PreconditionFailed => s3_error!(PreconditionFailed),
+        StoreError::InvalidRequest(m) => S3Error::with_message(S3ErrorCode::InvalidRequest, m),
         e @ (StoreError::InvalidReplicaCount { .. } | StoreError::InvalidArgument(_)) => {
             S3Error::with_message(S3ErrorCode::InvalidArgument, e.to_string())
         }
@@ -265,6 +279,100 @@ fn prefix_entries(page: &ListPage, enc: fn(&str) -> String) -> Vec<CommonPrefix>
         .collect()
 }
 
+fn parse_md5(content_md5: Option<&str>) -> S3Result<Option<[u8; 16]>> {
+    content_md5
+        .map(|b64| {
+            B64.decode(b64)
+                .ok()
+                .and_then(|d| <[u8; 16]>::try_from(d).ok())
+                .ok_or_else(|| s3_error!(InvalidDigest))
+        })
+        .transpose()
+}
+
+fn parse_upload_id(id: &str) -> S3Result<Uuid> {
+    Uuid::parse_str(id).map_err(|_| s3_error!(NoSuchUpload))
+}
+
+fn part_number(n: i32) -> S3Result<u32> {
+    u32::try_from(n).map_err(|_| s3_error!(InvalidArgument, "invalid part number"))
+}
+
+fn class_name(c: Option<StorageClass>) -> Option<String> {
+    c.map(|c| c.as_str().to_owned())
+}
+
+fn copy_source(src: &CopySource) -> S3Result<(String, String)> {
+    match src {
+        CopySource::Bucket {
+            bucket,
+            key,
+            version_id: None,
+        } => Ok((bucket.to_string(), key.to_string())),
+        CopySource::Bucket { .. } => Err(s3_error!(NotImplemented, "versioned copy sources")),
+        _ => Err(s3_error!(NotImplemented, "access point copy sources")),
+    }
+}
+
+/// Parses `x-amz-copy-source-range: bytes=first-last` into a half-open range.
+fn copy_range(range: Option<&str>) -> S3Result<Option<std::ops::Range<u64>>> {
+    let Some(range) = range else { return Ok(None) };
+    let invalid = || s3_error!(InvalidArgument, "invalid x-amz-copy-source-range");
+    let (first, last) = range
+        .strip_prefix("bytes=")
+        .and_then(|r| r.split_once('-'))
+        .ok_or_else(invalid)?;
+    let first: u64 = first.parse().map_err(|_| invalid())?;
+    let last: u64 = last.parse().map_err(|_| invalid())?;
+    if last < first {
+        return Err(invalid());
+    }
+    Ok(Some(first..last + 1))
+}
+
+/// Evaluates conditional request headers as RFC 9110 and S3 do.
+fn check_preconditions(
+    rec: &ObjectRecord,
+    if_match: Option<&ETagCondition>,
+    if_none_match: Option<&ETagCondition>,
+    if_modified_since: Option<&Timestamp>,
+    if_unmodified_since: Option<&Timestamp>,
+) -> S3Result<()> {
+    let matches = |c: &ETagCondition| match c {
+        ETagCondition::Any => true,
+        ETagCondition::ETag(e) => e.value() == rec.etag,
+    };
+    let modified = rec.created_at.div_euclid(1000);
+    let secs = |t: &Timestamp| time::OffsetDateTime::from(t.clone()).unix_timestamp();
+    if let Some(c) = if_match {
+        if !matches(c) {
+            return Err(s3_error!(PreconditionFailed));
+        }
+    } else if let Some(t) = if_unmodified_since
+        && modified > secs(t)
+    {
+        return Err(s3_error!(PreconditionFailed));
+    }
+    if let Some(c) = if_none_match {
+        if matches(c) {
+            return Err(s3_error!(NotModified));
+        }
+    } else if let Some(t) = if_modified_since
+        && modified <= secs(t)
+    {
+        return Err(s3_error!(NotModified));
+    }
+    Ok(())
+}
+
+fn take_checksum(outcome: &checksum::Outcome) -> Checksum {
+    outcome
+        .lock()
+        .expect("checksum lock")
+        .take()
+        .unwrap_or_default()
+}
+
 fn body_reader(body: Option<StreamingBlob>) -> Box<dyn AsyncRead + Unpin + Send> {
     match body {
         Some(blob) => Box::new(StreamReader::new(blob.map_err(io::Error::other))),
@@ -383,37 +491,358 @@ impl S3 for S3Service {
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
         let tenant = self.tenant(&req).await?;
+        let expected = checksum::expected(&req.headers, req.trailing_headers.as_ref())?;
         let input = req.input;
-        let content_md5 = input
-            .content_md5
-            .as_deref()
-            .map(|b64| {
-                B64.decode(b64)
-                    .ok()
-                    .and_then(|d| <[u8; 16]>::try_from(d).ok())
-                    .ok_or_else(|| s3_error!(InvalidDigest))
-            })
-            .transpose()?;
+        let if_absent = match &input.if_none_match {
+            None => false,
+            Some(ETagCondition::Any) => true,
+            Some(ETagCondition::ETag(_)) => {
+                return Err(s3_error!(NotImplemented, "If-None-Match supports only *"));
+            }
+        };
+        if input.if_match.is_some() {
+            return Err(s3_error!(NotImplemented, "If-Match on PutObject"));
+        }
         let request = PutObjectRequest {
             bucket: input.bucket,
             key: input.key,
             content_type: input.content_type,
-            storage_class: input.storage_class.map(|c| c.as_str().to_owned()),
+            storage_class: class_name(input.storage_class),
             user_metadata: input
                 .metadata
                 .unwrap_or_default()
                 .into_iter()
                 .collect::<BTreeMap<_, _>>(),
-            content_md5,
+            content_md5: parse_md5(input.content_md5.as_deref())?,
+            if_absent,
         };
+        let (body, verified) = checksum::wrap(body_reader(input.body), expected);
         let rec = self
             .store
-            .put_object(&tenant, request, body_reader(input.body))
+            .put_object(&tenant, request, body)
             .await
             .map_err(s3_err)?;
+        let c = take_checksum(&verified);
         Ok(S3Response::new(PutObjectOutput {
             e_tag: Some(etag(&rec)),
             size: Some(size_i64(rec.size)),
+            checksum_crc32: c.checksum_crc32,
+            checksum_crc32c: c.checksum_crc32c,
+            checksum_crc64nvme: c.checksum_crc64nvme,
+            checksum_sha1: c.checksum_sha1,
+            checksum_sha256: c.checksum_sha256,
+            ..Default::default()
+        }))
+    }
+
+    async fn copy_object(
+        &self,
+        req: S3Request<CopyObjectInput>,
+    ) -> S3Result<S3Response<CopyObjectOutput>> {
+        let tenant = self.tenant(&req).await?;
+        let input = req.input;
+        let (src_bucket, src_key) = copy_source(&input.copy_source)?;
+        let replace = match input.metadata_directive.as_ref().map(|d| d.as_str()) {
+            None | Some("COPY") => false,
+            Some("REPLACE") => true,
+            Some(_) => return Err(s3_error!(InvalidArgument, "invalid metadata directive")),
+        };
+        let dest = PutObjectRequest {
+            bucket: input.bucket,
+            key: input.key,
+            content_type: input.content_type,
+            storage_class: class_name(input.storage_class),
+            user_metadata: input.metadata.unwrap_or_default().into_iter().collect(),
+            content_md5: None,
+            if_absent: matches!(input.if_none_match, Some(ETagCondition::Any)),
+        };
+        let rec = self
+            .store
+            .copy_object(&tenant, &src_bucket, &src_key, dest, replace)
+            .await
+            .map_err(s3_err)?;
+        Ok(S3Response::new(CopyObjectOutput {
+            copy_object_result: Some(CopyObjectResult {
+                e_tag: Some(etag(&rec)),
+                last_modified: Some(timestamp(rec.created_at)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        req: S3Request<CreateMultipartUploadInput>,
+    ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        let tenant = self.tenant(&req).await?;
+        let input = req.input;
+        let request = PutObjectRequest {
+            bucket: input.bucket.clone(),
+            key: input.key.clone(),
+            content_type: input.content_type,
+            storage_class: class_name(input.storage_class),
+            user_metadata: input.metadata.unwrap_or_default().into_iter().collect(),
+            content_md5: None,
+            if_absent: false,
+        };
+        let upload = self
+            .store
+            .create_multipart_upload(&tenant, request)
+            .await
+            .map_err(s3_err)?;
+        Ok(S3Response::new(CreateMultipartUploadOutput {
+            bucket: Some(input.bucket),
+            key: Some(input.key),
+            upload_id: Some(upload.id.to_string()),
+            ..Default::default()
+        }))
+    }
+
+    async fn upload_part(
+        &self,
+        req: S3Request<UploadPartInput>,
+    ) -> S3Result<S3Response<UploadPartOutput>> {
+        let tenant = self.tenant(&req).await?;
+        let expected = checksum::expected(&req.headers, req.trailing_headers.as_ref())?;
+        let input = req.input;
+        let (body, verified) = checksum::wrap(body_reader(input.body), expected);
+        let part = self
+            .store
+            .upload_part(
+                &tenant,
+                &input.bucket,
+                &input.key,
+                parse_upload_id(&input.upload_id)?,
+                part_number(input.part_number)?,
+                parse_md5(input.content_md5.as_deref())?,
+                body,
+            )
+            .await
+            .map_err(s3_err)?;
+        let c = take_checksum(&verified);
+        Ok(S3Response::new(UploadPartOutput {
+            e_tag: Some(ETag::Strong(part.etag)),
+            checksum_crc32: c.checksum_crc32,
+            checksum_crc32c: c.checksum_crc32c,
+            checksum_crc64nvme: c.checksum_crc64nvme,
+            checksum_sha1: c.checksum_sha1,
+            checksum_sha256: c.checksum_sha256,
+            ..Default::default()
+        }))
+    }
+
+    async fn upload_part_copy(
+        &self,
+        req: S3Request<UploadPartCopyInput>,
+    ) -> S3Result<S3Response<UploadPartCopyOutput>> {
+        let tenant = self.tenant(&req).await?;
+        let input = req.input;
+        let (src_bucket, src_key) = copy_source(&input.copy_source)?;
+        let part = self
+            .store
+            .upload_part_copy(
+                &tenant,
+                &input.bucket,
+                &input.key,
+                parse_upload_id(&input.upload_id)?,
+                part_number(input.part_number)?,
+                &src_bucket,
+                &src_key,
+                copy_range(input.copy_source_range.as_deref())?,
+            )
+            .await
+            .map_err(s3_err)?;
+        Ok(S3Response::new(UploadPartCopyOutput {
+            copy_part_result: Some(CopyPartResult {
+                e_tag: Some(ETag::Strong(part.etag)),
+                last_modified: Some(timestamp(part.created_at)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        req: S3Request<CompleteMultipartUploadInput>,
+    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        let tenant = self.tenant(&req).await?;
+        let input = req.input;
+        let upload_id = parse_upload_id(&input.upload_id)?;
+        let parts = input
+            .multipart_upload
+            .and_then(|m| m.parts)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| {
+                Ok(CompletedPart {
+                    part_number: part_number(
+                        p.part_number.ok_or_else(|| s3_error!(MalformedXML))?,
+                    )?,
+                    etag: p.e_tag.ok_or_else(|| s3_error!(MalformedXML))?.into_value(),
+                })
+            })
+            .collect::<S3Result<Vec<_>>>()?;
+        if parts.is_empty() {
+            return Err(s3_error!(MalformedXML, "no parts specified"));
+        }
+        // Assembling large objects takes a while; s3s keeps the connection alive meanwhile.
+        let store = Arc::clone(&self.store);
+        let (bucket, key) = (input.bucket, input.key);
+        let future = async move {
+            let rec = store
+                .complete_multipart_upload(&tenant, &bucket, &key, upload_id, &parts)
+                .await
+                .map_err(s3_err)?;
+            Ok(CompleteMultipartUploadOutput {
+                location: Some(format!("/{bucket}/{key}")),
+                bucket: Some(bucket),
+                key: Some(key),
+                e_tag: Some(etag(&rec)),
+                ..Default::default()
+            })
+        };
+        Ok(S3Response::new(CompleteMultipartUploadOutput {
+            future: Some(Box::pin(future)),
+            ..Default::default()
+        }))
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        req: S3Request<AbortMultipartUploadInput>,
+    ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        let tenant = self.tenant(&req).await?;
+        let input = req.input;
+        self.store
+            .abort_multipart_upload(
+                &tenant,
+                &input.bucket,
+                &input.key,
+                parse_upload_id(&input.upload_id)?,
+            )
+            .await
+            .map_err(s3_err)?;
+        Ok(S3Response::new(AbortMultipartUploadOutput::default()))
+    }
+
+    async fn list_parts(
+        &self,
+        req: S3Request<ListPartsInput>,
+    ) -> S3Result<S3Response<ListPartsOutput>> {
+        let tenant = self.tenant(&req).await?;
+        let input = req.input;
+        let marker = part_number(input.part_number_marker.unwrap_or(0))?;
+        let max = max_keys(input.max_parts)?;
+        let (upload, page) = self
+            .store
+            .list_parts(
+                &tenant,
+                &input.bucket,
+                &input.key,
+                parse_upload_id(&input.upload_id)?,
+                marker,
+                max,
+            )
+            .await
+            .map_err(s3_err)?;
+        let owner = Owner {
+            id: Some(tenant.clone()),
+            display_name: None,
+        };
+        Ok(S3Response::new(ListPartsOutput {
+            bucket: Some(input.bucket),
+            key: Some(input.key),
+            upload_id: Some(input.upload_id),
+            part_number_marker: input.part_number_marker,
+            next_part_number_marker: page
+                .parts
+                .last()
+                .and_then(|p| i32::try_from(p.part_number).ok()),
+            max_parts: input.max_parts.or(Some(1000)),
+            is_truncated: Some(page.truncated),
+            storage_class: Some(StorageClass::from(
+                upload
+                    .storage_class
+                    .unwrap_or_else(|| "STANDARD".to_owned()),
+            )),
+            initiator: Some(Initiator {
+                id: Some(tenant),
+                display_name: None,
+            }),
+            owner: Some(owner),
+            parts: Some(
+                page.parts
+                    .into_iter()
+                    .map(|p| Part {
+                        part_number: i32::try_from(p.part_number).ok(),
+                        e_tag: Some(ETag::Strong(p.etag)),
+                        size: Some(size_i64(p.size)),
+                        last_modified: Some(timestamp(p.created_at)),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }))
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        req: S3Request<ListMultipartUploadsInput>,
+    ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        let tenant = self.tenant(&req).await?;
+        let input = req.input;
+        let enc = encoder(input.encoding_type.as_ref())?;
+        let page = self
+            .store
+            .list_multipart_uploads(
+                &tenant,
+                &input.bucket,
+                input.prefix.as_deref().unwrap_or_default(),
+                input.key_marker.as_deref().unwrap_or_default(),
+                input.upload_id_marker.as_deref().unwrap_or_default(),
+                max_keys(input.max_uploads)?,
+            )
+            .await
+            .map_err(s3_err)?;
+        let last = page
+            .uploads
+            .last()
+            .map(|u| (u.key.clone(), u.id.to_string()));
+        Ok(S3Response::new(ListMultipartUploadsOutput {
+            bucket: Some(input.bucket),
+            prefix: input.prefix.as_deref().map(enc),
+            key_marker: input.key_marker.as_deref().map(enc),
+            upload_id_marker: input.upload_id_marker,
+            max_uploads: input.max_uploads.or(Some(1000)),
+            is_truncated: Some(page.truncated),
+            next_key_marker: last.as_ref().map(|(k, _)| enc(k)),
+            next_upload_id_marker: last.map(|(_, id)| id),
+            encoding_type: input.encoding_type,
+            uploads: Some(
+                page.uploads
+                    .into_iter()
+                    .map(|u| MultipartUpload {
+                        key: Some(enc(&u.key)),
+                        upload_id: Some(u.id.to_string()),
+                        initiated: Some(timestamp(u.created_at)),
+                        storage_class: Some(StorageClass::from(
+                            u.storage_class.unwrap_or_else(|| "STANDARD".to_owned()),
+                        )),
+                        owner: Some(Owner {
+                            id: Some(tenant.clone()),
+                            display_name: None,
+                        }),
+                        initiator: Some(Initiator {
+                            id: Some(tenant.clone()),
+                            display_name: None,
+                        }),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
             ..Default::default()
         }))
     }
@@ -429,6 +858,13 @@ impl S3 for S3Service {
             .get_object(&tenant, &input.bucket, &input.key)
             .await
             .map_err(s3_err)?;
+        check_preconditions(
+            &rec,
+            input.if_match.as_ref(),
+            input.if_none_match.as_ref(),
+            input.if_modified_since.as_ref(),
+            input.if_unmodified_since.as_ref(),
+        )?;
 
         let (start, len, content_range) = match &input.range {
             None => (0, rec.size, None),
@@ -461,11 +897,19 @@ impl S3 for S3Service {
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
         let tenant = self.tenant(&req).await?;
+        let input = &req.input;
         let rec = self
             .store
-            .head_object(&tenant, &req.input.bucket, &req.input.key)
+            .head_object(&tenant, &input.bucket, &input.key)
             .await
             .map_err(s3_err)?;
+        check_preconditions(
+            &rec,
+            input.if_match.as_ref(),
+            input.if_none_match.as_ref(),
+            input.if_modified_since.as_ref(),
+            input.if_unmodified_since.as_ref(),
+        )?;
         Ok(S3Response::new(HeadObjectOutput {
             content_length: Some(size_i64(rec.size)),
             accept_ranges: Some("bytes".to_owned()),

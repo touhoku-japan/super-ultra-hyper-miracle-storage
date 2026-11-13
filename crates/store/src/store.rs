@@ -5,18 +5,22 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use tokio::{fs::File, io::AsyncRead};
+use md5::{Digest, Md5};
+use tokio::{
+    fs::File,
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt},
+};
 use uuid::Uuid;
 
 use crate::{
-    blob::{self, CopyOutcome},
+    blob::{self, CopyOutcome, Dest},
     config::StoreConfig,
     disk::{Disk, DiskId},
     error::{Result, StoreError},
     list::{self, ListPage, ListParams},
     meta::{
-        self, BucketRecord, DeleteBucketOutcome, MetadataStore, ObjectRecord, StoredObject,
-        TenantRecord,
+        self, BucketRecord, DeleteBucketOutcome, MetadataStore, ObjectRecord, PartRecord,
+        StoredObject, TenantRecord, UploadRecord,
     },
     placement::{self, Candidate},
 };
@@ -24,6 +28,9 @@ use crate::{
 const MAX_KEY_LEN: usize = 1024;
 /// S3's limit on the total size of user-defined metadata.
 const MAX_USER_METADATA: usize = 2048;
+/// S3's minimum size for every part except the last.
+pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+pub const MAX_PART_NUMBER: u32 = 10_000;
 const PAGE: u32 = 500;
 
 #[derive(Debug, Default)]
@@ -37,6 +44,28 @@ pub struct PutObjectRequest {
     pub user_metadata: BTreeMap<String, String>,
     /// Expected MD5 (`Content-MD5`); the write fails with [`StoreError::BadDigest`] on mismatch.
     pub content_md5: Option<[u8; 16]>,
+    /// `If-None-Match: *`: fail with [`StoreError::PreconditionFailed`] if the key exists.
+    pub if_absent: bool,
+}
+
+/// One entry of a CompleteMultipartUpload request.
+#[derive(Debug, Clone)]
+pub struct CompletedPart {
+    pub part_number: u32,
+    /// ETag as sent by the client (quotes are ignored).
+    pub etag: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PartsPage {
+    pub parts: Vec<PartRecord>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UploadsPage {
+    pub uploads: Vec<UploadRecord>,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -312,6 +341,20 @@ impl Store {
 
     pub async fn delete_bucket(&self, owner: &str, name: &str) -> Result<()> {
         self.owned_bucket(owner, name).await?;
+        if self.meta.list_objects(name, "", "", 1).await?.is_empty() {
+            // Unfinished multipart uploads would otherwise keep the bucket alive invisibly.
+            loop {
+                let uploads = self.meta.list_uploads(name, "", "", "", 100).await?;
+                if uploads.is_empty() {
+                    break;
+                }
+                for u in uploads {
+                    if let Some((upload, parts)) = self.meta.delete_upload(u.id).await? {
+                        self.remove_upload_files(&upload, &parts).await;
+                    }
+                }
+            }
+        }
         match self.meta.delete_bucket(name).await? {
             DeleteBucketOutcome::Deleted => Ok(()),
             DeleteBucketOutcome::NotFound => Err(StoreError::NoSuchBucket(name.to_owned())),
@@ -329,19 +372,33 @@ impl Store {
         req: PutObjectRequest,
         body: R,
     ) -> Result<ObjectRecord> {
-        validate_key(&req.key)?;
-        let meta_size: usize = req
-            .user_metadata
-            .iter()
-            .map(|(k, v)| k.len() + v.len())
-            .sum();
-        if meta_size > MAX_USER_METADATA {
+        let bucket = self.owned_bucket(owner, &req.bucket).await?;
+        self.write_object(&bucket, req, body).await
+    }
+
+    fn check_user_metadata(m: &BTreeMap<String, String>) -> Result<()> {
+        let size: usize = m.iter().map(|(k, v)| k.len() + v.len()).sum();
+        if size > MAX_USER_METADATA {
             return Err(StoreError::InvalidArgument(format!(
                 "user metadata exceeds {MAX_USER_METADATA} bytes"
             )));
         }
-        let bucket = self.owned_bucket(owner, &req.bucket).await?;
-        let (replicas, explicit) = self.resolve_replicas(&bucket, req.storage_class.as_deref())?;
+        Ok(())
+    }
+
+    async fn write_object<R: AsyncRead + Unpin>(
+        &self,
+        bucket: &BucketRecord,
+        req: PutObjectRequest,
+        body: R,
+    ) -> Result<ObjectRecord> {
+        validate_key(&req.key)?;
+        Self::check_user_metadata(&req.user_metadata)?;
+        if req.if_absent && self.meta.get_object(&req.bucket, &req.key).await?.is_some() {
+            // Cheap early exit; the metadata store re-checks atomically at commit.
+            return Err(StoreError::PreconditionFailed);
+        }
+        let (replicas, explicit) = self.resolve_replicas(bucket, req.storage_class.as_deref())?;
         let required = placement::ack_threshold(replicas);
         let targets = self.place(usize::from(replicas), &[]);
         if targets.len() < required {
@@ -352,7 +409,7 @@ impl Store {
         }
 
         let id = Uuid::new_v4();
-        let outcome = blob::write_replicas(&targets, id, required, body).await?;
+        let outcome = blob::write_replicas(&targets, Dest::Object(id), required, body).await?;
         let written = StoredObject {
             object: ObjectRecord {
                 id,
@@ -383,10 +440,13 @@ impl Store {
                 "object stored with fewer copies than requested; repair will add the rest"
             );
         }
+        self.commit_object(written, req.if_absent).await
+    }
 
+    async fn commit_object(&self, written: StoredObject, if_absent: bool) -> Result<ObjectRecord> {
         match self
             .meta
-            .put_object(&written.object, &written.replicas)
+            .put_object(&written.object, &written.replicas, if_absent)
             .await
         {
             Ok(previous) => {
@@ -397,6 +457,411 @@ impl Store {
             }
             Err(e) => {
                 self.remove_files(&written).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Copies an object (server side). With `replace_metadata` false, the content type and
+    /// user metadata come from the source; otherwise from `dest`.
+    pub async fn copy_object(
+        &self,
+        owner: &str,
+        src_bucket: &str,
+        src_key: &str,
+        mut dest: PutObjectRequest,
+        replace_metadata: bool,
+    ) -> Result<ObjectRecord> {
+        let src = self.owned_object(owner, src_bucket, src_key).await?;
+        let bucket = self.owned_bucket(owner, &dest.bucket).await?;
+        if src_bucket == dest.bucket
+            && src_key == dest.key
+            && !replace_metadata
+            && dest.storage_class.is_none()
+        {
+            return Err(StoreError::InvalidRequest(
+                "copying an object onto itself requires changing its metadata or storage class"
+                    .into(),
+            ));
+        }
+        if !replace_metadata {
+            dest.content_type.clone_from(&src.object.content_type);
+            dest.user_metadata.clone_from(&src.object.user_metadata);
+        }
+        dest.content_md5 = None;
+        let (_, file) = self.open_stored(src).await?;
+        self.write_object(&bucket, dest, file).await
+    }
+
+    /// Opens a readable copy of an object restricted to `range` (whole object when `None`).
+    async fn open_range(
+        &self,
+        owner: &str,
+        bucket: &str,
+        key: &str,
+        range: Option<std::ops::Range<u64>>,
+    ) -> Result<(ObjectRecord, tokio::io::Take<File>)> {
+        let stored = self.owned_object(owner, bucket, key).await?;
+        let (rec, mut file) = self.open_stored(stored).await?;
+        let range = range.unwrap_or(0..rec.size);
+        if range.start > range.end || range.end > rec.size {
+            return Err(StoreError::InvalidArgument(
+                "copy range is out of bounds".into(),
+            ));
+        }
+        file.seek(std::io::SeekFrom::Start(range.start)).await?;
+        Ok((rec, file.take(range.end - range.start)))
+    }
+
+    // ---- multipart uploads ----
+
+    /// Starts a multipart upload. The disks for the parts are chosen now, so that completing
+    /// the upload can concatenate the parts locally on each disk.
+    pub async fn create_multipart_upload(
+        &self,
+        owner: &str,
+        req: PutObjectRequest,
+    ) -> Result<UploadRecord> {
+        validate_key(&req.key)?;
+        Self::check_user_metadata(&req.user_metadata)?;
+        let bucket = self.owned_bucket(owner, &req.bucket).await?;
+        let (replicas, explicit) = self.resolve_replicas(&bucket, req.storage_class.as_deref())?;
+        let targets = self.place(usize::from(replicas), &[]);
+        let required = placement::ack_threshold(replicas);
+        if targets.len() < required {
+            return Err(StoreError::WriteQuorum {
+                required,
+                written: targets.len(),
+            });
+        }
+        let upload = UploadRecord {
+            id: Uuid::new_v4(),
+            bucket: req.bucket,
+            key: req.key,
+            content_type: req.content_type,
+            storage_class: req.storage_class,
+            user_metadata: req.user_metadata,
+            desired_replicas: replicas,
+            replicas_explicit: explicit,
+            disks: targets.iter().map(|d| d.id).collect(),
+            created_at: now_millis(),
+        };
+        self.meta.create_upload(&upload).await?;
+        Ok(upload)
+    }
+
+    async fn owned_upload(
+        &self,
+        owner: &str,
+        bucket: &str,
+        key: &str,
+        upload_id: Uuid,
+    ) -> Result<UploadRecord> {
+        self.owned_bucket(owner, bucket).await?;
+        self.meta
+            .get_upload(upload_id)
+            .await?
+            .filter(|u| u.bucket == bucket && u.key == key)
+            .ok_or(StoreError::NoSuchUpload)
+    }
+
+    /// Stores one part. Re-uploading a part number replaces the earlier part.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_part<R: AsyncRead + Unpin>(
+        &self,
+        owner: &str,
+        bucket: &str,
+        key: &str,
+        upload_id: Uuid,
+        part_number: u32,
+        content_md5: Option<[u8; 16]>,
+        body: R,
+    ) -> Result<PartRecord> {
+        if !(1..=MAX_PART_NUMBER).contains(&part_number) {
+            return Err(StoreError::InvalidArgument(format!(
+                "part number must be between 1 and {MAX_PART_NUMBER}"
+            )));
+        }
+        let upload = self.owned_upload(owner, bucket, key, upload_id).await?;
+        let targets: Vec<Arc<Disk>> = upload
+            .disks
+            .iter()
+            .filter_map(|d| self.disk(*d).cloned())
+            .collect();
+        let required = placement::ack_threshold(upload.desired_replicas);
+        if targets.len() < required {
+            return Err(StoreError::WriteQuorum {
+                required,
+                written: targets.len(),
+            });
+        }
+        let blob_id = Uuid::new_v4();
+        let dest = Dest::Part {
+            upload: upload_id,
+            blob: blob_id,
+        };
+        let outcome = blob::write_replicas(&targets, dest, required, body).await?;
+        let remove = |disks: Vec<DiskId>, dest: Dest| async move {
+            for d in disks {
+                if let Some(disk) = self.disk(d) {
+                    blob::remove_path(&dest.path(disk)).await;
+                }
+            }
+        };
+        if let Some(expected) = content_md5
+            && hex::encode(expected) != outcome.md5
+        {
+            remove(outcome.written, dest).await;
+            return Err(StoreError::BadDigest);
+        }
+        let part = PartRecord {
+            upload_id,
+            part_number,
+            blob_id,
+            size: outcome.size,
+            etag: outcome.md5,
+            blake3: outcome.blake3,
+            disks: outcome.written,
+            created_at: now_millis(),
+        };
+        match self.meta.put_part(&part).await {
+            Ok(previous) => {
+                if let Some(prev) = previous {
+                    let old = Dest::Part {
+                        upload: upload_id,
+                        blob: prev.blob_id,
+                    };
+                    remove(prev.disks, old).await;
+                }
+                Ok(part)
+            }
+            Err(e) => {
+                remove(part.disks, dest).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Stores a part copied from (a byte range of) an existing object.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_part_copy(
+        &self,
+        owner: &str,
+        bucket: &str,
+        key: &str,
+        upload_id: Uuid,
+        part_number: u32,
+        src_bucket: &str,
+        src_key: &str,
+        range: Option<std::ops::Range<u64>>,
+    ) -> Result<PartRecord> {
+        let (_, reader) = self.open_range(owner, src_bucket, src_key, range).await?;
+        self.upload_part(owner, bucket, key, upload_id, part_number, None, reader)
+            .await
+    }
+
+    pub async fn list_parts(
+        &self,
+        owner: &str,
+        bucket: &str,
+        key: &str,
+        upload_id: Uuid,
+        after_part: u32,
+        max_parts: usize,
+    ) -> Result<(UploadRecord, PartsPage)> {
+        let upload = self.owned_upload(owner, bucket, key, upload_id).await?;
+        let max = max_parts.min(1000);
+        let limit = u32::try_from(max + 1).unwrap_or(u32::MAX);
+        let mut parts = self.meta.list_parts(upload_id, after_part, limit).await?;
+        let truncated = parts.len() > max;
+        parts.truncate(max);
+        Ok((upload, PartsPage { parts, truncated }))
+    }
+
+    pub async fn list_multipart_uploads(
+        &self,
+        owner: &str,
+        bucket: &str,
+        prefix: &str,
+        after_key: &str,
+        after_id: &str,
+        max_uploads: usize,
+    ) -> Result<UploadsPage> {
+        self.owned_bucket(owner, bucket).await?;
+        let max = max_uploads.min(1000);
+        let limit = u32::try_from(max + 1).unwrap_or(u32::MAX);
+        let mut uploads = self
+            .meta
+            .list_uploads(bucket, prefix, after_key, after_id, limit)
+            .await?;
+        let truncated = uploads.len() > max;
+        uploads.truncate(max);
+        Ok(UploadsPage { uploads, truncated })
+    }
+
+    async fn remove_upload_files(&self, upload: &UploadRecord, parts: &[PartRecord]) {
+        let mut disks: HashSet<DiskId> = upload.disks.iter().copied().collect();
+        disks.extend(parts.iter().flat_map(|p| p.disks.iter().copied()));
+        for id in disks {
+            if let Some(disk) = self.disk(id) {
+                blob::remove_upload_dir(disk, upload.id).await;
+            }
+        }
+    }
+
+    pub async fn abort_multipart_upload(
+        &self,
+        owner: &str,
+        bucket: &str,
+        key: &str,
+        upload_id: Uuid,
+    ) -> Result<()> {
+        self.owned_upload(owner, bucket, key, upload_id).await?;
+        let (upload, parts) = self
+            .meta
+            .delete_upload(upload_id)
+            .await?
+            .ok_or(StoreError::NoSuchUpload)?;
+        self.remove_upload_files(&upload, &parts).await;
+        Ok(())
+    }
+
+    /// Assembles the listed parts into the final object: each disk holding all parts
+    /// concatenates them into an ordinary object file.
+    pub async fn complete_multipart_upload(
+        &self,
+        owner: &str,
+        bucket: &str,
+        key: &str,
+        upload_id: Uuid,
+        requested: &[CompletedPart],
+    ) -> Result<ObjectRecord> {
+        let upload = self.owned_upload(owner, bucket, key, upload_id).await?;
+        if requested.is_empty() {
+            return Err(StoreError::InvalidRequest(
+                "at least one part must be specified".into(),
+            ));
+        }
+        if requested
+            .windows(2)
+            .any(|w| w[0].part_number >= w[1].part_number)
+        {
+            return Err(StoreError::InvalidPartOrder);
+        }
+
+        let mut stored = std::collections::HashMap::new();
+        let mut after = 0;
+        loop {
+            let page = self.meta.list_parts(upload_id, after, 1000).await?;
+            let Some(last) = page.last() else { break };
+            after = last.part_number;
+            for p in page {
+                stored.insert(p.part_number, p);
+            }
+        }
+        let mut chosen: Vec<&PartRecord> = Vec::with_capacity(requested.len());
+        for r in requested {
+            let part = stored.get(&r.part_number).ok_or_else(|| {
+                StoreError::InvalidPart(format!("part {} was not uploaded", r.part_number))
+            })?;
+            if r.etag.trim_matches('"') != part.etag {
+                return Err(StoreError::InvalidPart(format!(
+                    "ETag of part {} does not match",
+                    r.part_number
+                )));
+            }
+            chosen.push(part);
+        }
+        if chosen[..chosen.len() - 1]
+            .iter()
+            .any(|p| p.size < MIN_PART_SIZE)
+        {
+            return Err(StoreError::EntityTooSmall);
+        }
+
+        // S3's multipart ETag: MD5 of the concatenated binary part MD5s, plus "-<count>".
+        let mut md5 = Md5::new();
+        for p in &chosen {
+            md5.update(hex::decode(&p.etag).map_err(|e| StoreError::Metadata(Box::new(e)))?);
+        }
+        let etag = format!("{}-{}", hex::encode(md5.finalize()), chosen.len());
+        let size: u64 = chosen.iter().map(|p| p.size).sum();
+        let blobs: Vec<(Uuid, String)> = chosen
+            .iter()
+            .map(|p| (p.blob_id, p.blake3.clone()))
+            .collect();
+
+        let object_id = Uuid::new_v4();
+        let candidates: Vec<Arc<Disk>> = upload
+            .disks
+            .iter()
+            .filter(|d| chosen.iter().all(|p| p.disks.contains(d)))
+            .filter_map(|d| self.disk(*d).cloned())
+            .collect();
+        let results = futures::future::join_all(candidates.iter().map(|disk| {
+            let blobs = &blobs;
+            async move {
+                let r = blob::concat_parts(disk, upload_id, blobs, object_id).await;
+                (Arc::clone(disk), r)
+            }
+        }))
+        .await;
+        let mut written: Vec<(DiskId, String)> = Vec::new();
+        for (disk, r) in results {
+            match r {
+                Ok(hash) => written.push((disk.id, hash)),
+                Err(error) => {
+                    tracing::warn!(disk = %disk.root.display(), %error, "cannot assemble upload on disk");
+                }
+            }
+        }
+        // Every part was verified on every disk, so all results must agree.
+        let blake3 = written.first().map(|(_, h)| h.clone()).unwrap_or_default();
+        let replicas: Vec<DiskId> = written
+            .iter()
+            .filter(|(_, h)| *h == blake3)
+            .map(|(d, _)| *d)
+            .collect();
+        let new_object = StoredObject {
+            object: ObjectRecord {
+                id: object_id,
+                bucket: upload.bucket.clone(),
+                key: upload.key.clone(),
+                size,
+                etag,
+                blake3,
+                content_type: upload.content_type.clone(),
+                storage_class: upload.storage_class.clone(),
+                user_metadata: upload.user_metadata.clone(),
+                desired_replicas: upload.desired_replicas,
+                replicas_explicit: upload.replicas_explicit,
+                created_at: now_millis(),
+            },
+            replicas: written.iter().map(|(d, _)| *d).collect(),
+        };
+        let required = placement::ack_threshold(upload.desired_replicas);
+        if replicas.len() < required || replicas.len() != new_object.replicas.len() {
+            self.remove_files(&new_object).await;
+            return Err(StoreError::WriteQuorum {
+                required,
+                written: replicas.len(),
+            });
+        }
+
+        match self
+            .meta
+            .complete_upload(upload_id, &new_object.object, &new_object.replicas)
+            .await
+        {
+            Ok((parts, previous)) => {
+                if let Some(prev) = previous {
+                    self.remove_files(&prev).await;
+                }
+                self.remove_upload_files(&upload, &parts).await;
+                Ok(new_object.object)
+            }
+            Err(e) => {
+                self.remove_files(&new_object).await;
                 Err(e)
             }
         }

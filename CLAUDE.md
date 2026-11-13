@@ -25,6 +25,8 @@ release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレ
     - `s3.rs` — `s3s::S3` 実装。リクエストごとに検証済みアクセスキー → テナント ID を引き、store にテナントを渡す。
       `KeyStore`（`S3Auth`）が SigV4 用にシークレットを復号して返す。body 読み取り中の s3s エラー（SHA-256 不一致等）は `body_error` で S3 エラーに戻す
     - `crypto.rs` — アクセスキーのシークレットを AES-256-GCM で暗号化（AAD = アクセスキー ID）。マスターキーは `SUHMS_MASTER_KEY` か `[auth] master_key_file`
+    - `checksum.rs` — `x-amz-checksum-*`（ヘッダ、または aws-chunked のトレーラ）を body を流しながら検証する reader。
+      不一致は EOF で読み取りエラーにし、store がコミット前に書き込みを捨てる
     - `admin.rs` — 管理サブコマンド
     - `tests/` — `common/mod.rs` の自前 SigV4 署名器で、実ルータを in-process で叩く E2E テスト
   - `store/` — ストレージエンジン
@@ -35,14 +37,19 @@ release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレ
     - `meta/` — `MetadataStore` trait と SQLite 実装。スキーマは `meta/migrations/<backend>/NNNN_*.sql`（リリース済みのマイグレーションは編集しない）
     - `list.rs` — S3 の ListObjects 意味論（prefix / delimiter / marker / continuation）。キー順は UTF-8 バイト順
     - `store.rs` — `Store`: テナント・バケット・オブジェクト操作（すべて owner = テナント ID でスコープ。他テナントのバケットは AccessDenied）、
-      `scrub()`、`repair()`
+      コピー、マルチパート、`scrub()`、`repair()`
+    - マルチパート: アップロード開始時にディスクを決め、パートは各ディスクの `.suhms/multipart/<upload>/<blob>` に置く。
+      完了時は各ディスク上でローカルにパートを連結して普通のオブジェクトファイルにする（パートごとに BLAKE3 を検証）。
+      ETag は S3 と同じ `md5(パートMD5の連結)-N`。完了処理中は s3s がキープアライブの空白を送る
 - S3 プロトコル層は `s3s` クレート（Apache-2.0。`openssl` feature は使わない）
 - 対応済み S3 操作: ListBuckets, Create/Head/Delete Bucket, GetBucketLocation, GetBucketVersioning（常に未設定）,
-  Put/Get（Range）/Head/Delete Object, DeleteObjects, ListObjects V1/V2（encoding-type=url 対応）, presigned URL
+  Put/Get（Range）/Head/Delete Object, DeleteObjects, ListObjects V1/V2（encoding-type=url 対応）, presigned URL,
+  CopyObject（COPY/REPLACE）, Create/UploadPart/UploadPartCopy/Complete/Abort MultipartUpload, ListParts, ListMultipartUploads,
+  条件付きリクエスト（GET/HEAD の If-Match / If-None-Match / If-(Un)Modified-Since、PUT の If-None-Match: *）
 
 ## ライセンス
 
-MIT ライセンス。依存クレートは `deny.toml` の許可リスト（MIT / Apache-2.0 / BSD 等の寛容なもの）に限る。
+MIT ライセンス。依存クレートは `deny.toml` の許可リスト（MIT / Apache-2.0 / BSD / BSL-1.0 等の寛容なもの）に限る。
 コピーレフト（GPL / AGPL / LGPL）の依存は追加しないこと。CI の cargo-deny がこれを検査する。
 
 ## 決定済みの設計方針
@@ -73,9 +80,9 @@ MIT ライセンス。依存クレートは `deny.toml` の許可リスト（MIT
 
 - `deny.toml` で RUSTSEC-2026-0459（同梱 SQLite の脆弱性）を一時除外中。sqlx が libsqlite3-sys >= 0.39 を許容したら更新して除外を外す
 - PostgreSQL / MariaDB バックエンド未実装（`meta::connect` がエラーを返す）
-- Multipart Upload / CopyObject 未対応（Phase 3）。aws CLI は 8MB 超、rclone は 200MiB 超で multipart を使う
-- `x-amz-checksum-*`（ヘッダ・aws-chunked トレーラ）を検証していない。`Content-MD5` と `x-amz-content-sha256` は検証済み
-- 条件付きリクエスト（If-Match / If-None-Match / If-Modified-Since）未対応
+- チェックサムは検証するが保存しないので、GET で `x-amz-checksum-*` を返さない。マルチパート全体のチェックサム（COMPOSITE / FULL_OBJECT）も未対応
+- PUT の If-Match、ListMultipartUploads の delimiter は未対応
+- 放置されたマルチパートアップロードの自動削除なし（バケット削除時のみ中止される）
 - scrub / repair は手動実行のみ（定期実行なし）
 - メタデータ更新前にクラッシュした場合や、オフラインのディスク上に残った孤立ファイルの GC がない
 - ディスクの恒久撤去（decommission）時に replicas 行を消す管理操作がない

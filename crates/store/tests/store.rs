@@ -549,3 +549,242 @@ async fn list_objects_follows_s3_semantics() {
     let (k, _, _) = list_all(&store, "zzz", None, 1000, true).await;
     assert!(k.is_empty());
 }
+
+fn part_data(seed: u8, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(7).wrapping_add(seed))
+        .collect()
+}
+
+#[tokio::test]
+async fn multipart_upload_assembles_one_plain_file_per_disk() {
+    use suhms_store::{CompletedPart, MIN_PART_SIZE};
+    let env = Env::new(3);
+    let store = env.open().await;
+    store.create_bucket(OWNER, "mp1", None).await.unwrap();
+    let mut req = put("mp1", "big.bin", None);
+    req.user_metadata.insert("origin".into(), "test".into());
+    let upload = store.create_multipart_upload(OWNER, req).await.unwrap();
+    assert_eq!(upload.disks.len(), 3);
+
+    let p1 = part_data(1, MIN_PART_SIZE as usize);
+    let p2_old = part_data(2, 1000);
+    let p2 = part_data(3, 1234);
+    // Out of order, and part 2 re-uploaded: the later upload wins.
+    let up = |n: u32, data: Vec<u8>| {
+        let store = &store;
+        async move {
+            store
+                .upload_part(OWNER, "mp1", "big.bin", upload.id, n, None, &data[..])
+                .await
+                .unwrap()
+        }
+    };
+    up(2, p2_old).await;
+    let r2 = up(2, p2.clone()).await;
+    let r1 = up(1, p1.clone()).await;
+
+    let (_, page) = store
+        .list_parts(OWNER, "mp1", "big.bin", upload.id, 0, 1000)
+        .await
+        .unwrap();
+    assert_eq!(page.parts.len(), 2);
+
+    let parts = vec![
+        CompletedPart {
+            part_number: 1,
+            etag: format!("\"{}\"", r1.etag),
+        },
+        CompletedPart {
+            part_number: 2,
+            etag: r2.etag.clone(),
+        },
+    ];
+    let rec = store
+        .complete_multipart_upload(OWNER, "mp1", "big.bin", upload.id, &parts)
+        .await
+        .unwrap();
+    let mut expected = p1.clone();
+    expected.extend_from_slice(&p2);
+    assert_eq!(rec.size, expected.len() as u64);
+    assert!(rec.etag.ends_with("-2"), "{}", rec.etag);
+    assert_eq!(
+        rec.user_metadata.get("origin").map(String::as_str),
+        Some("test")
+    );
+
+    let locs = store.object_locations("mp1", "big.bin").await.unwrap();
+    assert_eq!(locs.len(), 3);
+    for p in &locs {
+        assert_eq!(
+            std::fs::read(p).unwrap(),
+            expected,
+            "a plain, complete file"
+        );
+    }
+    for d in &env.disks {
+        let dir = d
+            .join(".suhms/multipart")
+            .join(upload.id.simple().to_string());
+        assert!(!dir.exists(), "part files are cleaned up");
+    }
+    assert_eq!(read_object(&store, "mp1", "big.bin").await, expected);
+    // Scrub verifies the assembled files against the recorded hash.
+    assert_eq!(store.scrub().await.unwrap().removed, 0);
+
+    let err = store
+        .complete_multipart_upload(OWNER, "mp1", "big.bin", upload.id, &parts)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NoSuchUpload), "{err}");
+}
+
+#[tokio::test]
+async fn multipart_completion_is_validated() {
+    use suhms_store::CompletedPart;
+    let env = Env::new(1);
+    let store = env.open().await;
+    store.create_bucket(OWNER, "mp1", Some(1)).await.unwrap();
+    let upload = store
+        .create_multipart_upload(OWNER, put("mp1", "k", None))
+        .await
+        .unwrap();
+    let small1 = store
+        .upload_part(OWNER, "mp1", "k", upload.id, 1, None, &b"aaa"[..])
+        .await
+        .unwrap();
+    let small2 = store
+        .upload_part(OWNER, "mp1", "k", upload.id, 2, None, &b"bbb"[..])
+        .await
+        .unwrap();
+    let cp = |n: u32, etag: &str| CompletedPart {
+        part_number: n,
+        etag: etag.into(),
+    };
+
+    let complete = |parts: Vec<CompletedPart>| {
+        let store = &store;
+        async move {
+            store
+                .complete_multipart_upload(OWNER, "mp1", "k", upload.id, &parts)
+                .await
+                .unwrap_err()
+        }
+    };
+    assert!(matches!(
+        complete(vec![cp(3, "x")]).await,
+        StoreError::InvalidPart(_)
+    ));
+    assert!(matches!(
+        complete(vec![cp(1, "wrong")]).await,
+        StoreError::InvalidPart(_)
+    ));
+    assert!(matches!(
+        complete(vec![cp(2, &small2.etag), cp(1, &small1.etag)]).await,
+        StoreError::InvalidPartOrder
+    ));
+    assert!(matches!(
+        complete(vec![cp(1, &small1.etag), cp(2, &small2.etag)]).await,
+        StoreError::EntityTooSmall
+    ));
+    let err = store
+        .upload_part(OWNER, "mp1", "k", upload.id, 10_001, None, &b""[..])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::InvalidArgument(_)), "{err}");
+    let err = store
+        .upload_part(OWNER, "mp1", "other-key", upload.id, 1, None, &b""[..])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NoSuchUpload), "{err}");
+
+    // A single (small) last part is fine.
+    let rec = store
+        .complete_multipart_upload(OWNER, "mp1", "k", upload.id, &[cp(2, &small2.etag)])
+        .await
+        .unwrap();
+    assert_eq!(read_object(&store, "mp1", "k").await, b"bbb");
+    assert!(rec.etag.ends_with("-1"));
+}
+
+#[tokio::test]
+async fn abort_and_bucket_delete_clean_up_uploads() {
+    let env = Env::new(2);
+    let store = env.open().await;
+    store.create_bucket(OWNER, "mp1", Some(2)).await.unwrap();
+    let u1 = store
+        .create_multipart_upload(OWNER, put("mp1", "a", None))
+        .await
+        .unwrap();
+    let u2 = store
+        .create_multipart_upload(OWNER, put("mp1", "b", None))
+        .await
+        .unwrap();
+    for u in [&u1, &u2] {
+        store
+            .upload_part(OWNER, "mp1", &u.key, u.id, 1, None, &b"part"[..])
+            .await
+            .unwrap();
+    }
+    let page = store
+        .list_multipart_uploads(OWNER, "mp1", "", "", "", 1)
+        .await
+        .unwrap();
+    assert_eq!(page.uploads.len(), 1);
+    assert!(page.truncated);
+
+    store
+        .abort_multipart_upload(OWNER, "mp1", "a", u1.id)
+        .await
+        .unwrap();
+    let dir = |u: &suhms_store::UploadRecord, d: &PathBuf| {
+        d.join(".suhms/multipart").join(u.id.simple().to_string())
+    };
+    assert!(env.disks.iter().all(|d| !dir(&u1, d).exists()));
+    assert!(env.disks.iter().all(|d| dir(&u2, d).exists()));
+
+    // Deleting the (object-less) bucket aborts the remaining upload.
+    store.delete_bucket(OWNER, "mp1").await.unwrap();
+    assert!(env.disks.iter().all(|d| !dir(&u2, d).exists()));
+}
+
+#[tokio::test]
+async fn copy_object_and_conditional_put() {
+    let env = Env::new(2);
+    let store = env.open().await;
+    store.create_bucket(OWNER, "src1", Some(2)).await.unwrap();
+    store.create_bucket(OWNER, "dst1", Some(1)).await.unwrap();
+    let mut req = put("src1", "a", None);
+    req.user_metadata.insert("k".into(), "v".into());
+    req.content_type = Some("text/plain".into());
+    store.put_object(OWNER, req, &b"hello"[..]).await.unwrap();
+
+    let rec = store
+        .copy_object(OWNER, "src1", "a", put("dst1", "b", None), false)
+        .await
+        .unwrap();
+    assert_eq!(rec.user_metadata.get("k").map(String::as_str), Some("v"));
+    assert_eq!(rec.content_type.as_deref(), Some("text/plain"));
+    assert_eq!(read_object(&store, "dst1", "b").await, b"hello");
+    assert_eq!(store.object_locations("dst1", "b").await.unwrap().len(), 1);
+
+    let rec = store
+        .copy_object(OWNER, "src1", "a", put("dst1", "c", None), true)
+        .await
+        .unwrap();
+    assert!(rec.user_metadata.is_empty());
+
+    let err = store
+        .copy_object(OWNER, "src1", "a", put("src1", "a", None), false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::InvalidRequest(_)), "{err}");
+
+    let mut req = put("src1", "a", None);
+    req.if_absent = true;
+    let err = store.put_object(OWNER, req, &b"x"[..]).await.unwrap_err();
+    assert!(matches!(err, StoreError::PreconditionFailed), "{err}");
+    let mut req = put("src1", "new", None);
+    req.if_absent = true;
+    store.put_object(OWNER, req, &b"x"[..]).await.unwrap();
+}

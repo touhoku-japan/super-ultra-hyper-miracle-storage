@@ -21,6 +21,22 @@ use crate::{
 
 const CHUNK: usize = 1 << 20;
 
+/// Where a write lands on each target disk.
+#[derive(Debug, Clone, Copy)]
+pub enum Dest {
+    Object(Uuid),
+    Part { upload: Uuid, blob: Uuid },
+}
+
+impl Dest {
+    pub fn path(self, disk: &Disk) -> PathBuf {
+        match self {
+            Self::Object(blob) => disk.object_path(blob),
+            Self::Part { upload, blob } => disk.part_path(upload, blob),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct WriteOutcome {
     pub size: u64,
@@ -52,7 +68,7 @@ impl Slot {
 /// `required` copies survive, in which case nothing is left behind.
 pub async fn write_replicas<R: AsyncRead + Unpin>(
     targets: &[Arc<Disk>],
-    blob: Uuid,
+    dest: Dest,
     required: usize,
     mut body: R,
 ) -> Result<WriteOutcome> {
@@ -87,7 +103,7 @@ pub async fn write_replicas<R: AsyncRead + Unpin>(
         let Some(mut file) = slot.file.take() else {
             continue;
         };
-        let final_path = slot.disk.object_path(blob);
+        let final_path = dest.path(&slot.disk);
         let persisted = async {
             file.flush().await?;
             file.sync_all().await?;
@@ -104,7 +120,7 @@ pub async fn write_replicas<R: AsyncRead + Unpin>(
     if written.len() < required {
         for slot in &slots {
             if written.contains(&slot.disk.id) {
-                remove(&slot.disk, blob).await;
+                remove_path(&dest.path(&slot.disk)).await;
             }
         }
         return Err(StoreError::WriteQuorum {
@@ -258,6 +274,73 @@ pub async fn copy_replica(
         let _ = fs::remove_file(&tmp).await;
     }
     result
+}
+
+/// Concatenates parts stored on `disk` into a new object file, verifying each part against its
+/// recorded BLAKE3. Returns the BLAKE3 of the whole object.
+pub async fn concat_parts(
+    disk: &Disk,
+    upload: Uuid,
+    parts: &[(Uuid, String)],
+    object: Uuid,
+) -> io::Result<String> {
+    let tmp = disk.tmp_path();
+    let result = async {
+        let mut output = File::create_new(&tmp).await?;
+        let mut whole = blake3::Hasher::new();
+        let mut buf = vec![0u8; CHUNK];
+        for (blob, expected) in parts {
+            let mut input = File::open(disk.part_path(upload, *blob)).await?;
+            let mut part = blake3::Hasher::new();
+            loop {
+                let n = input.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                part.update(&buf[..n]);
+                whole.update(&buf[..n]);
+                output.write_all(&buf[..n]).await?;
+            }
+            if part.finalize().to_hex().as_str() != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("part {blob} on this disk is corrupt"),
+                ));
+            }
+        }
+        output.flush().await?;
+        output.sync_all().await?;
+        drop(output);
+        publish(&tmp, &disk.object_path(object)).await?;
+        Ok(whole.finalize().to_hex().to_string())
+    }
+    .await;
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp).await;
+    }
+    result
+}
+
+/// Deletes all part files of an upload from a disk.
+pub async fn remove_upload_dir(disk: &Disk, upload: Uuid) {
+    match fs::remove_dir_all(disk.upload_dir(upload)).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(disk = %disk.root.display(), %upload, %error, "failed to remove upload parts");
+        }
+    }
+}
+
+/// Deletes a file; missing files are fine, other errors are logged.
+pub async fn remove_path(path: &Path) {
+    match fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "failed to remove file");
+        }
+    }
 }
 
 /// Deletes a blob's file from a disk. Missing files are fine; other errors are logged, since the

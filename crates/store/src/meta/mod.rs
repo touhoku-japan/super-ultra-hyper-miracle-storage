@@ -71,6 +71,35 @@ pub struct ObjectRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadRecord {
+    pub id: Uuid,
+    pub bucket: String,
+    pub key: String,
+    pub content_type: Option<String>,
+    pub storage_class: Option<String>,
+    pub user_metadata: BTreeMap<String, String>,
+    pub desired_replicas: u8,
+    pub replicas_explicit: bool,
+    /// Disks chosen for the parts; completing concatenates the parts on each of them locally.
+    pub disks: Vec<DiskId>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartRecord {
+    pub upload_id: Uuid,
+    pub part_number: u32,
+    pub blob_id: Uuid,
+    pub size: u64,
+    /// Hex MD5 of the part.
+    pub etag: String,
+    pub blake3: String,
+    /// Disks holding a copy of this part.
+    pub disks: Vec<DiskId>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredObject {
     pub object: ObjectRecord,
     /// Disks holding a copy (including disks that are currently offline).
@@ -134,11 +163,13 @@ pub trait MetadataStore: Send + Sync {
     // ---- objects ----
 
     /// Inserts or replaces the object at (bucket, key) and returns the object it replaced.
-    /// Fails with [`StoreError::NoSuchBucket`] when the bucket does not exist.
+    /// Fails with [`StoreError::NoSuchBucket`] when the bucket does not exist, and with
+    /// [`StoreError::PreconditionFailed`] when `if_absent` is set and the key exists.
     async fn put_object(
         &self,
         object: &ObjectRecord,
         replicas: &[DiskId],
+        if_absent: bool,
     ) -> Result<Option<StoredObject>>;
     async fn get_object(&self, bucket: &str, key: &str) -> Result<Option<StoredObject>>;
     async fn get_object_by_id(&self, id: Uuid) -> Result<Option<StoredObject>>;
@@ -153,6 +184,41 @@ pub trait MetadataStore: Send + Sync {
         after: &str,
         limit: u32,
     ) -> Result<Vec<ObjectRecord>>;
+
+    // ---- multipart uploads ----
+
+    /// Fails with [`StoreError::NoSuchBucket`] when the bucket does not exist.
+    async fn create_upload(&self, upload: &UploadRecord) -> Result<()>;
+    async fn get_upload(&self, id: Uuid) -> Result<Option<UploadRecord>>;
+    /// Uploads of a bucket under `prefix`, ordered by (key, id), after (`after_key`, `after_id`).
+    async fn list_uploads(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        after_key: &str,
+        after_id: &str,
+        limit: u32,
+    ) -> Result<Vec<UploadRecord>>;
+    /// Records a part, replacing any earlier part with the same number (which is returned).
+    /// Fails with [`StoreError::NoSuchUpload`] when the upload no longer exists.
+    async fn put_part(&self, part: &PartRecord) -> Result<Option<PartRecord>>;
+    async fn list_parts(
+        &self,
+        upload_id: Uuid,
+        after_part: u32,
+        limit: u32,
+    ) -> Result<Vec<PartRecord>>;
+    /// Removes an upload and its parts, returning what was removed.
+    async fn delete_upload(&self, id: Uuid) -> Result<Option<(UploadRecord, Vec<PartRecord>)>>;
+    /// Atomically removes the upload and stores the completed object in its place. Returns the
+    /// upload's parts and the object that was replaced. Fails with
+    /// [`StoreError::NoSuchUpload`] when the upload was completed or aborted meanwhile.
+    async fn complete_upload(
+        &self,
+        upload_id: Uuid,
+        object: &ObjectRecord,
+        replicas: &[DiskId],
+    ) -> Result<(Vec<PartRecord>, Option<StoredObject>)>;
 
     // ---- replicas ----
 
@@ -186,6 +252,14 @@ pub async fn connect(url: &str) -> Result<Arc<dyn MetadataStore>> {
 
 pub(crate) fn encode_user_metadata(m: &BTreeMap<String, String>) -> String {
     serde_json::to_string(m).expect("string map serializes")
+}
+
+pub(crate) fn encode_disks(d: &[DiskId]) -> String {
+    serde_json::to_string(d).expect("uuid list serializes")
+}
+
+pub(crate) fn decode_disks(s: &str) -> Result<Vec<DiskId>> {
+    serde_json::from_str(s).map_err(|e| StoreError::Metadata(Box::new(e)))
 }
 
 pub(crate) fn decode_user_metadata(s: &str) -> Result<BTreeMap<String, String>> {

@@ -26,6 +26,7 @@ hex = "0.4.3"
 s3s = { version = "0.17.0", default-features = false }
 suhms-store = { path = "../store" }
 tokio-util = { version = "0.7.20", features = ["io"] }
+time = "0.3.55"
 tower.workspace = true
 uuid = { version = "1.29.2", features = ["v4"] }
 axum.workspace = true
@@ -42,7 +43,6 @@ hmac = "0.13.0"
 md-5 = "0.11.0"
 sha2 = "0.11.1"
 tempfile = "3.27.0"
-time = "0.3.55"
 
 [lints]
 workspace = true

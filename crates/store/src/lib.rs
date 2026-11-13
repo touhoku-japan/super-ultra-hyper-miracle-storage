@@ -14,6 +14,9 @@ pub use crate::{
     config::StoreConfig,
     error::{Result, StoreError},
     list::{ListPage, ListParams, ListStart},
-    meta::{AccessKeyRecord, BucketRecord, ObjectRecord, TenantRecord},
-    store::{PutObjectRequest, RepairReport, ScrubReport, Store},
+    meta::{AccessKeyRecord, BucketRecord, ObjectRecord, PartRecord, TenantRecord, UploadRecord},
+    store::{
+        CompletedPart, MAX_PART_NUMBER, MIN_PART_SIZE, PartsPage, PutObjectRequest, RepairReport,
+        ScrubReport, Store, UploadsPage,
+    },
 };

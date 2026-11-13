@@ -2,6 +2,7 @@
 //! binary is a thin wrapper; integration tests drive [`app`] directly.
 
 pub mod admin;
+pub mod checksum;
 pub mod config;
 pub mod crypto;
 pub mod s3;
