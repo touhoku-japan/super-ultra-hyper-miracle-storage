@@ -14,6 +14,9 @@ allow = [
     "Zlib",
     "Unicode-3.0",
     "CC0-1.0",
+    # Permissive data license of the Mozilla CA bundle (webpki-root-certs, via reqwest's rustls
+    # support). No copyleft terms; suhms itself trusts only the cluster CA for node-to-node TLS.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 

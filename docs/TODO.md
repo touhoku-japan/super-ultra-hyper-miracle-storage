@@ -8,7 +8,6 @@
 1. **実機検証** — 3 台実機でのクラスタ、PostgreSQL（Patroni 等）/ MariaDB（Galera 等）の HA 構成、負荷・性能試験。
    これまでは 1 プロセス内の 3 ノードと CI のサービスコンテナでしか確認していない
 2. **PostgreSQL / MariaDB をこのホストで未検証** — CI では 3 バックエンドとも通っているが、実 DB サーバでは未確認
-3. **ノード間通信の暗号化** — 現状は平文 HTTP + HMAC 認証のみ。プライベートネットワーク / WireGuard で保護するか、TLS 対応を入れる
 4. **dev-sorahost（ポータル）側の実装** — 申込、アクセスキー発行、使用量取得、Stripe 課金連携。
    仕様は `docs/sorahost-integration.md`、PHP クライアント例は `docs/examples/SuhmsAdminClient.php`
 5. **RUSTSEC-2026-0459 の一時除外を外す** — sqlx が libsqlite3-sys >= 0.39 を許容したら更新して `deny.toml` から除外を削除
@@ -35,6 +34,7 @@
 - ~~13. ListMultipartUploads / ListObjectVersions の delimiter~~
 - ~~14. versionId 指定のコピー元~~
 - ~~15. ExpiredObjectDeleteMarker、transition（ストレージクラス＝レプリカ数の変更）~~
+- ~~3. ノード間通信の暗号化~~（`[cluster.tls]` の相互 TLS。`docs/cluster-tls.md`）
 
 ## 実装しないと決めたもの
 

@@ -34,7 +34,10 @@ release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレ
       `crc_fast::checksum_combine` で合成。データは読み直さない）を求める。コピーは要求されたアルゴリズム、
       無ければコピー元のアルゴリズムで計算し直す
     - `cluster.rs` — ノード間 API（`[cluster] listen` の別リスナー、`x-suhms-node-auth` の HMAC 認証）と
-      `HttpPeer`（`reqwest`、TLS なし。プライベートネットワーク前提）。`open_store` がクラスタ構成ならピア付きで Store を開く
+      `HttpPeer`（`reqwest`）。`open_store` がクラスタ構成ならピア付きで Store を開く
+    - `tls.rs` — ノード間の相互 TLS（`[cluster.tls]`）。rustls（暗号プロバイダは `ring`。aws-lc はビルドが重いので使わない）。
+      クラスタ CA が署名したクライアント証明書を必須にし、サーバ証明書も同じ CA でだけ検証する。HMAC 認証は残す。
+      `TlsListener` はハンドシェイクを別タスクで行う `axum::serve` 用リスナー。手順は `docs/cluster-tls.md`
     - `tenancy.rs` — アクセスキー/テナントの 10 秒キャッシュ（`Directory`。管理 API での変更は同ノードで即時無効化）、
       アクセスキーごとのレート制限（トークンバケット）、課金用メーター（`Meter`、class A/B リクエスト数・ingress/egress を
       テナント×時間で集計し定期的に `usage_hourly` へ加算）、Prometheus メトリクス
@@ -139,7 +142,7 @@ MIT ライセンス。依存クレートは `deny.toml` の許可リスト（MIT
 - `deny.toml` で RUSTSEC-2026-0459（同梱 SQLite の脆弱性）を一時除外中。sqlx が libsqlite3-sys >= 0.39 を許容したら更新して除外を外す
 - PostgreSQL / MariaDB はこのホストでは未検証（CI の `metadata-backends` ジョブでサービスコンテナに対して store のテストを実行）。
   ローカルで試すなら `SUHMS_TEST_POSTGRES=postgres://... cargo test -p suhms-store`（テストごとに DB を作る）
-- ノード間通信は平文 HTTP（HMAC 認証のみ）。ノード間はプライベートネットワークか WireGuard 等で保護すること
+- `[cluster.tls]` を設定しないとノード間通信は平文 HTTP（HMAC 認証のみ）。その場合はプライベートネットワークか WireGuard 等で保護すること
 - チェックサムを指定しないアップロードにはチェックサムを付けない（AWS の既定 CRC64NVME 自動付与はしない）。
   アルゴリズム未指定のマルチパートも同様。MD5 / SHA512 / xxHash 系のチェックサムは未対応
 - ライフサイクルの Date 指定、NewerNoncurrentVersions、タグ・サイズによるフィルタは未対応
