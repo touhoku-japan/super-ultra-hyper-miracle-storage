@@ -7,8 +7,9 @@ use uuid::Uuid;
 
 use super::{
     AccessKeyRecord, BucketRecord, DeleteBucketOutcome, DiskRecord, MetadataStore, ObjectRecord,
-    PartRecord, ReplicaEntry, StoredObject, TenantRecord, UploadRecord, decode_disks,
-    decode_user_metadata, encode_disks, encode_user_metadata, is_retryable,
+    PartRecord, ReplicaEntry, StorageUsage, StoredObject, TenantRecord, TenantUpdate, UploadRecord,
+    UsageDelta, UsageRow, decode_disks, decode_user_metadata, encode_disks, encode_user_metadata,
+    is_retryable,
 };
 use crate::{
     disk::DiskId,
@@ -16,7 +17,10 @@ use crate::{
 };
 
 /// Applied in order; each runs once, inside a transaction. Never edit a released migration.
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("migrations/postgres/0001_init.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("migrations/postgres/0001_init.sql")),
+    (2, include_str!("migrations/postgres/0002_commercial.sql")),
+];
 
 macro_rules! object_select {
     ($where:literal) => {
@@ -125,6 +129,10 @@ async fn migrate(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
+fn u64_of(v: i64) -> u64 {
+    u64::try_from(v).unwrap_or(0)
+}
+
 fn parse_uuid(s: &str) -> Result<Uuid> {
     Uuid::parse_str(s).map_err(|e| StoreError::Metadata(Box::new(e)))
 }
@@ -160,6 +168,7 @@ fn bucket_from_row(r: &PgRow) -> Result<BucketRecord> {
             .map(to_u8)
             .transpose()?,
         created_at: r.try_get("created_at")?,
+        public_read: r.try_get("public_read")?,
     })
 }
 
@@ -283,6 +292,9 @@ fn tenant_from_row(r: &PgRow) -> Result<TenantRecord> {
         id: r.try_get("id")?,
         name: r.try_get("name")?,
         created_at: r.try_get("created_at")?,
+        suspended: r.try_get("suspended")?,
+        quota_bytes: r.try_get::<Option<i64>, _>("quota_bytes")?.map(u64_of),
+        max_buckets: r.try_get::<Option<i64>, _>("max_buckets")?.map(u64_of),
     })
 }
 
@@ -368,6 +380,161 @@ impl MetadataStore for PostgresMetadata {
         }
     }
 
+    async fn update_tenant(&self, id: &str, update: &TenantUpdate) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let exists = sqlx::query("SELECT 1 FROM tenants WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+        if !exists {
+            return Ok(false);
+        }
+        if let Some(v) = update.suspended {
+            sqlx::query("UPDATE tenants SET suspended = $1 WHERE id = $2")
+                .bind(v)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if let Some(v) = update.quota_bytes {
+            sqlx::query("UPDATE tenants SET quota_bytes = $1 WHERE id = $2")
+                .bind(v.map(i64_of).transpose()?)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if let Some(v) = update.max_buckets {
+            sqlx::query("UPDATE tenants SET max_buckets = $1 WHERE id = $2")
+                .bind(v.map(i64_of).transpose()?)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn set_bucket_public(&self, name: &str, public_read: bool) -> Result<bool> {
+        let res = sqlx::query("UPDATE buckets SET public_read = $1 WHERE name = $2")
+            .bind(public_read)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn list_stale_uploads(
+        &self,
+        created_before: i64,
+        limit: u32,
+    ) -> Result<Vec<UploadRecord>> {
+        sqlx::query(upload_select!(
+            "created_at < $1 ORDER BY created_at LIMIT $2"
+        ))
+        .bind(created_before)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(upload_from_row)
+        .collect()
+    }
+
+    async fn storage_usage(&self, tenant_id: Option<&str>) -> Result<Vec<StorageUsage>> {
+        let rows = sqlx::query(
+            "SELECT b.owner AS tenant_id, COUNT(*) AS objects, SUM(o.size)::BIGINT AS logical_bytes, \
+             SUM(o.size * o.desired_replicas)::BIGINT AS stored_bytes \
+             FROM objects o JOIN buckets b ON b.name = o.bucket \
+             WHERE $1::TEXT IS NULL OR b.owner = $2 GROUP BY b.owner ORDER BY b.owner",
+        )
+        .bind(tenant_id)
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(StorageUsage {
+                    tenant_id: r.try_get("tenant_id")?,
+                    objects: u64_of(r.try_get::<i64, _>("objects")?),
+                    logical_bytes: u64_of(r.try_get::<i64, _>("logical_bytes")?),
+                    stored_bytes: u64_of(r.try_get::<i64, _>("stored_bytes")?),
+                })
+            })
+            .collect()
+    }
+
+    async fn add_usage(&self, deltas: &[UsageDelta]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for d in deltas {
+            sqlx::query(
+                "INSERT INTO usage_hourly (tenant_id, hour, class_a_requests, class_b_requests, \
+     ingress_bytes, egress_bytes) VALUES ($1, $2, $3, $4, $5, $6) \
+     ON CONFLICT (tenant_id, hour) DO UPDATE SET \
+     class_a_requests = usage_hourly.class_a_requests + excluded.class_a_requests, \
+     class_b_requests = usage_hourly.class_b_requests + excluded.class_b_requests, \
+     ingress_bytes = usage_hourly.ingress_bytes + excluded.ingress_bytes, \
+     egress_bytes = usage_hourly.egress_bytes + excluded.egress_bytes",
+            )
+            .bind(&d.tenant_id)
+            .bind(d.hour)
+            .bind(i64_of(d.class_a)?)
+            .bind(i64_of(d.class_b)?)
+            .bind(i64_of(d.ingress_bytes)?)
+            .bind(i64_of(d.egress_bytes)?)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn record_storage(&self, hour: i64, usage: &[StorageUsage]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for u in usage {
+            sqlx::query("INSERT INTO usage_hourly (tenant_id, hour, stored_objects, logical_bytes, stored_bytes) \
+     VALUES ($1, $2, $3, $4, $5) ON CONFLICT (tenant_id, hour) DO UPDATE SET \
+     stored_objects = excluded.stored_objects, logical_bytes = excluded.logical_bytes, \
+     stored_bytes = excluded.stored_bytes")
+                .bind(&u.tenant_id)
+                .bind(hour)
+                .bind(i64_of(u.objects)?)
+                .bind(i64_of(u.logical_bytes)?)
+                .bind(i64_of(u.stored_bytes)?)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn usage(&self, tenant_id: &str, from: i64, to: i64) -> Result<Vec<UsageRow>> {
+        sqlx::query(
+            "SELECT hour, class_a_requests, class_b_requests, ingress_bytes, egress_bytes, \
+             stored_objects, logical_bytes, stored_bytes FROM usage_hourly \
+             WHERE tenant_id = $1 AND hour >= $2 AND hour < $3 ORDER BY hour",
+        )
+        .bind(tenant_id)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|r| {
+            Ok(UsageRow {
+                hour: r.try_get("hour")?,
+                class_a_requests: u64_of(r.try_get("class_a_requests")?),
+                class_b_requests: u64_of(r.try_get("class_b_requests")?),
+                ingress_bytes: u64_of(r.try_get("ingress_bytes")?),
+                egress_bytes: u64_of(r.try_get("egress_bytes")?),
+                stored_objects: u64_of(r.try_get("stored_objects")?),
+                logical_bytes: u64_of(r.try_get("logical_bytes")?),
+                stored_bytes: u64_of(r.try_get("stored_bytes")?),
+            })
+        })
+        .collect()
+    }
+
     async fn create_tenant(&self, tenant: &TenantRecord) -> Result<bool> {
         let res = sqlx::query(
             "INSERT INTO tenants (id, name, created_at) VALUES ($1, $2, $3) \
@@ -382,7 +549,7 @@ impl MetadataStore for PostgresMetadata {
     }
 
     async fn get_tenant(&self, id: &str) -> Result<Option<TenantRecord>> {
-        sqlx::query("SELECT id, name, created_at FROM tenants WHERE id = $1")
+        sqlx::query("SELECT id, name, created_at, suspended, quota_bytes, max_buckets FROM tenants WHERE id = $1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?
@@ -392,7 +559,7 @@ impl MetadataStore for PostgresMetadata {
     }
 
     async fn get_tenant_by_name(&self, name: &str) -> Result<Option<TenantRecord>> {
-        sqlx::query("SELECT id, name, created_at FROM tenants WHERE name = $1")
+        sqlx::query("SELECT id, name, created_at, suspended, quota_bytes, max_buckets FROM tenants WHERE name = $1")
             .bind(name)
             .fetch_optional(&self.pool)
             .await?
@@ -402,7 +569,7 @@ impl MetadataStore for PostgresMetadata {
     }
 
     async fn list_tenants(&self) -> Result<Vec<TenantRecord>> {
-        sqlx::query("SELECT id, name, created_at FROM tenants ORDER BY name")
+        sqlx::query("SELECT id, name, created_at, suspended, quota_bytes, max_buckets FROM tenants ORDER BY name")
             .fetch_all(&self.pool)
             .await?
             .iter()
@@ -537,18 +704,20 @@ impl MetadataStore for PostgresMetadata {
     }
 
     async fn get_bucket(&self, name: &str) -> Result<Option<BucketRecord>> {
-        sqlx::query("SELECT name, owner, replicas, created_at FROM buckets WHERE name = $1")
-            .bind(name)
-            .fetch_optional(&self.pool)
-            .await?
-            .as_ref()
-            .map(bucket_from_row)
-            .transpose()
+        sqlx::query(
+            "SELECT name, owner, replicas, created_at, public_read FROM buckets WHERE name = $1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(bucket_from_row)
+        .transpose()
     }
 
     async fn list_buckets(&self, owner: &str) -> Result<Vec<BucketRecord>> {
         sqlx::query(
-            "SELECT name, owner, replicas, created_at FROM buckets WHERE owner = $1 ORDER BY name",
+            "SELECT name, owner, replicas, created_at, public_read FROM buckets WHERE owner = $1 ORDER BY name",
         )
         .bind(owner)
         .fetch_all(&self.pool)

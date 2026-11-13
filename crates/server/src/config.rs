@@ -16,6 +16,89 @@ pub struct Config {
     pub s3: S3Config,
     pub auth: AuthConfig,
     pub cluster: ClusterConfig,
+    pub admin: AdminConfig,
+    pub limits: LimitsConfig,
+    pub maintenance: MaintenanceConfig,
+}
+
+/// The administration API (used by the SoraHost portal). Disabled unless `listen` is set.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdminConfig {
+    /// Keep it on a private network.
+    pub listen: Option<SocketAddr>,
+    /// File holding the bearer token; `SUHMS_ADMIN_TOKEN` takes precedence.
+    pub token_file: Option<PathBuf>,
+}
+
+impl AdminConfig {
+    pub fn load_token(&self) -> anyhow::Result<String> {
+        let token = match std::env::var("SUHMS_ADMIN_TOKEN") {
+            Ok(t) => t,
+            Err(_) => {
+                let path = self
+                    .token_file
+                    .as_ref()
+                    .context("the admin API needs SUHMS_ADMIN_TOKEN or [admin] token_file")?;
+                std::fs::read_to_string(path)
+                    .with_context(|| format!("failed to read {}", path.display()))?
+            }
+        };
+        let token = token.trim().to_owned();
+        anyhow::ensure!(
+            token.len() >= 32,
+            "admin token must be at least 32 characters"
+        );
+        Ok(token)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LimitsConfig {
+    /// Sustained requests per second allowed per access key (on each node).
+    pub requests_per_second: f64,
+    /// Short bursts above the sustained rate.
+    pub burst: f64,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            requests_per_second: 200.0,
+            burst: 400.0,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MaintenanceConfig {
+    /// Run cluster-wide jobs (repair, upload cleanup, usage snapshots) on this node. Enable it
+    /// on exactly one node of a cluster.
+    pub leader: bool,
+    pub repair_interval_secs: u64,
+    /// Every node scrubs its own disks; 0 disables.
+    pub scrub_interval_secs: u64,
+    /// Multipart uploads older than this are aborted.
+    pub abort_uploads_after_secs: u64,
+    /// How often request/traffic counters are written to the usage meter.
+    pub usage_flush_secs: u64,
+    /// How often stored bytes are recorded in the usage meter.
+    pub storage_snapshot_secs: u64,
+}
+
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            leader: true,
+            repair_interval_secs: 600,
+            scrub_interval_secs: 7 * 24 * 3600,
+            abort_uploads_after_secs: 7 * 24 * 3600,
+            usage_flush_secs: 60,
+            storage_snapshot_secs: 3600,
+        }
+    }
 }
 
 /// Multi-node operation. Leave `nodes` empty for a single-node deployment.
@@ -73,6 +156,8 @@ pub struct S3Config {
     pub domains: Vec<String>,
     /// Largest single PutObject body, in bytes.
     pub max_object_size: u64,
+    /// Allow buckets to be made public-read (anonymous GET/HEAD) through the admin API.
+    pub allow_public_buckets: bool,
 }
 
 impl Default for S3Config {
@@ -81,6 +166,7 @@ impl Default for S3Config {
             region: "jp-1".to_owned(),
             domains: Vec::new(),
             max_object_size: 5 * 1024 * 1024 * 1024,
+            allow_public_buckets: false,
         }
     }
 }

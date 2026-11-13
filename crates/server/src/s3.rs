@@ -38,27 +38,52 @@ use s3s::{
     },
     s3_error,
 };
+use std::sync::atomic::Ordering;
+
 use suhms_store::{
     CompletedPart, ListPage, ListParams, ListStart, ObjectRecord, PutObjectRequest, Store,
-    StoreError,
+    StoreError, meta::StoredObject,
 };
 use tokio::io::AsyncRead;
 use tokio_util::io::{ReaderStream, StreamReader};
 use uuid::Uuid;
 
-use crate::{checksum, crypto::SecretCipher};
+use crate::{
+    checksum,
+    crypto::SecretCipher,
+    tenancy::{Class, Tenancy},
+};
 
 const READ_CHUNK: usize = 256 * 1024;
 
 /// Resolves access keys for SigV4 verification.
 pub struct KeyStore {
-    store: Arc<Store>,
+    tenancy: Arc<Tenancy>,
     cipher: Arc<SecretCipher>,
 }
 
 impl KeyStore {
-    pub fn new(store: Arc<Store>, cipher: Arc<SecretCipher>) -> Self {
-        Self { store, cipher }
+    pub fn new(tenancy: Arc<Tenancy>, cipher: Arc<SecretCipher>) -> Self {
+        Self { tenancy, cipher }
+    }
+}
+
+/// Lets anonymous requests through only for object reads, and only when public buckets are
+/// allowed; the handlers then check that the bucket really is public.
+pub struct PublicAccess {
+    pub allow_public: bool,
+}
+
+#[async_trait]
+impl s3s::access::S3Access for PublicAccess {
+    async fn check(&self, cx: &mut s3s::access::S3AccessContext<'_>) -> S3Result<()> {
+        if cx.credentials().is_some() {
+            return Ok(());
+        }
+        if self.allow_public && matches!(cx.s3_op().name(), "GetObject" | "HeadObject") {
+            return Ok(());
+        }
+        Err(s3_error!(AccessDenied, "Signature is required"))
     }
 }
 
@@ -66,9 +91,9 @@ impl KeyStore {
 impl S3Auth for KeyStore {
     async fn get_secret_key(&self, access_key: &str) -> S3Result<SecretKey> {
         let key = self
-            .store
-            .metadata()
-            .get_access_key(access_key)
+            .tenancy
+            .directory
+            .key(access_key)
             .await
             .map_err(internal)?
             .filter(|k| k.active)
@@ -83,29 +108,92 @@ impl S3Auth for KeyStore {
 
 pub struct S3Service {
     store: Arc<Store>,
+    tenancy: Arc<Tenancy>,
     region: String,
 }
 
 impl S3Service {
-    pub fn new(store: Arc<Store>, region: String) -> Self {
-        Self { store, region }
+    pub fn new(store: Arc<Store>, tenancy: Arc<Tenancy>, region: String) -> Self {
+        Self {
+            store,
+            tenancy,
+            region,
+        }
     }
 
-    /// Tenant id of the (already signature-verified) caller.
-    async fn tenant<T>(&self, req: &S3Request<T>) -> S3Result<String> {
+    /// Tenant id of the (already signature-verified) caller, after checking that the tenant is
+    /// active and within its rate limit. Counts the request for billing.
+    async fn tenant<T>(&self, req: &S3Request<T>, class: Class) -> S3Result<String> {
         let cred = req
             .credentials
             .as_ref()
             .ok_or_else(|| s3_error!(AccessDenied, "Signature is required"))?;
-        let key = self
-            .store
-            .metadata()
-            .get_access_key(&cred.access_key)
+        let t = &self.tenancy;
+        let key = t
+            .directory
+            .key(&cred.access_key)
             .await
             .map_err(internal)?
             .filter(|k| k.active)
             .ok_or_else(|| s3_error!(InvalidAccessKeyId))?;
-        Ok(key.tenant_id)
+        let tenant = t
+            .directory
+            .tenant(&key.tenant_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| s3_error!(InvalidAccessKeyId))?;
+        if tenant.suspended {
+            t.meter.rejected_total.fetch_add(1, Ordering::Relaxed);
+            return Err(s3_error!(AccessDenied, "This account is suspended"));
+        }
+        if !t.limiter.allow(&key.id) {
+            t.meter.rejected_total.fetch_add(1, Ordering::Relaxed);
+            return Err(s3_error!(SlowDown));
+        }
+        t.meter.request(&tenant.id, class);
+        Ok(tenant.id)
+    }
+
+    /// For GetObject/HeadObject: the caller's tenant, or `None` for an anonymous reader (only
+    /// let through by [`PublicAccess`] when public buckets are allowed).
+    async fn reader<T>(&self, req: &S3Request<T>) -> S3Result<Option<String>> {
+        if req.credentials.is_none() && self.tenancy.allow_public {
+            return Ok(None);
+        }
+        self.tenant(req, Class::B).await.map(Some)
+    }
+
+    /// Looks up an object for reading; returns it with the tenant its traffic is billed to.
+    async fn lookup_for_read(
+        &self,
+        reader: Option<&str>,
+        bucket: &str,
+        key: &str,
+    ) -> S3Result<(StoredObject, String)> {
+        if let Some(tenant) = reader {
+            let stored = self
+                .store
+                .get_object(tenant, bucket, key)
+                .await
+                .map_err(s3_err)?;
+            return Ok((stored, tenant.to_owned()));
+        }
+        let stored = self
+            .store
+            .get_public_object(bucket, key)
+            .await
+            .map_err(s3_err)?;
+        // Anonymous traffic is billed to the bucket's owner.
+        let owner = self
+            .store
+            .metadata()
+            .get_bucket(bucket)
+            .await
+            .map_err(internal)?
+            .map(|b| b.owner)
+            .unwrap_or_default();
+        self.tenancy.meter.request(&owner, Class::B);
+        Ok((stored, owner))
     }
 }
 
@@ -133,6 +221,15 @@ fn s3_err(e: StoreError) -> S3Error {
         StoreError::InvalidPartOrder => s3_error!(InvalidPartOrder),
         StoreError::EntityTooSmall => s3_error!(EntityTooSmall),
         StoreError::PreconditionFailed => s3_error!(PreconditionFailed),
+        StoreError::QuotaExceeded => {
+            let mut e = S3Error::with_message(
+                S3ErrorCode::Custom("QuotaExceeded".into()),
+                "The storage quota of this account has been exceeded.",
+            );
+            e.set_status_code(axum::http::StatusCode::FORBIDDEN);
+            e
+        }
+        StoreError::TooManyBuckets => s3_error!(TooManyBuckets),
         StoreError::InvalidRequest(m) => S3Error::with_message(S3ErrorCode::InvalidRequest, m),
         e @ (StoreError::InvalidReplicaCount { .. } | StoreError::InvalidArgument(_)) => {
             S3Error::with_message(S3ErrorCode::InvalidArgument, e.to_string())
@@ -386,7 +483,7 @@ impl S3 for S3Service {
         &self,
         req: S3Request<ListBucketsInput>,
     ) -> S3Result<S3Response<ListBucketsOutput>> {
-        let tenant_id = self.tenant(&req).await?;
+        let tenant_id = self.tenant(&req, Class::A).await?;
         let tenant = self
             .store
             .metadata()
@@ -420,7 +517,7 @@ impl S3 for S3Service {
         &self,
         req: S3Request<CreateBucketInput>,
     ) -> S3Result<S3Response<CreateBucketOutput>> {
-        let tenant = self.tenant(&req).await?;
+        let tenant = self.tenant(&req, Class::A).await?;
         let name = req.input.bucket;
         self.store
             .create_bucket(&tenant, &name, None)
@@ -436,7 +533,7 @@ impl S3 for S3Service {
         &self,
         req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
-        let tenant = self.tenant(&req).await?;
+        let tenant = self.tenant(&req, Class::B).await?;
         self.store
             .get_bucket(&tenant, &req.input.bucket)
             .await
@@ -451,7 +548,7 @@ impl S3 for S3Service {
         &self,
         req: S3Request<GetBucketLocationInput>,
     ) -> S3Result<S3Response<GetBucketLocationOutput>> {
-        let tenant = self.tenant(&req).await?;
+        let tenant = self.tenant(&req, Class::B).await?;
         self.store
             .get_bucket(&tenant, &req.input.bucket)
             .await
@@ -466,7 +563,7 @@ impl S3 for S3Service {
         &self,
         req: S3Request<GetBucketVersioningInput>,
     ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
-        let tenant = self.tenant(&req).await?;
+        let tenant = self.tenant(&req, Class::B).await?;
         self.store
             .get_bucket(&tenant, &req.input.bucket)
             .await
@@ -478,7 +575,7 @@ impl S3 for S3Service {
         &self,
         req: S3Request<DeleteBucketInput>,
     ) -> S3Result<S3Response<DeleteBucketOutput>> {
-        let tenant = self.tenant(&req).await?;
+        let tenant = self.tenant(&req, Class::B).await?;
         self.store
             .delete_bucket(&tenant, &req.input.bucket)
             .await
@@ -490,7 +587,7 @@ impl S3 for S3Service {
         &self,
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
-        let tenant = self.tenant(&req).await?;
+        let tenant = self.tenant(&req, Class::A).await?;
         let expected = checksum::expected(&req.headers, req.trailing_headers.as_ref())?;
         let input = req.input;
         let if_absent = match &input.if_none_match {
@@ -522,6 +619,7 @@ impl S3 for S3Service {
             .put_object(&tenant, request, body)
             .await
             .map_err(s3_err)?;
+        self.tenancy.meter.ingress(&tenant, rec.size);
         let c = take_checksum(&verified);
         Ok(S3Response::new(PutObjectOutput {
             e_tag: Some(etag(&rec)),
@@ -539,7 +637,7 @@ impl S3 for S3Service {
         &self,
         req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
-        let tenant = self.tenant(&req).await?;
+        let tenant = self.tenant(&req, Class::A).await?;
         let input = req.input;
         let (src_bucket, src_key) = copy_source(&input.copy_source)?;
         let replace = match input.metadata_directive.as_ref().map(|d| d.as_str()) {
@@ -575,7 +673,7 @@ impl S3 for S3Service {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
-        let tenant = self.tenant(&req).await?;
+        let tenant = self.tenant(&req, Class::A).await?;
         let input = req.input;
         let request = PutObjectRequest {
             bucket: input.bucket.clone(),
@@ -603,7 +701,7 @@ impl S3 for S3Service {
         &self,
         req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
-        let tenant = self.tenant(&req).await?;
+        let tenant = self.tenant(&req, Class::A).await?;
         let expected = checksum::expected(&req.headers, req.trailing_headers.as_ref())?;
         let input = req.input;
         let (body, verified) = checksum::wrap(body_reader(input.body), expected);
@@ -620,6 +718,7 @@ impl S3 for S3Service {
             )
             .await
             .map_err(s3_err)?;
+        self.tenancy.meter.ingress(&tenant, part.size);
         let c = take_checksum(&verified);
         Ok(S3Response::new(UploadPartOutput {
             e_tag: Some(ETag::Strong(part.etag)),
@@ -636,7 +735,7 @@ impl S3 for S3Service {
         &self,
         req: S3Request<UploadPartCopyInput>,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
-        let tenant = self.tenant(&req).await?;
+        let tenant = self.tenant(&req, Class::A).await?;
         let input = req.input;
         let (src_bucket, src_key) = copy_source(&input.copy_source)?;
         let part = self
@@ -667,7 +766,7 @@ impl S3 for S3Service {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        let tenant = self.tenant(&req).await?;
+        let tenant = self.tenant(&req, Class::A).await?;
         let input = req.input;
         let upload_id = parse_upload_id(&input.upload_id)?;
         let parts = input
@@ -713,7 +812,7 @@ impl S3 for S3Service {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
-        let tenant = self.tenant(&req).await?;
+        let tenant = self.tenant(&req, Class::B).await?;
         let input = req.input;
         self.store
             .abort_multipart_upload(
@@ -731,7 +830,7 @@ impl S3 for S3Service {
         &self,
         req: S3Request<ListPartsInput>,
     ) -> S3Result<S3Response<ListPartsOutput>> {
-        let tenant = self.tenant(&req).await?;
+        let tenant = self.tenant(&req, Class::A).await?;
         let input = req.input;
         let marker = part_number(input.part_number_marker.unwrap_or(0))?;
         let max = max_keys(input.max_parts)?;
@@ -792,7 +891,7 @@ impl S3 for S3Service {
         &self,
         req: S3Request<ListMultipartUploadsInput>,
     ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
-        let tenant = self.tenant(&req).await?;
+        let tenant = self.tenant(&req, Class::A).await?;
         let input = req.input;
         let enc = encoder(input.encoding_type.as_ref())?;
         let page = self
@@ -851,13 +950,11 @@ impl S3 for S3Service {
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
-        let tenant = self.tenant(&req).await?;
+        let reader = self.reader(&req).await?;
         let input = req.input;
-        let stored = self
-            .store
-            .get_object(&tenant, &input.bucket, &input.key)
-            .await
-            .map_err(s3_err)?;
+        let (stored, payer) = self
+            .lookup_for_read(reader.as_deref(), &input.bucket, &input.key)
+            .await?;
         let rec = &stored.object;
         check_preconditions(
             rec,
@@ -880,6 +977,7 @@ impl S3 for S3Service {
             .read_object(&stored, start..start + len)
             .await
             .map_err(s3_err)?;
+        self.tenancy.meter.egress(&payer, len);
         let body = ReaderStream::with_capacity(reader, READ_CHUNK);
 
         Ok(S3Response::new(GetObjectOutput {
@@ -899,13 +997,12 @@ impl S3 for S3Service {
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
-        let tenant = self.tenant(&req).await?;
+        let reader = self.reader(&req).await?;
         let input = &req.input;
-        let rec = self
-            .store
-            .head_object(&tenant, &input.bucket, &input.key)
-            .await
-            .map_err(s3_err)?;
+        let (stored, _) = self
+            .lookup_for_read(reader.as_deref(), &input.bucket, &input.key)
+            .await?;
+        let rec = stored.object;
         check_preconditions(
             &rec,
             input.if_match.as_ref(),
@@ -928,7 +1025,7 @@ impl S3 for S3Service {
         &self,
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
-        let tenant = self.tenant(&req).await?;
+        let tenant = self.tenant(&req, Class::B).await?;
         self.store
             .delete_object(&tenant, &req.input.bucket, &req.input.key)
             .await
@@ -940,7 +1037,7 @@ impl S3 for S3Service {
         &self,
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        let tenant = self.tenant(&req).await?;
+        let tenant = self.tenant(&req, Class::A).await?;
         let input = req.input;
         if input.delete.objects.len() > 1000 {
             return Err(s3_error!(MalformedXML, "at most 1000 keys per request"));
@@ -984,7 +1081,7 @@ impl S3 for S3Service {
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
-        let tenant = self.tenant(&req).await?;
+        let tenant = self.tenant(&req, Class::A).await?;
         let input = req.input;
         let enc = encoder(input.encoding_type.as_ref())?;
         let start = if let Some(token) = &input.continuation_token {
@@ -1036,7 +1133,7 @@ impl S3 for S3Service {
         &self,
         req: S3Request<ListObjectsInput>,
     ) -> S3Result<S3Response<ListObjectsOutput>> {
-        let tenant = self.tenant(&req).await?;
+        let tenant = self.tenant(&req, Class::A).await?;
         let input = req.input;
         let enc = encoder(input.encoding_type.as_ref())?;
         let start = match &input.marker {

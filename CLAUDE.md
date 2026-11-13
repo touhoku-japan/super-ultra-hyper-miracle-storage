@@ -29,6 +29,10 @@ release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレ
       不一致は EOF で読み取りエラーにし、store がコミット前に書き込みを捨てる
     - `cluster.rs` — ノード間 API（`[cluster] listen` の別リスナー、`x-suhms-node-auth` の HMAC 認証）と
       `HttpPeer`（`reqwest`、TLS なし。プライベートネットワーク前提）。`open_store` がクラスタ構成ならピア付きで Store を開く
+    - `tenancy.rs` — アクセスキー/テナントの 10 秒キャッシュ（`Directory`。管理 API での変更は同ノードで即時無効化）、
+      アクセスキーごとのレート制限（トークンバケット）、課金用メーター（`Meter`、class A/B リクエスト数・ingress/egress を
+      テナント×時間で集計し定期的に `usage_hourly` へ加算）、Prometheus メトリクス
+    - `admin_api.rs` — SoraHost ポータル用の管理 API（`[admin] listen`、Bearer トークン）。`/metrics` だけ認証なし
     - `admin.rs` — 管理サブコマンド
     - `tests/` — `common/mod.rs` の自前 SigV4 署名器で、実ルータを in-process で叩く E2E テスト
   - `store/` — ストレージエンジン
@@ -51,6 +55,11 @@ release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレ
       完了時は各ディスク上でローカルにパートを連結して普通のオブジェクトファイルにする（パートごとに BLAKE3 を検証）。
       ETag は S3 と同じ `md5(パートMD5の連結)-N`。完了処理中は s3s がキープアライブの空白を送る
 - S3 プロトコル層は `s3s` クレート（Apache-2.0。`openssl` feature は使わない）
+- 商用機能: テナント停止（全 S3 リクエスト拒否）、容量クォータ（論理バイト。30 秒キャッシュなので少し超過しうる）、
+  バケット数上限、公開バケット（`[s3] allow_public_buckets` + 管理 API でバケットごとに許可。匿名は GET/HEAD のみ、
+  通信量はバケット所有者に課金）、監査ログ（`suhms::audit` ターゲット。ログレベルに関係なく出力）、
+  定期メンテナンス（`[maintenance]`: 全ノードで heartbeat・メーター書き出し・scrub、leader だけ repair・放置マルチパート削除・容量スナップショット）
+- サーバ側暗号化（SSE）は実装しない: 「ファイルをそのまま置く」方針と矛盾するため。保存時暗号化はディスク側（LUKS 等）で行う
 - 対応済み S3 操作: ListBuckets, Create/Head/Delete Bucket, GetBucketLocation, GetBucketVersioning（常に未設定）,
   Put/Get（Range）/Head/Delete Object, DeleteObjects, ListObjects V1/V2（encoding-type=url 対応）, presigned URL,
   CopyObject（COPY/REPLACE）, Create/UploadPart/UploadPartCopy/Complete/Abort MultipartUpload, ListParts, ListMultipartUploads,
@@ -93,8 +102,6 @@ MIT ライセンス。依存クレートは `deny.toml` の許可リスト（MIT
 - ノード間通信は平文 HTTP（HMAC 認証のみ）。ノード間はプライベートネットワークか WireGuard 等で保護すること
 - チェックサムは検証するが保存しないので、GET で `x-amz-checksum-*` を返さない。マルチパート全体のチェックサム（COMPOSITE / FULL_OBJECT）も未対応
 - PUT の If-Match、ListMultipartUploads の delimiter は未対応
-- 放置されたマルチパートアップロードの自動削除なし（バケット削除時のみ中止される）
-- scrub / repair は手動実行のみ（定期実行なし）
 - メタデータ更新前にクラッシュした場合や、オフラインのディスク上に残った孤立ファイルの GC がない
 - ディスクの恒久撤去（decommission）時に replicas 行を消す管理操作がない
 - `list_misreplicated` は objects の全件走査。数億件規模では見直しが必要

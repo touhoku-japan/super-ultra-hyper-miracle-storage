@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     ops::Range,
     path::PathBuf,
     sync::Arc,
@@ -19,7 +19,7 @@ use crate::{
     list::{self, ListPage, ListParams},
     meta::{
         self, BucketRecord, DeleteBucketOutcome, MetadataStore, ObjectRecord, PartRecord,
-        StoredObject, TenantRecord, UploadRecord,
+        StorageUsage, StoredObject, TenantRecord, UploadRecord,
     },
     placement::{self, Candidate},
 };
@@ -37,6 +37,9 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const ALIVE_MS: i64 = 30_000;
 /// How long a node reuses its snapshot of the cluster's disks.
 const VIEW_TTL: Duration = Duration::from_secs(2);
+/// Quota checks use a tenant's stored bytes as of at most this long ago, so a tenant can
+/// overshoot its quota by what it writes within this window.
+const USAGE_TTL: Duration = Duration::from_secs(30);
 
 /// One disk as seen by this node.
 #[derive(Debug, Clone)]
@@ -106,6 +109,8 @@ pub struct Store {
     meta: Arc<dyn MetadataStore>,
     peers: Arc<dyn Peers>,
     view: RwLock<Option<(Instant, Arc<Vec<DiskInfo>>)>>,
+    /// Logical bytes stored per tenant, for quota checks (refreshed every [`USAGE_TTL`]).
+    usage: RwLock<HashMap<String, (Instant, u64)>>,
 }
 
 fn now_millis() -> i64 {
@@ -113,6 +118,11 @@ fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .expect("clock is after 1970");
     i64::try_from(d.as_millis()).expect("timestamp fits in i64")
+}
+
+/// Start (unix ms) of the hour containing `millis`.
+pub fn hour_of(millis: i64) -> i64 {
+    millis - millis.rem_euclid(3_600_000)
 }
 
 fn validate_key(key: &str) -> Result<()> {
@@ -194,6 +204,7 @@ impl Store {
             meta,
             peers,
             view: RwLock::new(None),
+            usage: RwLock::new(HashMap::new()),
         })
     }
 
@@ -403,6 +414,48 @@ impl Store {
         }
     }
 
+    // ---- quotas ----
+
+    /// Logical bytes the tenant stores (cached for [`USAGE_TTL`]).
+    async fn stored_bytes(&self, tenant: &str) -> Result<u64> {
+        if let Some((at, bytes)) = self.usage.read().await.get(tenant)
+            && at.elapsed() < USAGE_TTL
+        {
+            return Ok(*bytes);
+        }
+        let bytes = self
+            .meta
+            .storage_usage(Some(tenant))
+            .await?
+            .first()
+            .map_or(0, |u| u.logical_bytes);
+        self.usage
+            .write()
+            .await
+            .insert(tenant.to_owned(), (Instant::now(), bytes));
+        Ok(bytes)
+    }
+
+    /// Fails with [`StoreError::QuotaExceeded`] if adding `adding` bytes would exceed the
+    /// tenant's storage quota.
+    async fn check_quota(&self, tenant: &str, adding: u64) -> Result<()> {
+        let Some(t) = self.meta.get_tenant(tenant).await? else {
+            return Ok(());
+        };
+        let Some(quota) = t.quota_bytes else {
+            return Ok(());
+        };
+        let used = self.stored_bytes(tenant).await?;
+        if used.saturating_add(adding) > quota {
+            return Err(StoreError::QuotaExceeded);
+        }
+        let mut cache = self.usage.write().await;
+        if let Some((_, bytes)) = cache.get_mut(tenant) {
+            *bytes = bytes.saturating_add(adding);
+        }
+        Ok(())
+    }
+
     // ---- tenants ----
 
     /// Creates a tenant (a customer account that owns buckets and access keys).
@@ -416,6 +469,7 @@ impl Store {
             id: Uuid::new_v4().to_string(),
             name: name.to_owned(),
             created_at: now_millis(),
+            ..TenantRecord::default()
         };
         if !self.meta.create_tenant(&record).await? {
             return Err(StoreError::TenantAlreadyExists(name.to_owned()));
@@ -450,11 +504,18 @@ impl Store {
         if let Some(n) = replicas {
             self.check_replicas(n).await?;
         }
+        if let Some(t) = self.meta.get_tenant(owner).await?
+            && let Some(max) = t.max_buckets
+            && self.meta.list_buckets(owner).await?.len() as u64 >= max
+        {
+            return Err(StoreError::TooManyBuckets);
+        }
         let record = BucketRecord {
             name: name.to_owned(),
             owner: owner.to_owned(),
             replicas,
             created_at: now_millis(),
+            public_read: false,
         };
         if !self.meta.create_bucket(&record).await? {
             let existing = self.meta.get_bucket(name).await?;
@@ -550,6 +611,7 @@ impl Store {
             // Cheap early exit; the metadata store re-checks atomically at commit.
             return Err(StoreError::PreconditionFailed);
         }
+        self.check_quota(&bucket.owner, 0).await?;
         let (replicas, explicit) = self
             .resolve_replicas(bucket, req.storage_class.as_deref())
             .await?;
@@ -586,6 +648,10 @@ impl Store {
         {
             self.remove_files(&written).await;
             return Err(StoreError::BadDigest);
+        }
+        if let Err(e) = self.check_quota(&bucket.owner, written.object.size).await {
+            self.remove_files(&written).await;
+            return Err(e);
         }
         if written.replicas.len() < usize::from(replicas) {
             tracing::warn!(
@@ -877,6 +943,7 @@ impl Store {
         requested: &[CompletedPart],
     ) -> Result<ObjectRecord> {
         let upload = self.owned_upload(owner, bucket, key, upload_id).await?;
+        self.check_quota(owner, 0).await?;
         if requested.is_empty() {
             return Err(StoreError::InvalidRequest(
                 "at least one part must be specified".into(),
@@ -926,6 +993,7 @@ impl Store {
         }
         let etag = format!("{}-{}", hex::encode(md5.finalize()), chosen.len());
         let size: u64 = chosen.iter().map(|p| p.size).sum();
+        self.check_quota(owner, size).await?;
         let blobs: Vec<(Uuid, String)> = chosen
             .iter()
             .map(|p| (p.blob_id, p.blake3.clone()))
@@ -1070,6 +1138,50 @@ impl Store {
     pub async fn list_objects(&self, owner: &str, params: &ListParams) -> Result<ListPage> {
         self.owned_bucket(owner, &params.bucket).await?;
         list::list(self.meta.as_ref(), params).await
+    }
+
+    /// Looks up an object for an anonymous reader: only in buckets marked public-read.
+    pub async fn get_public_object(&self, bucket: &str, key: &str) -> Result<StoredObject> {
+        let b = self.require_bucket(bucket).await?;
+        if !b.public_read {
+            return Err(StoreError::AccessDenied);
+        }
+        self.require_object(bucket, key).await
+    }
+
+    /// Marks a bucket public-read or private (administrative).
+    pub async fn set_bucket_public(&self, name: &str, public_read: bool) -> Result<()> {
+        if !self.meta.set_bucket_public(name, public_read).await? {
+            return Err(StoreError::NoSuchBucket(name.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Aborts multipart uploads older than `max_age`, deleting their parts. Returns how many.
+    pub async fn abort_stale_uploads(&self, max_age: Duration) -> Result<u64> {
+        let cutoff = now_millis() - i64::try_from(max_age.as_millis()).unwrap_or(i64::MAX);
+        let mut aborted = 0;
+        loop {
+            let stale = self.meta.list_stale_uploads(cutoff, 100).await?;
+            if stale.is_empty() {
+                return Ok(aborted);
+            }
+            for u in stale {
+                if let Some((upload, parts)) = self.meta.delete_upload(u.id).await? {
+                    self.remove_upload_files(&upload, &parts).await;
+                    aborted += 1;
+                }
+            }
+        }
+    }
+
+    /// Records every tenant's stored bytes in the current hour of the usage meter.
+    pub async fn snapshot_storage(&self) -> Result<Vec<StorageUsage>> {
+        let usage = self.meta.storage_usage(None).await?;
+        self.meta
+            .record_storage(hour_of(now_millis()), &usage)
+            .await?;
+        Ok(usage)
     }
 
     /// Disks recorded as holding the object (administrative, not scoped to a tenant).

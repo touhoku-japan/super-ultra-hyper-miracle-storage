@@ -93,6 +93,7 @@ pub async fn tenant(config: &Config, cmd: TenantCmd) -> anyhow::Result<()> {
                 id: uuid::Uuid::new_v4().to_string(),
                 name: name.clone(),
                 created_at: now_millis(),
+                ..suhms_store::TenantRecord::default()
             };
             if !meta.create_tenant(&record).await? {
                 bail!("tenant {name} already exists");

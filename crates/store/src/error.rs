@@ -70,6 +70,12 @@ pub enum StoreError {
     #[error("precondition failed")]
     PreconditionFailed,
 
+    #[error("storage quota exceeded")]
+    QuotaExceeded,
+
+    #[error("bucket limit reached")]
+    TooManyBuckets,
+
     #[error("bucket {0} is not empty")]
     BucketNotEmpty(String),
 

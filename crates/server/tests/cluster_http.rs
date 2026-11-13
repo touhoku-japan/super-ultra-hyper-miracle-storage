@@ -83,7 +83,13 @@ impl Cluster {
             let internal = tokio::spawn(async move {
                 axum::serve(listener, router).await.unwrap();
             });
-            let app = suhms_server::app(Arc::clone(&store), Arc::clone(&cipher), &config).unwrap();
+            let app = suhms_server::app(
+                Arc::clone(&store),
+                suhms_server::tenancy(Arc::clone(&store), &config),
+                Arc::clone(&cipher),
+                &config,
+            )
+            .unwrap();
             nodes.push(Node {
                 store,
                 app,

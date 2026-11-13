@@ -18,12 +18,17 @@ use crate::{
     error::{Result, StoreError},
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TenantRecord {
     pub id: String,
     /// Unique human-readable name (e.g. the SoraHost customer id).
     pub name: String,
     pub created_at: i64,
+    /// Suspended tenants (e.g. unpaid) cannot use the S3 API.
+    pub suspended: bool,
+    /// Maximum total size of the tenant's objects (logical bytes, not counting replicas).
+    pub quota_bytes: Option<u64>,
+    pub max_buckets: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,7 +43,7 @@ pub struct AccessKeyRecord {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BucketRecord {
     pub name: String,
     /// Tenant id of the owner.
@@ -47,6 +52,8 @@ pub struct BucketRecord {
     pub replicas: Option<u8>,
     /// Unix time in milliseconds.
     pub created_at: i64,
+    /// Anyone may GET/HEAD objects (only if the server allows public buckets).
+    pub public_read: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +133,52 @@ pub struct DiskRecord {
     pub heartbeat_at: i64,
 }
 
+/// Requests and traffic of one tenant in one hour, to be added to the meter.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageDelta {
+    pub tenant_id: String,
+    /// Unix ms of the start of the hour.
+    pub hour: i64,
+    /// PUT, COPY, POST and LIST requests.
+    pub class_a: u64,
+    /// GET, HEAD and other requests.
+    pub class_b: u64,
+    pub ingress_bytes: u64,
+    pub egress_bytes: u64,
+}
+
+/// What a tenant stores right now.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StorageUsage {
+    pub tenant_id: String,
+    pub objects: u64,
+    /// Sum of object sizes.
+    pub logical_bytes: u64,
+    /// Sum of object sizes times their replica counts (disk space used).
+    pub stored_bytes: u64,
+}
+
+/// One hour of a tenant's meter.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct UsageRow {
+    pub hour: i64,
+    pub class_a_requests: u64,
+    pub class_b_requests: u64,
+    pub ingress_bytes: u64,
+    pub egress_bytes: u64,
+    pub stored_objects: u64,
+    pub logical_bytes: u64,
+    pub stored_bytes: u64,
+}
+
+/// Changes to a tenant's settings; `None` leaves a field unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TenantUpdate {
+    pub suspended: Option<bool>,
+    pub quota_bytes: Option<Option<u64>>,
+    pub max_buckets: Option<Option<u64>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteBucketOutcome {
     Deleted,
@@ -142,6 +195,8 @@ pub trait MetadataStore: Send + Sync {
     async fn get_tenant(&self, id: &str) -> Result<Option<TenantRecord>>;
     async fn get_tenant_by_name(&self, name: &str) -> Result<Option<TenantRecord>>;
     async fn list_tenants(&self) -> Result<Vec<TenantRecord>>;
+    /// Returns false when the tenant does not exist.
+    async fn update_tenant(&self, id: &str, update: &TenantUpdate) -> Result<bool>;
     async fn create_access_key(&self, key: &AccessKeyRecord) -> Result<()>;
     async fn get_access_key(&self, id: &str) -> Result<Option<AccessKeyRecord>>;
     async fn list_access_keys(&self, tenant_id: &str) -> Result<Vec<AccessKeyRecord>>;
@@ -183,6 +238,8 @@ pub trait MetadataStore: Send + Sync {
         effective: u8,
     ) -> Result<bool>;
     async fn delete_bucket(&self, name: &str) -> Result<DeleteBucketOutcome>;
+    /// Returns false when the bucket does not exist.
+    async fn set_bucket_public(&self, name: &str, public_read: bool) -> Result<bool>;
 
     // ---- objects ----
 
@@ -243,6 +300,24 @@ pub trait MetadataStore: Send + Sync {
         object: &ObjectRecord,
         replicas: &[DiskId],
     ) -> Result<(Vec<PartRecord>, Option<StoredObject>)>;
+
+    /// Uploads started before `created_before` (unix ms), oldest first.
+    async fn list_stale_uploads(
+        &self,
+        created_before: i64,
+        limit: u32,
+    ) -> Result<Vec<UploadRecord>>;
+
+    // ---- usage metering ----
+
+    /// What each tenant (or only `tenant_id`) stores now. Tenants without objects are omitted.
+    async fn storage_usage(&self, tenant_id: Option<&str>) -> Result<Vec<StorageUsage>>;
+    /// Adds requests and traffic to the hourly meter.
+    async fn add_usage(&self, deltas: &[UsageDelta]) -> Result<()>;
+    /// Records what each tenant stores in `hour` (overwriting an earlier snapshot of that hour).
+    async fn record_storage(&self, hour: i64, usage: &[StorageUsage]) -> Result<()>;
+    /// A tenant's meter for hours in `[from, to)`.
+    async fn usage(&self, tenant_id: &str, from: i64, to: i64) -> Result<Vec<UsageRow>>;
 
     // ---- replicas ----
 

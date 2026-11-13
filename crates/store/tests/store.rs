@@ -51,7 +51,7 @@ impl Env {
             .create_tenant(&TenantRecord {
                 id: OWNER.into(),
                 name: OWNER.into(),
-                created_at: 0,
+                ..TenantRecord::default()
             })
             .await
             .unwrap();
@@ -827,4 +827,196 @@ async fn copy_object_and_conditional_put() {
     let mut req = put("src1", "new", None);
     req.if_absent = true;
     store.put_object(OWNER, req, &b"x"[..]).await.unwrap();
+}
+
+#[tokio::test]
+async fn quotas_and_bucket_limits() {
+    use suhms_store::TenantUpdate;
+    let env = Env::new(1).await;
+    let store = env.open().await;
+    let t = store.create_tenant("limited").await.unwrap();
+    store
+        .metadata()
+        .update_tenant(
+            &t.id,
+            &TenantUpdate {
+                quota_bytes: Some(Some(10)),
+                max_buckets: Some(Some(1)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let got = store.metadata().get_tenant(&t.id).await.unwrap().unwrap();
+    assert_eq!(
+        (got.quota_bytes, got.max_buckets, got.suspended),
+        (Some(10), Some(1), false)
+    );
+
+    store.create_bucket(&t.id, "only", Some(1)).await.unwrap();
+    let err = store
+        .create_bucket(&t.id, "second", Some(1))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::TooManyBuckets), "{err}");
+
+    store
+        .put_object(&t.id, put("only", "a", None), &b"123456"[..])
+        .await
+        .unwrap();
+    let err = store
+        .put_object(&t.id, put("only", "b", None), &b"123456"[..])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::QuotaExceeded), "{err}");
+    let err = store.get_object(&t.id, "only", "b").await.unwrap_err();
+    assert!(
+        matches!(err, StoreError::NoSuchKey { .. }),
+        "rejected write left nothing: {err}"
+    );
+
+    // Lifting the quota takes effect.
+    store
+        .metadata()
+        .update_tenant(
+            &t.id,
+            &TenantUpdate {
+                quota_bytes: Some(None),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .put_object(&t.id, put("only", "b", None), &b"123456"[..])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn public_buckets_serve_anonymous_reads_only_when_marked() {
+    let env = Env::new(1).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "pub", Some(1)).await.unwrap();
+    store
+        .put_object(OWNER, put("pub", "x", None), &b"hi"[..])
+        .await
+        .unwrap();
+    let err = store.get_public_object("pub", "x").await.unwrap_err();
+    assert!(matches!(err, StoreError::AccessDenied), "{err}");
+    store.set_bucket_public("pub", true).await.unwrap();
+    let stored = store.get_public_object("pub", "x").await.unwrap();
+    assert_eq!(stored.object.size, 2);
+    assert!(store.get_bucket(OWNER, "pub").await.unwrap().public_read);
+}
+
+#[tokio::test]
+async fn stale_uploads_are_aborted() {
+    let env = Env::new(1).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "mpu", Some(1)).await.unwrap();
+    let u = store
+        .create_multipart_upload(OWNER, put("mpu", "k", None))
+        .await
+        .unwrap();
+    store
+        .upload_part(OWNER, "mpu", "k", u.id, 1, None, &b"part"[..])
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .abort_stale_uploads(std::time::Duration::from_secs(3600))
+            .await
+            .unwrap(),
+        0
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert_eq!(
+        store
+            .abort_stale_uploads(std::time::Duration::from_millis(1))
+            .await
+            .unwrap(),
+        1
+    );
+    let dir = env.disks[0]
+        .join(".suhms/multipart")
+        .join(u.id.simple().to_string());
+    assert!(!dir.exists());
+}
+
+#[tokio::test]
+async fn usage_meter_accumulates_and_snapshots() {
+    use suhms_store::{UsageDelta, hour_of};
+    let env = Env::new(1).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "met", Some(1)).await.unwrap();
+    store
+        .put_object(OWNER, put("met", "a", None), &b"12345"[..])
+        .await
+        .unwrap();
+    store
+        .put_object(OWNER, put("met", "b", None), &b"123"[..])
+        .await
+        .unwrap();
+
+    let hour = hour_of(1_700_000_123_456);
+    assert_eq!(hour, 1_699_999_200_000);
+    let delta = UsageDelta {
+        tenant_id: OWNER.into(),
+        hour,
+        class_a: 2,
+        class_b: 5,
+        ingress_bytes: 100,
+        egress_bytes: 7,
+    };
+    store
+        .metadata()
+        .add_usage(&[delta.clone(), delta])
+        .await
+        .unwrap();
+    let rows = store
+        .metadata()
+        .usage(OWNER, hour, hour + 3_600_000)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (
+            rows[0].class_a_requests,
+            rows[0].class_b_requests,
+            rows[0].ingress_bytes,
+            rows[0].egress_bytes
+        ),
+        (4, 10, 200, 14)
+    );
+
+    let snap = store.snapshot_storage().await.unwrap();
+    let mine = snap.iter().find(|u| u.tenant_id == OWNER).unwrap();
+    assert_eq!(
+        (mine.objects, mine.logical_bytes, mine.stored_bytes),
+        (2, 8, 8)
+    );
+    let now = hour_of(
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap(),
+    );
+    let rows = store
+        .metadata()
+        .usage(OWNER, now, now + 3_600_000)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].logical_bytes, 8);
+    // Snapshots overwrite, they do not add up.
+    store.snapshot_storage().await.unwrap();
+    let rows = store
+        .metadata()
+        .usage(OWNER, now, now + 3_600_000)
+        .await
+        .unwrap();
+    assert_eq!((rows[0].stored_objects, rows[0].logical_bytes), (2, 8));
 }

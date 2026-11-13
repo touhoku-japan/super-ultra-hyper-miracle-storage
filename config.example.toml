@@ -35,6 +35,8 @@ region = "jp-1"
 domains = []
 # PutObject 1 回の最大サイズ（バイト）
 max_object_size = 5368709120
+# 管理 API でバケットを公開（匿名で GET/HEAD 可）にすることを許可するか。既定は不許可
+allow_public_buckets = false
 
 [auth]
 # アクセスキーのシークレットを暗号化するマスターキー（`suhms gen-master-key` で生成した 64 桁 hex）。
@@ -54,3 +56,24 @@ master_key_file = "/etc/suhms/master.key"
 #   { id = "node2", url = "http://10.0.0.2:9100" },
 #   { id = "node3", url = "http://10.0.0.3:9100" },
 # ]
+
+# 管理 API（SoraHost ポータル用）。listen を設定したときだけ有効。プライベートネットワークに置くこと
+[admin]
+# listen = "10.0.0.1:9200"
+# Bearer トークン（32 文字以上）。環境変数 SUHMS_ADMIN_TOKEN が優先
+# token_file = "/etc/suhms/admin.token"
+
+# アクセスキーごとのレート制限（ノードごと）。超えると 503 SlowDown
+[limits]
+requests_per_second = 200.0
+burst = 400.0
+
+[maintenance]
+# repair・放置マルチパートの削除・使用量スナップショットを実行するノード。クラスタでは 1 台だけ true にする
+leader = true
+repair_interval_secs = 600
+# 自ノードのディスクの scrub 間隔（0 で無効）
+scrub_interval_secs = 604800
+abort_uploads_after_secs = 604800
+usage_flush_secs = 60
+storage_snapshot_secs = 3600

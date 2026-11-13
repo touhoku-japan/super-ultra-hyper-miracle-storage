@@ -29,9 +29,13 @@ pub struct Creds {
     pub secret: String,
 }
 
+pub const ADMIN_TOKEN: &str = "admin-token-for-tests-0123456789abcdef";
+
 pub struct Server {
     pub dir: TempDir,
     pub app: Router,
+    pub admin: Router,
+    pub tenancy: Arc<suhms_server::tenancy::Tenancy>,
     pub store: Arc<Store>,
     pub cipher: Arc<SecretCipher>,
     pub disks: Vec<PathBuf>,
@@ -75,6 +79,11 @@ pub fn xml_values(xml: &str, tag: &str) -> Vec<String> {
 
 impl Server {
     pub async fn start(disks: usize) -> Self {
+        Self::start_with(disks, |_| {}).await
+    }
+
+    /// Starts a server after letting `configure` adjust the config.
+    pub async fn start_with(disks: usize, configure: impl FnOnce(&mut Config)) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let disk_paths: Vec<PathBuf> = (0..disks)
             .map(|i| {
@@ -83,7 +92,7 @@ impl Server {
                 p
             })
             .collect();
-        let config = Config {
+        let mut config = Config {
             storage: StoreConfig {
                 disks: disk_paths.clone(),
                 metadata_url: format!("sqlite://{}", dir.path().join("meta.db").display()),
@@ -96,12 +105,29 @@ impl Server {
             },
             ..Config::default()
         };
+        configure(&mut config);
         let store = Arc::new(Store::open(config.storage.clone()).await.unwrap());
         let cipher = Arc::new(SecretCipher::from_hex(&SecretCipher::generate_hex()).unwrap());
-        let app = suhms_server::app(Arc::clone(&store), Arc::clone(&cipher), &config).unwrap();
+        let tenancy = suhms_server::tenancy(Arc::clone(&store), &config);
+        let app = suhms_server::app(
+            Arc::clone(&store),
+            Arc::clone(&tenancy),
+            Arc::clone(&cipher),
+            &config,
+        )
+        .unwrap();
+        let admin = suhms_server::admin_api::router(
+            Arc::clone(&store),
+            Arc::clone(&tenancy),
+            Arc::clone(&cipher),
+            ADMIN_TOKEN,
+            config.s3.allow_public_buckets,
+        );
         Self {
             dir,
             app,
+            admin,
+            tenancy,
             store,
             cipher,
             disks: disk_paths,
@@ -115,6 +141,38 @@ impl Server {
             .await
             .unwrap();
         (t.id, Creds { key, secret })
+    }
+
+    /// Calls the admin API with the test token; `body` is JSON.
+    pub async fn admin(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {ADMIN_TOKEN}"));
+        let body = match body {
+            Some(v) => {
+                req = req.header("content-type", "application/json");
+                Body::from(v.to_string())
+            }
+            None => Body::empty(),
+        };
+        let resp = self
+            .admin
+            .clone()
+            .oneshot(req.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
     }
 
     pub async fn send(&self, req: Request<Body>) -> Resp {

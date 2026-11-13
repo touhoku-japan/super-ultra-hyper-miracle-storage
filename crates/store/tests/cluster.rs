@@ -125,7 +125,7 @@ impl Cluster {
             .create_tenant(&TenantRecord {
                 id: OWNER.into(),
                 name: OWNER.into(),
-                created_at: 0,
+                ..TenantRecord::default()
             })
             .await
             .unwrap();

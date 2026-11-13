@@ -53,11 +53,14 @@ async fn rejects_anonymous_and_badly_signed_requests() {
         srv.s3(&creds, "GET", "/", &[], &[], vec![]).await.status,
         200
     );
-    srv.store
-        .metadata()
-        .set_access_key_active(&creds.key, false)
-        .await
-        .unwrap();
+    let (status, _) = srv
+        .admin(
+            "PATCH",
+            &format!("/admin/v1/keys/{}", creds.key),
+            Some(serde_json::json!({"active": false})),
+        )
+        .await;
+    assert_eq!(status, 204);
     let resp = srv.s3(&creds, "GET", "/", &[], &[], vec![]).await;
     assert_eq!(resp.error_code().as_deref(), Some("InvalidAccessKeyId"));
 }
