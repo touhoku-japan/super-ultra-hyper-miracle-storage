@@ -65,6 +65,12 @@ release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレ
   CopyObject（COPY/REPLACE）, Create/UploadPart/UploadPartCopy/Complete/Abort MultipartUpload, ListParts, ListMultipartUploads,
   条件付きリクエスト（GET/HEAD の If-Match / If-None-Match / If-(Un)Modified-Since、PUT の If-None-Match: *）
 
+## ドキュメント・デプロイ
+
+- `docs/sorahost-integration.md` — SoraHost ポータル（dev-sorahost）から管理 API を使う仕様（課金計算を含む）。
+  `docs/examples/SuhmsAdminClient.php` は Laravel 用クライアント例。**dev-sorahost 側の実装はこのリポジトリでは行わない**
+- `deploy/suhms.service`（systemd）、`deploy/nginx.conf`（TLS 終端。管理 API とノード間 API は公開しない）
+
 ## ライセンス
 
 MIT ライセンス。依存クレートは `deny.toml` の許可リスト（MIT / Apache-2.0 / BSD / BSL-1.0 等の寛容なもの）に限る。
