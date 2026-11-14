@@ -15,7 +15,9 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
 
 開発ホストは 2 コア / 2.9GB RAM で他アプリと共有しているため、ビルドは `CARGO_BUILD_JOBS=1` で行う。
 release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレートはこのホストでのビルドが重いので dev-dependency に入れない。
-実クライアントでの互換確認はホストにある `rclone` で行う（環境変数 `RCLONE_CONFIG_S_*` で設定、`force_path_style=true`）。
+実クライアントでの互換確認はホストにある `rclone`（環境変数 `RCLONE_CONFIG_S_*` で設定、`force_path_style=true`）か、
+AWS CLI v2 で `scripts/awscli-compat.sh` を実行する（主要操作を一通り叩いて PASS/FAIL を出す。パス形式のアドレッシングが必要）。
+AWS CLI はホストにシステムインストールしていないので、公式インストーラで `-i <dir> -b <dir>` を指定し任意のディレクトリに入れて使う。
 
 ## 構成
 
