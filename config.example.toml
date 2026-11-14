@@ -90,5 +90,8 @@ scrub_interval_secs = 604800
 gc_interval_secs = 86400
 gc_grace_secs = 86400
 abort_uploads_after_secs = 604800
+# チェックサム導入前に保存したオブジェクトへの CRC64NVME の後付け（leader のみ。終われば止まる。0 で無効）と読み出し速度の上限（MiB/s、0 で無制限）
+checksum_backfill_interval_secs = 3600
+checksum_backfill_mib_per_sec = 50
 usage_flush_secs = 60
 storage_snapshot_secs = 3600

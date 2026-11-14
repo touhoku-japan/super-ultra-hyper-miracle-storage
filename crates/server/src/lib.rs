@@ -3,6 +3,7 @@
 
 pub mod admin;
 pub mod admin_api;
+pub mod backfill;
 pub mod checksum;
 pub mod cluster;
 pub mod config;

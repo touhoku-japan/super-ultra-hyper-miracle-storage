@@ -61,6 +61,15 @@ enum Command {
         #[arg(long)]
         max_moves: Option<u64>,
     },
+    /// Add checksums (CRC64NVME) to objects stored before every upload got one
+    ChecksumBackfill {
+        /// Stop after this many objects
+        #[arg(long)]
+        max_objects: Option<u64>,
+        /// Read at most this many MiB/s (default: unlimited)
+        #[arg(long)]
+        mib_per_sec: Option<u64>,
+    },
     /// Manage disks (draining, removal)
     #[command(subcommand)]
     Disk(admin::DiskCmd),
@@ -91,6 +100,10 @@ async fn main() -> anyhow::Result<()> {
             margin_gib,
             max_moves,
         } => admin::rebalance(config, margin_gib, max_moves).await,
+        Command::ChecksumBackfill {
+            max_objects,
+            mib_per_sec,
+        } => admin::checksum_backfill(config, max_objects, mib_per_sec).await,
         Command::Disk(cmd) => admin::disk(&config, cmd).await,
         Command::Node(cmd) => admin::node(&config, cmd).await,
     }
@@ -272,6 +285,8 @@ fn spawn_maintenance(
                                 trimmed = r.trimmed,
                                 drained = r.drained,
                                 queued = r.queued,
+                                postponed = r.postponed,
+                                resumed = r.resumed,
                                 unrecoverable = r.unrecoverable,
                                 "repair finished"
                             );
@@ -301,6 +316,46 @@ fn spawn_maintenance(
             Ok(())
         }
     });
+    let (s, rate) = (Arc::clone(store), m.checksum_backfill_mib_per_sec);
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    every(
+        secs(m.checksum_backfill_interval_secs),
+        "checksum backfill",
+        move || {
+            let (s, finished) = (Arc::clone(&s), Arc::clone(&finished));
+            async move {
+                use std::sync::atomic::Ordering;
+                if finished.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                let options = suhms_server::backfill::BackfillOptions {
+                    max_objects: None,
+                    bytes_per_sec: (rate > 0).then_some(rate << 20),
+                };
+                match suhms_server::backfill::backfill_checksums(&s, options).await {
+                    Ok(r) if r.is_idle() => {
+                        // New uploads always get a checksum, so there is nothing more to do.
+                        finished.store(true, Ordering::Relaxed);
+                        Ok(())
+                    }
+                    Ok(r) => {
+                        tracing::info!(
+                            updated = r.updated,
+                            corrupt = r.corrupt,
+                            failed = r.failed,
+                            "checksum backfill finished"
+                        );
+                        Ok(())
+                    }
+                    Err(suhms_store::StoreError::Busy(reason)) => {
+                        tracing::debug!(%reason, "checksum backfill skipped");
+                        Ok(())
+                    }
+                    Err(e) => Err(e.into()),
+                }
+            }
+        },
+    );
     let s = Arc::clone(store);
     every(secs(3600), "lifecycle", move || {
         let s = Arc::clone(&s);

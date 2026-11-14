@@ -29,7 +29,7 @@ use crate::{
 
 mod maintenance;
 
-pub use self::maintenance::{GcOptions, GcReport, RebalanceOptions, RebalanceReport};
+pub use self::maintenance::{GcOptions, GcReport, Lease, RebalanceOptions, RebalanceReport};
 
 const MAX_KEY_LEN: usize = 1024;
 /// S3's limit on the total size of user-defined metadata.
@@ -197,6 +197,10 @@ pub struct RepairReport {
     pub drained: u64,
     /// Objects queued because a disk went down, came back, or started draining.
     pub queued: u64,
+    /// Queued objects that could not be fixed now and wait before the next attempt.
+    pub postponed: u64,
+    /// Postponed objects made due again because usable disks were added or came back.
+    pub resumed: u64,
     /// Objects that are short of copies and have no healthy copy on an online disk.
     pub unrecoverable: u64,
 }
@@ -214,6 +218,8 @@ pub struct Store {
     /// Identifies this process as a lease holder (node id plus a random suffix, so an admin
     /// command and the server on the same node are distinct holders).
     instance: String,
+    /// Live, non-draining disks as of the last repair pass (to notice new capacity).
+    repair_capacity: std::sync::Mutex<Option<HashSet<DiskId>>>,
 }
 
 fn now_millis() -> i64 {
@@ -373,6 +379,7 @@ impl Store {
             view: RwLock::new(None),
             usage: RwLock::new(HashMap::new()),
             instance: format!("{}/{}", config.node_id, Uuid::new_v4().simple()),
+            repair_capacity: std::sync::Mutex::new(None),
             config,
         })
     }
@@ -1521,6 +1528,29 @@ impl Store {
             }
         }
         Err(StoreError::NoHealthyReplica(stored.object.id))
+    }
+
+    /// Reads a whole object from the first readable copy, feeding every chunk to `sink`, and
+    /// checks it against its BLAKE3. Returns false when the content did not match (a corrupt
+    /// copy: scrub replaces it; whatever `sink` computed must be discarded).
+    pub async fn read_verified(
+        &self,
+        stored: &StoredObject,
+        sink: &mut (dyn FnMut(&[u8]) + Send),
+    ) -> Result<bool> {
+        use tokio::io::AsyncReadExt as _;
+        let mut reader = self.read_object(stored, 0..stored.object.size).await?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = vec![0; 1 << 20];
+        loop {
+            let n = reader.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            sink(&buf[..n]);
+        }
+        Ok(hasher.finalize().to_hex().as_str() == stored.object.blake3)
     }
 
     /// Deletes the key. In a versioned bucket this adds a delete marker (the data stays as a
