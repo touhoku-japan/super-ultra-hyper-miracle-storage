@@ -1731,3 +1731,201 @@ async fn lifecycle_keeps_newer_noncurrent_versions() {
     assert_eq!(kept, [4, 3, 2]);
     assert_eq!(store.apply_lifecycle().await.unwrap().purged, 0);
 }
+
+fn tags(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect()
+}
+
+#[tokio::test]
+async fn object_tags_follow_puts_copies_and_uploads() {
+    let env = Env::new(1).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "tag", Some(1)).await.unwrap();
+    let mut req = put("tag", "a", None);
+    req.tags = Some(tags(&[("env", "prod"), ("team", "ops")]));
+    store.put_object(OWNER, req, &b"x"[..]).await.unwrap();
+    let a = store.object_tags(OWNER, "tag", "a", None).await.unwrap();
+    assert_eq!(a.tags, tags(&[("env", "prod"), ("team", "ops")]));
+
+    // Copies keep the source's tags unless replaced.
+    store
+        .copy_object(OWNER, "tag", "a", put("tag", "b", None), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .object_tags(OWNER, "tag", "b", None)
+            .await
+            .unwrap()
+            .tags,
+        a.tags
+    );
+    let mut dest = put("tag", "c", None);
+    dest.tags = Some(tags(&[("env", "dev")]));
+    store
+        .copy_object(OWNER, "tag", "a", dest, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .object_tags(OWNER, "tag", "c", None)
+            .await
+            .unwrap()
+            .tags,
+        tags(&[("env", "dev")])
+    );
+
+    // Multipart uploads apply their tags at completion.
+    let mut req = put("tag", "mp", None);
+    req.tags = Some(tags(&[("kind", "backup")]));
+    let u = store.create_multipart_upload(OWNER, req).await.unwrap();
+    let p = store
+        .upload_part(OWNER, "tag", "mp", u.id, 1, None, &b"part"[..])
+        .await
+        .unwrap();
+    let parts = [suhms_store::CompletedPart {
+        part_number: 1,
+        etag: p.etag,
+    }];
+    store
+        .complete_multipart_upload(OWNER, "tag", "mp", u.id, &parts)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .object_tags(OWNER, "tag", "mp", None)
+            .await
+            .unwrap()
+            .tags,
+        tags(&[("kind", "backup")])
+    );
+
+    // Replacing and removing.
+    store
+        .set_object_tags(OWNER, "tag", "a", None, &tags(&[("x", "1")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .object_tags(OWNER, "tag", "a", None)
+            .await
+            .unwrap()
+            .tags,
+        tags(&[("x", "1")])
+    );
+    store
+        .set_object_tags(OWNER, "tag", "a", None, &tags(&[]))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .object_tags(OWNER, "tag", "a", None)
+            .await
+            .unwrap()
+            .tags
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn tags_are_per_version_and_validated() {
+    let env = Env::new(1).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "tgv", Some(1)).await.unwrap();
+    store.set_versioning(OWNER, "tgv", "Enabled").await.unwrap();
+    let v1 = store
+        .put_object(OWNER, put("tgv", "k", None), &b"1"[..])
+        .await
+        .unwrap();
+    store
+        .put_object(OWNER, put("tgv", "k", None), &b"2"[..])
+        .await
+        .unwrap();
+    store
+        .set_object_tags(
+            OWNER,
+            "tgv",
+            "k",
+            Some(&v1.version_id),
+            &tags(&[("old", "yes")]),
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .object_tags(OWNER, "tgv", "k", None)
+            .await
+            .unwrap()
+            .tags
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .object_tags(OWNER, "tgv", "k", Some(&v1.version_id))
+            .await
+            .unwrap()
+            .tags,
+        tags(&[("old", "yes")])
+    );
+
+    let eleven: Vec<(String, String)> = (0..11).map(|i| (format!("k{i}"), "v".into())).collect();
+    let eleven = eleven.into_iter().collect();
+    let long_key = tags(&[(&"k".repeat(129), "v")]);
+    let bad_char = tags(&[("a", "semi;colon")]);
+    for t in [eleven, long_key, bad_char] {
+        let err = store
+            .set_object_tags(OWNER, "tgv", "k", None, &t)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidTag(_)), "{err}");
+    }
+    assert!(
+        store
+            .set_object_tags(
+                OWNER,
+                "tgv",
+                "k",
+                None,
+                &tags(&[("日本語 key", "値 = 1/2 @x")])
+            )
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn lifecycle_tag_filters() {
+    use suhms_store::lifecycle::LifecycleRule;
+    let env = Env::new(1).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "ltg", Some(1)).await.unwrap();
+    for (k, t) in [
+        ("tmp1", tags(&[("temp", "true"), ("team", "a")])),
+        ("tmp2", tags(&[("temp", "true")])),
+        ("keep", tags(&[("temp", "false"), ("team", "a")])),
+    ] {
+        let mut req = put("ltg", k, None);
+        req.tags = Some(t);
+        store.put_object(OWNER, req, &b"x"[..]).await.unwrap();
+    }
+    // Every tag of the filter must match.
+    let rules = vec![LifecycleRule {
+        id: "temp".into(),
+        enabled: true,
+        expiration_days: Some(0),
+        tags: tags(&[("temp", "true"), ("team", "a")]),
+        ..LifecycleRule::default()
+    }];
+    store
+        .set_lifecycle(OWNER, "ltg", Some(&rules))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    assert_eq!(store.apply_lifecycle().await.unwrap().expired, 1);
+    assert!(store.head_object(OWNER, "ltg", "tmp1").await.is_err());
+    assert!(store.head_object(OWNER, "ltg", "tmp2").await.is_ok());
+    assert!(store.head_object(OWNER, "ltg", "keep").await.is_ok());
+}

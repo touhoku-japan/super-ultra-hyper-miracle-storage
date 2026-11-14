@@ -24,7 +24,6 @@
 ## S3 互換性
 
 16. **AWS CLI での互換確認** — このホストに未インストールのため rclone でのみ確認済み
-19. **オブジェクトタグ** — Put/Get/DeleteObjectTagging が無い（ライフサイクルのタグフィルタもこれ待ち）
 
 ## 済
 
@@ -34,7 +33,8 @@
 - ~~14. versionId 指定のコピー元~~
 - ~~15. ExpiredObjectDeleteMarker、transition（ストレージクラス＝レプリカ数の変更）~~
 - ~~17. チェックサムの残り~~（未指定時の CRC64NVME、MD5 / SHA512 / xxHash 系）
-- ~~18. ライフサイクルの残り~~（Date、NewerNoncurrentVersions、サイズフィルタ。タグは 19 待ち）
+- ~~18. ライフサイクルの残り~~（Date、NewerNoncurrentVersions、サイズ・タグフィルタ）
+- ~~19. オブジェクトタグ~~（Put/Get/DeleteObjectTagging、`x-amz-tagging`、タグ数ヘッダ）
 - ~~3. ノード間通信の暗号化~~（`[cluster.tls]` の相互 TLS。`docs/cluster-tls.md`）
 
 ## 実装しないと決めたもの

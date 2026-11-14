@@ -29,18 +29,20 @@ use s3s::{
         CreateMultipartUploadInput, CreateMultipartUploadOutput, DefaultRetention,
         DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketInput,
         DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput, DeleteBucketOutput,
-        DeleteMarkerEntry, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput,
-        DeleteObjectsOutput, DeletedObject, ETag, ETagCondition, ExpirationStatus,
-        GetBucketCorsInput, GetBucketCorsOutput, GetBucketLifecycleConfigurationInput,
-        GetBucketLifecycleConfigurationOutput, GetBucketLocationInput, GetBucketLocationOutput,
-        GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectInput,
-        GetObjectLegalHoldInput, GetObjectLegalHoldOutput, GetObjectLockConfigurationInput,
+        DeleteMarkerEntry, DeleteObjectInput, DeleteObjectOutput, DeleteObjectTaggingInput,
+        DeleteObjectTaggingOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
+        ETagCondition, ExpirationStatus, GetBucketCorsInput, GetBucketCorsOutput,
+        GetBucketLifecycleConfigurationInput, GetBucketLifecycleConfigurationOutput,
+        GetBucketLocationInput, GetBucketLocationOutput, GetBucketVersioningInput,
+        GetBucketVersioningOutput, GetObjectInput, GetObjectLegalHoldInput,
+        GetObjectLegalHoldOutput, GetObjectLockConfigurationInput,
         GetObjectLockConfigurationOutput, GetObjectOutput, GetObjectRetentionInput,
-        GetObjectRetentionOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
-        HeadObjectOutput, Initiator, LifecycleExpiration, LifecycleRule as S3LifecycleRule,
-        ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput,
-        ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
-        ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput, MultipartUpload,
+        GetObjectRetentionOutput, GetObjectTaggingInput, GetObjectTaggingOutput, HeadBucketInput,
+        HeadBucketOutput, HeadObjectInput, HeadObjectOutput, Initiator, LifecycleExpiration,
+        LifecycleRule as S3LifecycleRule, ListBucketsInput, ListBucketsOutput,
+        ListMultipartUploadsInput, ListMultipartUploadsOutput, ListObjectVersionsInput,
+        ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
+        ListObjectsV2Output, ListPartsInput, ListPartsOutput, MultipartUpload,
         NoncurrentVersionExpiration, NoncurrentVersionTransition, Object, ObjectLockConfiguration,
         ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention,
         ObjectLockRetentionMode, ObjectLockRule, ObjectStorageClass, ObjectVersion,
@@ -49,9 +51,9 @@ use s3s::{
         PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectInput,
         PutObjectLegalHoldInput, PutObjectLegalHoldOutput, PutObjectLockConfigurationInput,
         PutObjectLockConfigurationOutput, PutObjectOutput, PutObjectRetentionInput,
-        PutObjectRetentionOutput, StorageClass, StreamingBlob, Timestamp, Transition,
-        TransitionStorageClass, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput,
-        UploadPartOutput,
+        PutObjectRetentionOutput, PutObjectTaggingInput, PutObjectTaggingOutput, StorageClass,
+        StreamingBlob, Timestamp, Transition, TransitionStorageClass, UploadPartCopyInput,
+        UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
     },
     s3_error,
 };
@@ -257,6 +259,7 @@ fn s3_err(e: StoreError) -> S3Error {
             )
         }
         StoreError::InvalidRequest(m) => S3Error::with_message(S3ErrorCode::InvalidRequest, m),
+        StoreError::InvalidTag(m) => S3Error::with_message(S3ErrorCode::InvalidTag, m),
         e @ (StoreError::InvalidReplicaCount { .. } | StoreError::InvalidArgument(_)) => {
             S3Error::with_message(S3ErrorCode::InvalidArgument, e.to_string())
         }
@@ -492,6 +495,54 @@ fn copy_wrap(
     })
 }
 
+/// Parses `x-amz-tagging` (URL query encoding: `k1=v1&k2=v2`).
+fn parse_tagging(header: Option<&str>) -> S3Result<Option<BTreeMap<String, String>>> {
+    let Some(header) = header else {
+        return Ok(None);
+    };
+    let decode = |s: &str| {
+        percent_encoding::percent_decode_str(&s.replace('+', " "))
+            .decode_utf8()
+            .map(|s| s.into_owned())
+            .map_err(|_| s3_error!(InvalidTag, "x-amz-tagging is not valid UTF-8"))
+    };
+    let mut tags = BTreeMap::new();
+    for pair in header.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if tags.insert(decode(k)?, decode(v)?).is_some() {
+            return Err(s3_error!(InvalidTag, "duplicate tag key"));
+        }
+    }
+    Ok(Some(tags))
+}
+
+/// The tag set of a PutObjectTagging body.
+fn tag_set_to_map(set: Vec<s3s::dto::Tag>) -> S3Result<BTreeMap<String, String>> {
+    let mut tags = BTreeMap::new();
+    for t in set {
+        let key = t
+            .key
+            .ok_or_else(|| s3_error!(MalformedXML, "a tag needs a Key"))?;
+        if tags.insert(key, t.value.unwrap_or_default()).is_some() {
+            return Err(s3_error!(InvalidTag, "duplicate tag key"));
+        }
+    }
+    Ok(tags)
+}
+
+fn map_to_tag_set(tags: &BTreeMap<String, String>) -> Vec<s3s::dto::Tag> {
+    tags.iter()
+        .map(|(k, v)| s3s::dto::Tag {
+            key: Some(k.clone()),
+            value: Some(v.clone()),
+        })
+        .collect()
+}
+
+fn tag_count(rec: &ObjectRecord) -> Option<i32> {
+    (!rec.tags.is_empty()).then(|| i32::try_from(rec.tags.len()).unwrap_or(i32::MAX))
+}
+
 fn version_header(v: &str) -> Option<String> {
     (v != NULL_VERSION).then(|| v.to_owned())
 }
@@ -600,10 +651,20 @@ fn lifecycle_size(n: Option<i64>) -> S3Result<Option<u64>> {
 fn lifecycle_rule_from_s3(i: usize, r: &S3LifecycleRule) -> S3Result<LifecycleRule> {
     let filter = r.filter.as_ref();
     let and = filter.and_then(|f| f.and.as_ref());
-    if filter.is_some_and(|f| f.tag.is_some())
-        || and.is_some_and(|a| a.tags.as_ref().is_some_and(|t| !t.is_empty()))
-    {
-        return Err(s3_error!(NotImplemented, "lifecycle filters by object tag"));
+    let mut tag_filter: Vec<s3s::dto::Tag> =
+        filter.and_then(|f| f.tag.clone()).into_iter().collect();
+    tag_filter.extend(and.and_then(|a| a.tags.clone()).unwrap_or_default());
+    let tags = tag_set_to_map(tag_filter)?;
+    let expired_markers = r
+        .expiration
+        .as_ref()
+        .and_then(|e| e.expired_object_delete_marker)
+        .unwrap_or(false);
+    if expired_markers && !tags.is_empty() {
+        return Err(s3_error!(
+            InvalidRequest,
+            "ExpiredObjectDeleteMarker cannot be used with a tag filter"
+        ));
     }
     let prefix = filter
         .and_then(|f| f.prefix.clone())
@@ -683,6 +744,7 @@ fn lifecycle_rule_from_s3(i: usize, r: &S3LifecycleRule) -> S3Result<LifecycleRu
         )?,
         min_size,
         max_size,
+        tags,
         abort_multipart_days: lifecycle_days(
             r.abort_incomplete_multipart_upload
                 .as_ref()
@@ -701,13 +763,13 @@ fn lifecycle_rule_to_s3(r: LifecycleRule) -> S3LifecycleRule {
     let days = |d: Option<u32>| d.and_then(|d| i32::try_from(d).ok());
     let size = |n: Option<u64>| n.and_then(|n| i64::try_from(n).ok());
     let has_size = r.min_size.is_some() || r.max_size.is_some();
-    let filter = if has_size {
+    let filter = if has_size || !r.tags.is_empty() {
         s3s::dto::LifecycleRuleFilter {
             and: Some(s3s::dto::LifecycleRuleAndOperator {
                 prefix: Some(r.prefix.clone()),
                 object_size_greater_than: size(r.min_size),
                 object_size_less_than: size(r.max_size),
-                ..Default::default()
+                tags: (!r.tags.is_empty()).then(|| map_to_tag_set(&r.tags)),
             }),
             ..Default::default()
         }
@@ -1187,6 +1249,73 @@ impl S3 for S3Service {
         }))
     }
 
+    async fn put_object_tagging(
+        &self,
+        req: S3Request<PutObjectTaggingInput>,
+    ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
+        let tenant = self.tenant(&req, Class::A).await?;
+        let input = req.input;
+        let tags = tag_set_to_map(input.tagging.tag_set)?;
+        let rec = self
+            .store
+            .set_object_tags(
+                &tenant,
+                &input.bucket,
+                &input.key,
+                input.version_id.as_deref(),
+                &tags,
+            )
+            .await
+            .map_err(s3_err)?;
+        Ok(S3Response::new(PutObjectTaggingOutput {
+            version_id: version_of(&rec),
+        }))
+    }
+
+    async fn get_object_tagging(
+        &self,
+        req: S3Request<GetObjectTaggingInput>,
+    ) -> S3Result<S3Response<GetObjectTaggingOutput>> {
+        let tenant = self.tenant(&req, Class::B).await?;
+        let input = req.input;
+        let rec = self
+            .store
+            .object_tags(
+                &tenant,
+                &input.bucket,
+                &input.key,
+                input.version_id.as_deref(),
+            )
+            .await
+            .map_err(s3_err)?;
+        Ok(S3Response::new(GetObjectTaggingOutput {
+            tag_set: map_to_tag_set(&rec.tags),
+            version_id: version_of(&rec),
+        }))
+    }
+
+    async fn delete_object_tagging(
+        &self,
+        req: S3Request<DeleteObjectTaggingInput>,
+    ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
+        let tenant = self.tenant(&req, Class::B).await?;
+        let input = req.input;
+        let rec = self
+            .store
+            .set_object_tags(
+                &tenant,
+                &input.bucket,
+                &input.key,
+                input.version_id.as_deref(),
+                &BTreeMap::new(),
+            )
+            .await
+            .map_err(s3_err)?;
+        Ok(S3Response::new(DeleteObjectTaggingOutput {
+            version_id: version_of(&rec),
+        }))
+    }
+
     async fn put_object_legal_hold(
         &self,
         req: S3Request<PutObjectLegalHoldInput>,
@@ -1323,6 +1452,7 @@ impl S3 for S3Service {
             content_md5: parse_md5(input.content_md5.as_deref())?,
             condition,
             checksum: Some(slot),
+            tags: parse_tagging(input.tagging.as_deref())?,
             lock_mode: input.object_lock_mode.map(|m| m.as_str().to_owned()),
             lock_until: input.object_lock_retain_until_date.map(millis),
             legal_hold: input
@@ -1389,6 +1519,13 @@ impl S3 for S3Service {
                 WriteCondition::None
             },
             checksum: Some(Arc::clone(&pending)),
+            tags: match input.tagging_directive.as_ref().map(|d| d.as_str()) {
+                None | Some("COPY") => None,
+                Some("REPLACE") => {
+                    Some(parse_tagging(input.tagging.as_deref())?.unwrap_or_default())
+                }
+                Some(_) => return Err(s3_error!(InvalidArgument, "invalid tagging directive")),
+            },
             ..PutObjectRequest::default()
         };
         let source = suhms_store::CopySource {
@@ -1454,6 +1591,7 @@ impl S3 for S3Service {
             storage_class: class_name(input.storage_class),
             user_metadata: input.metadata.unwrap_or_default().into_iter().collect(),
             multipart_checksum: cfg.as_ref().map(UploadChecksum::encode),
+            tags: parse_tagging(input.tagging.as_deref())?,
             ..PutObjectRequest::default()
         };
         let upload = self
@@ -1907,6 +2045,7 @@ impl S3 for S3Service {
             last_modified: Some(timestamp(rec.created_at)),
             content_type: rec.content_type.clone(),
             metadata: user_metadata(rec),
+            tag_count: tag_count(rec),
             storage_class: rec.storage_class.clone().map(StorageClass::from),
             checksum_crc32: c.checksum_crc32,
             checksum_crc32c: c.checksum_crc32c,
@@ -1954,6 +2093,7 @@ impl S3 for S3Service {
         let stored = stored_checksum(&rec, input.checksum_mode.as_ref());
         let c = stored.as_ref().map(Stored::fields).unwrap_or_default();
         Ok(S3Response::new(HeadObjectOutput {
+            tag_count: tag_count(&rec),
             version_id: version_of(&rec),
             storage_class: rec.storage_class.clone().map(StorageClass::from),
             checksum_crc32: c.checksum_crc32,

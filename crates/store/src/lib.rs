@@ -27,6 +27,6 @@ pub use crate::{
         ChecksumSlot, CompleteChecksum, CompletedPart, CopySource, CopyWrap, DeleteResult,
         DiskInfo, HEARTBEAT_INTERVAL, LifecycleReport, MAX_PART_NUMBER, MIN_PART_SIZE, PartsPage,
         PutObjectRequest, RESERVED_BUCKETS, RepairReport, ScrubReport, Store, UploadsPage,
-        VersionsPage, hour_of,
+        VersionsPage, hour_of, validate_tags,
     },
 };

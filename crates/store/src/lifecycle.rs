@@ -1,10 +1,14 @@
 //! Bucket lifecycle rules (a subset of S3's): expire current versions, permanently delete
 //! noncurrent versions, remove expired object delete markers, move versions to another
 //! storage class (= replica count) and abort incomplete multipart uploads, each after a
-//! number of days or from a date, optionally limited to a key prefix and an object size range.
-//! Filtering by object tags is not supported (suhms has no object tagging).
+//! number of days or from a date, optionally limited to a key prefix, an object size range and
+//! object tags.
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+
+use crate::meta::ObjectRecord;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleRule {
@@ -29,6 +33,9 @@ pub struct LifecycleRule {
     /// Only objects smaller than this many bytes (`ObjectSizeLessThan`).
     #[serde(default)]
     pub max_size: Option<u64>,
+    /// Only objects having all of these tags.
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
     /// Multipart uploads started this long ago are aborted.
     pub abort_multipart_days: Option<u32>,
     /// Delete markers that are the only remaining version of their key are removed.
@@ -58,12 +65,14 @@ pub struct Transition {
 }
 
 impl LifecycleRule {
-    /// Whether a version falls under the rule's size filter (delete markers have no size and
-    /// are never filtered out).
-    pub fn matches_size(&self, size: u64, delete_marker: bool) -> bool {
-        delete_marker
-            || (self.min_size.is_none_or(|min| size > min)
-                && self.max_size.is_none_or(|max| size < max))
+    /// Whether a version falls under the rule's size and tag filters. Delete markers have no
+    /// size or tags and are never filtered out (S3 does not allow tag filters together with
+    /// expired-delete-marker removal).
+    pub fn matches(&self, o: &ObjectRecord) -> bool {
+        o.delete_marker
+            || (self.min_size.is_none_or(|min| o.size > min)
+                && self.max_size.is_none_or(|max| o.size < max)
+                && self.tags.iter().all(|(k, v)| o.tags.get(k) == Some(v)))
     }
 }
 
