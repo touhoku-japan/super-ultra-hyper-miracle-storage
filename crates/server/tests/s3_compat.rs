@@ -467,3 +467,162 @@ async fn lifecycle_transitions_and_delete_marker_rules_round_trip() {
     assert_eq!(xml_values(&xml, "NoncurrentDays"), vec!["7"]);
     assert_eq!(xml_values(&xml, "ExpiredObjectDeleteMarker"), vec!["true"]);
 }
+
+#[tokio::test]
+async fn uploads_without_a_checksum_get_crc64nvme() {
+    let srv = Server::start(1).await;
+    let (_, c) = srv.tenant("alice").await;
+    srv.s3(&c, "PUT", "/dflt", &[], &[], vec![]).await;
+    let resp = srv
+        .s3(&c, "PUT", "/dflt/a", &[], &[], b"hello".to_vec())
+        .await;
+    let crc = B64.encode(Crc64Nvme::checksum(b"hello"));
+    assert_eq!(resp.header("x-amz-checksum-crc64nvme"), Some(crc.as_str()));
+    let resp = srv
+        .s3(
+            &c,
+            "HEAD",
+            "/dflt/a",
+            &[],
+            &[("x-amz-checksum-mode", "ENABLED")],
+            vec![],
+        )
+        .await;
+    assert_eq!(resp.header("x-amz-checksum-crc64nvme"), Some(crc.as_str()));
+
+    // A multipart upload without an algorithm gets the full-object CRC64NVME too.
+    let resp = srv
+        .s3(&c, "POST", "/dflt/mp", &[("uploads", "")], &[], vec![])
+        .await;
+    let id = upload_id(&resp.text());
+    let p1 = vec![3u8; 5 * MIB];
+    let mut etags = Vec::new();
+    for (n, body) in [("1", p1.clone()), ("2", b"end".to_vec())] {
+        let resp = srv
+            .s3(
+                &c,
+                "PUT",
+                "/dflt/mp",
+                &[("partNumber", n), ("uploadId", &id)],
+                &[],
+                body,
+            )
+            .await;
+        etags.push(resp.header("etag").unwrap().to_owned());
+    }
+    let done = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        etags[0], etags[1]
+    );
+    let xml = srv
+        .s3(&c, "POST", "/dflt/mp", &[("uploadId", &id)], &[], done)
+        .await
+        .text();
+    let mut whole = p1;
+    whole.extend_from_slice(b"end");
+    assert_eq!(
+        xml_values(&xml, "ChecksumCRC64NVME"),
+        vec![B64.encode(Crc64Nvme::checksum(&whole))],
+        "{xml}"
+    );
+}
+
+#[tokio::test]
+async fn newer_checksum_algorithms_over_http() {
+    use s3s::crypto::{Md5 as AmzMd5, Sha512, XxHash64};
+    let srv = Server::start(1).await;
+    let (_, c) = srv.tenant("alice").await;
+    srv.s3(&c, "PUT", "/algo", &[], &[], vec![]).await;
+    for (header, sum) in [
+        (
+            "x-amz-checksum-sha512",
+            B64.encode(Sha512::checksum(b"data")),
+        ),
+        ("x-amz-checksum-md5", B64.encode(AmzMd5::checksum(b"data"))),
+        (
+            "x-amz-checksum-xxhash64",
+            B64.encode(XxHash64::checksum(b"data")),
+        ),
+    ] {
+        let resp = srv
+            .s3(
+                &c,
+                "PUT",
+                "/algo/k",
+                &[],
+                &[(header, &sum)],
+                b"data".to_vec(),
+            )
+            .await;
+        assert_eq!(resp.status, 200, "{header}: {}", resp.text());
+        let resp = srv
+            .s3(
+                &c,
+                "HEAD",
+                "/algo/k",
+                &[],
+                &[("x-amz-checksum-mode", "ENABLED")],
+                vec![],
+            )
+            .await;
+        assert_eq!(resp.header(header), Some(sum.as_str()));
+        let resp = srv
+            .s3(
+                &c,
+                "PUT",
+                "/algo/k",
+                &[],
+                &[(header, "AAAA")],
+                b"data".to_vec(),
+            )
+            .await;
+        assert_eq!(resp.status, 400, "{header}");
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_dates_sizes_and_newer_versions_round_trip() {
+    let srv = Server::start(1).await;
+    let (_, c) = srv.tenant("alice").await;
+    srv.s3(&c, "PUT", "/lcx", &[], &[], vec![]).await;
+    let put = |cfg: String| {
+        let (srv, c) = (&srv, &c);
+        async move {
+            srv.s3(
+                c,
+                "PUT",
+                "/lcx",
+                &[("lifecycle", "")],
+                &[("content-md5", &md5_b64(&cfg))],
+                cfg.into_bytes(),
+            )
+            .await
+        }
+    };
+    let cfg = "<LifecycleConfiguration><Rule><ID>r</ID><Filter><And><Prefix>logs/</Prefix>\
+               <ObjectSizeGreaterThan>1024</ObjectSizeGreaterThan>\
+               <ObjectSizeLessThan>1048576</ObjectSizeLessThan></And></Filter>\
+               <Status>Enabled</Status><Expiration><Date>2030-01-01T00:00:00Z</Date></Expiration>\
+               <NoncurrentVersionExpiration><NoncurrentDays>30</NoncurrentDays>\
+               <NewerNoncurrentVersions>3</NewerNoncurrentVersions></NoncurrentVersionExpiration>\
+               </Rule></LifecycleConfiguration>";
+    let resp = put(cfg.to_owned()).await;
+    assert_eq!(resp.status, 200, "{}", resp.text());
+    let xml = srv
+        .s3(&c, "GET", "/lcx", &[("lifecycle", "")], &[], vec![])
+        .await
+        .text();
+    assert_eq!(xml_values(&xml, "Prefix"), vec!["logs/"], "{xml}");
+    assert_eq!(xml_values(&xml, "ObjectSizeGreaterThan"), vec!["1024"]);
+    assert_eq!(xml_values(&xml, "ObjectSizeLessThan"), vec!["1048576"]);
+    assert_eq!(xml_values(&xml, "NewerNoncurrentVersions"), vec!["3"]);
+    assert_eq!(xml_values(&xml, "Date").len(), 1, "{xml}");
+    assert!(xml_values(&xml, "Date")[0].starts_with("2030-01-01T00:00:00"));
+
+    // Tag filters are not supported (no object tagging).
+    let tagged = "<LifecycleConfiguration><Rule><ID>t</ID><Filter><Tag><Key>a</Key><Value>b</Value>\
+                  </Tag></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration>\
+                  </Rule></LifecycleConfiguration>";
+    assert_eq!(put(tagged.to_owned()).await.status, 501);
+}

@@ -24,7 +24,10 @@ use crc_fast::CrcAlgorithm;
 use s3s::{
     S3Error, S3Result,
     checksum::ChecksumHasher,
-    crypto::{Checksum as _, Crc32, Crc32c, Crc64Nvme, Sha1, Sha256},
+    crypto::{
+        Checksum as _, Crc32, Crc32c, Crc64Nvme, Md5, Sha1, Sha256, Sha512, XxHash3, XxHash64,
+        XxHash128,
+    },
     dto::{Checksum, ChecksumAlgorithm, ChecksumType},
     s3_error,
 };
@@ -42,24 +45,43 @@ pub enum Algo {
     Crc64Nvme,
     Sha1,
     Sha256,
+    Sha512,
+    Md5,
+    XxHash64,
+    XxHash3,
+    XxHash128,
 }
 
-const ALGOS: [(Algo, &str); 5] = [
+/// What uploads without a checksum get, as in S3 (and what multipart uploads without an
+/// algorithm combine into a full-object checksum).
+pub const DEFAULT_ALGO: Algo = Algo::Crc64Nvme;
+
+const ALGOS: [(Algo, &str); 10] = [
     (Algo::Crc32, "x-amz-checksum-crc32"),
     (Algo::Crc32c, "x-amz-checksum-crc32c"),
     (Algo::Crc64Nvme, "x-amz-checksum-crc64nvme"),
     (Algo::Sha1, "x-amz-checksum-sha1"),
     (Algo::Sha256, "x-amz-checksum-sha256"),
+    (Algo::Sha512, "x-amz-checksum-sha512"),
+    (Algo::Md5, "x-amz-checksum-md5"),
+    (Algo::XxHash64, "x-amz-checksum-xxhash64"),
+    (Algo::XxHash3, "x-amz-checksum-xxhash3"),
+    (Algo::XxHash128, "x-amz-checksum-xxhash128"),
 ];
 
 impl Algo {
     pub fn name(self) -> &'static str {
         match self {
-            Self::Crc32 => "CRC32",
-            Self::Crc32c => "CRC32C",
-            Self::Crc64Nvme => "CRC64NVME",
-            Self::Sha1 => "SHA1",
-            Self::Sha256 => "SHA256",
+            Self::Crc32 => ChecksumAlgorithm::CRC32,
+            Self::Crc32c => ChecksumAlgorithm::CRC32C,
+            Self::Crc64Nvme => ChecksumAlgorithm::CRC64NVME,
+            Self::Sha1 => ChecksumAlgorithm::SHA1,
+            Self::Sha256 => ChecksumAlgorithm::SHA256,
+            Self::Sha512 => ChecksumAlgorithm::SHA512,
+            Self::Md5 => ChecksumAlgorithm::MD5,
+            Self::XxHash64 => ChecksumAlgorithm::XXHASH64,
+            Self::XxHash3 => ChecksumAlgorithm::XXHASH3,
+            Self::XxHash128 => ChecksumAlgorithm::XXHASH128,
         }
     }
 
@@ -89,7 +111,7 @@ impl Algo {
             Self::Crc32 => Some(CrcAlgorithm::Crc32IsoHdlc),
             Self::Crc32c => Some(CrcAlgorithm::Crc32Iscsi),
             Self::Crc64Nvme => Some(CrcAlgorithm::Crc64Nvme),
-            Self::Sha1 | Self::Sha256 => None,
+            _ => None,
         }
     }
 
@@ -102,6 +124,8 @@ impl Algo {
         }
     }
 
+    /// FULL_OBJECT needs a CRC (combinable without the data); COMPOSITE works for any other
+    /// algorithm, CRC64NVME being full-object only.
     fn supports(self, kind: &str) -> bool {
         match kind {
             FULL_OBJECT => self.crc().is_some(),
@@ -110,16 +134,19 @@ impl Algo {
         }
     }
 
-    fn hasher(self) -> ChecksumHasher {
-        let mut h = ChecksumHasher::default();
+    fn enable(self, h: &mut ChecksumHasher) {
         match self {
             Self::Crc32 => h.crc32 = Some(Crc32::new()),
             Self::Crc32c => h.crc32c = Some(Crc32c::new()),
             Self::Crc64Nvme => h.crc64nvme = Some(Crc64Nvme::new()),
             Self::Sha1 => h.sha1 = Some(Sha1::new()),
             Self::Sha256 => h.sha256 = Some(Sha256::new()),
+            Self::Sha512 => h.sha512 = Some(Sha512::new()),
+            Self::Md5 => h.md5 = Some(Md5::new()),
+            Self::XxHash64 => h.xxhash64 = Some(XxHash64::new()),
+            Self::XxHash3 => h.xxhash3 = Some(XxHash3::new()),
+            Self::XxHash128 => h.xxhash128 = Some(XxHash128::new()),
         }
-        h
     }
 
     fn digest(self, data: &[u8]) -> Vec<u8> {
@@ -129,6 +156,11 @@ impl Algo {
             Self::Crc64Nvme => Crc64Nvme::checksum(data).as_ref().to_vec(),
             Self::Sha1 => Sha1::checksum(data).as_ref().to_vec(),
             Self::Sha256 => Sha256::checksum(data).as_ref().to_vec(),
+            Self::Sha512 => Sha512::checksum(data).as_ref().to_vec(),
+            Self::Md5 => Md5::checksum(data).as_ref().to_vec(),
+            Self::XxHash64 => XxHash64::checksum(data).as_ref().to_vec(),
+            Self::XxHash3 => XxHash3::checksum(data).as_ref().to_vec(),
+            Self::XxHash128 => XxHash128::checksum(data).as_ref().to_vec(),
         }
     }
 
@@ -139,18 +171,41 @@ impl Algo {
             Self::Crc64Nvme => c.checksum_crc64nvme.as_deref(),
             Self::Sha1 => c.checksum_sha1.as_deref(),
             Self::Sha256 => c.checksum_sha256.as_deref(),
+            Self::Sha512 => c.checksum_sha512.as_deref(),
+            Self::Md5 => c.checksum_md5.as_deref(),
+            Self::XxHash64 => c.checksum_xxhash64.as_deref(),
+            Self::XxHash3 => c.checksum_xxhash3.as_deref(),
+            Self::XxHash128 => c.checksum_xxhash128.as_deref(),
         }
     }
 
     fn set(self, c: &mut Checksum, v: String) {
-        match self {
-            Self::Crc32 => c.checksum_crc32 = Some(v),
-            Self::Crc32c => c.checksum_crc32c = Some(v),
-            Self::Crc64Nvme => c.checksum_crc64nvme = Some(v),
-            Self::Sha1 => c.checksum_sha1 = Some(v),
-            Self::Sha256 => c.checksum_sha256 = Some(v),
-        }
+        let field = match self {
+            Self::Crc32 => &mut c.checksum_crc32,
+            Self::Crc32c => &mut c.checksum_crc32c,
+            Self::Crc64Nvme => &mut c.checksum_crc64nvme,
+            Self::Sha1 => &mut c.checksum_sha1,
+            Self::Sha256 => &mut c.checksum_sha256,
+            Self::Sha512 => &mut c.checksum_sha512,
+            Self::Md5 => &mut c.checksum_md5,
+            Self::XxHash64 => &mut c.checksum_xxhash64,
+            Self::XxHash3 => &mut c.checksum_xxhash3,
+            Self::XxHash128 => &mut c.checksum_xxhash128,
+        };
+        *field = Some(v);
     }
+}
+
+/// Which checksum a body gets stored with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Policy {
+    /// The context requires this algorithm (a multipart upload's); a client checksum of
+    /// another algorithm is an error.
+    Required(Algo),
+    /// The client's algorithm if it sent a checksum, otherwise [`DEFAULT_ALGO`].
+    ClientOrDefault,
+    /// Always store this algorithm; a client checksum of another algorithm is verified too.
+    Always(Algo),
 }
 
 /// A checksum as kept by the store (JSON in the `checksum` column).
@@ -311,47 +366,59 @@ pub type Outcome = Arc<Mutex<Option<Checksum>>>;
 
 pub struct VerifyingReader<R> {
     inner: R,
-    algo: Algo,
+    /// The algorithm stored with the body.
+    store: Algo,
     expected: Option<Expected>,
     hasher: Option<ChecksumHasher>,
     outcome: Outcome,
     slot: ChecksumSlot,
 }
 
-/// Wraps `inner` so that its checksum is computed and, if the client sent one, verified at end
-/// of stream. `compute` is the algorithm required by the context (the upload's, or the copy
-/// source's); without it and without a client checksum nothing is computed.
+/// Wraps `inner` so that its checksum is computed (per `policy`) and, if the client sent one,
+/// verified at end of stream. The stored checksum is published to the returned slot.
 #[allow(clippy::type_complexity)]
 pub fn wrap<R>(
     inner: R,
     expected: Option<Expected>,
-    compute: Option<Algo>,
-) -> S3Result<(VerifyingReader<R>, Outcome, Option<ChecksumSlot>)>
+    policy: Policy,
+) -> S3Result<(VerifyingReader<R>, Outcome, ChecksumSlot)>
 where
     R: AsyncRead + Unpin,
 {
-    if let (Some(e), Some(c)) = (&expected, compute)
-        && e.algo != c
-    {
-        return Err(s3_error!(
-            InvalidRequest,
-            "Checksum Type mismatch occurred, expected checksum Type: {}, actual checksum Type: {}",
-            c.name().to_ascii_lowercase(),
-            e.algo.name().to_ascii_lowercase()
-        ));
+    let client = expected.as_ref().map(|e| e.algo);
+    let store = match policy {
+        Policy::Required(a) => {
+            if let Some(c) = client
+                && c != a
+            {
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "Checksum Type mismatch occurred, expected checksum Type: {}, actual checksum Type: {}",
+                    a.name().to_ascii_lowercase(),
+                    c.name().to_ascii_lowercase()
+                ));
+            }
+            a
+        }
+        Policy::ClientOrDefault => client.unwrap_or(DEFAULT_ALGO),
+        Policy::Always(a) => a,
+    };
+    let mut hasher = ChecksumHasher::default();
+    store.enable(&mut hasher);
+    if let Some(c) = client {
+        c.enable(&mut hasher);
     }
-    let algo = expected.as_ref().map(|e| e.algo).or(compute);
     let outcome = Outcome::default();
     let slot = ChecksumSlot::default();
     let reader = VerifyingReader {
         inner,
-        algo: algo.unwrap_or(Algo::Crc32),
-        hasher: algo.map(Algo::hasher),
+        store,
+        hasher: Some(hasher),
         expected,
         outcome: Arc::clone(&outcome),
         slot: Arc::clone(&slot),
     };
-    Ok((reader, outcome, algo.map(|_| slot)))
+    Ok((reader, outcome, slot))
 }
 
 fn mismatch(algo: Algo) -> io::Error {
@@ -383,8 +450,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for VerifyingReader<R> {
         // End of stream: trailers (if any) have been parsed by now.
         if let Some(h) = this.hasher.take() {
             let computed = h.finalize();
-            let algo = this.algo;
             if let Some(expected) = &this.expected {
+                let algo = expected.algo;
                 let claimed = match &expected.source {
                     Source::Header(v) => Some(v.clone()),
                     Source::Trailer(t, name) => t
@@ -405,9 +472,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for VerifyingReader<R> {
                     return Poll::Ready(Err(mismatch(algo)));
                 }
             }
-            if let Some(v) = algo.value(&computed) {
+            if let Some(v) = this.store.value(&computed) {
                 let stored = Stored {
-                    algorithm: algo.name().to_owned(),
+                    algorithm: this.store.name().to_owned(),
                     kind: FULL_OBJECT.to_owned(),
                     value: v.to_owned(),
                 };
@@ -432,8 +499,22 @@ pub fn complete(
     claimed_parts: &[Checksum],
     claimed: &Checksum,
 ) -> Result<Option<String>, StoreError> {
-    let Some(cfg) = UploadChecksum::decode(upload.checksum.as_deref()) else {
-        return Ok(None);
+    // Without an algorithm, parts carry the default CRC64NVME and the object gets its
+    // full-object CRC (as in S3); parts stored before that existed have none.
+    let cfg = match UploadChecksum::decode(upload.checksum.as_deref()) {
+        Some(cfg) => cfg,
+        None => {
+            let all_default = parts.iter().all(|p| {
+                Stored::decode(p.checksum.as_deref()).and_then(|s| s.algo()) == Some(DEFAULT_ALGO)
+            });
+            if !all_default {
+                return Ok(None);
+            }
+            UploadChecksum {
+                algorithm: DEFAULT_ALGO.name().to_owned(),
+                kind: FULL_OBJECT.to_owned(),
+            }
+        }
     };
     let algo = cfg
         .algo()
@@ -512,12 +593,16 @@ mod tests {
         h
     }
 
+    fn stored(slot: &ChecksumSlot) -> Stored {
+        Stored::decode(slot.lock().unwrap().as_deref()).unwrap()
+    }
+
     #[tokio::test]
     async fn verifies_header_checksums() {
         // CRC32 of "hello" is 0x3610a686.
         let good = headers(&[("x-amz-checksum-crc32", "NhCmhg==")]);
         let exp = expected(&good, None).unwrap();
-        let (mut r, outcome, slot) = wrap(&b"hello"[..], exp, None).unwrap();
+        let (mut r, outcome, slot) = wrap(&b"hello"[..], exp, Policy::ClientOrDefault).unwrap();
         let mut out = Vec::new();
         r.read_to_end(&mut out).await.unwrap();
         assert_eq!(
@@ -530,29 +615,108 @@ mod tests {
                 .as_deref(),
             Some("NhCmhg==")
         );
-        let stored = Stored::decode(slot.unwrap().lock().unwrap().as_deref()).unwrap();
-        assert_eq!(stored.value, "NhCmhg==");
-        assert_eq!(stored.kind, FULL_OBJECT);
+        let s = stored(&slot);
+        assert_eq!(
+            (s.algorithm.as_str(), s.value.as_str()),
+            ("CRC32", "NhCmhg==")
+        );
+        assert_eq!(s.kind, FULL_OBJECT);
 
         let bad = headers(&[("x-amz-checksum-crc32", "AAAAAA==")]);
-        let (mut r, _, _) = wrap(&b"hello"[..], expected(&bad, None).unwrap(), None).unwrap();
+        let (mut r, _, _) = wrap(
+            &b"hello"[..],
+            expected(&bad, None).unwrap(),
+            Policy::ClientOrDefault,
+        )
+        .unwrap();
         let err = r.read_to_end(&mut Vec::new()).await.unwrap_err();
         let inner = err.into_inner().unwrap().downcast::<S3Error>().unwrap();
         assert_eq!(inner.code(), &s3s::S3ErrorCode::BadDigest);
     }
 
     #[tokio::test]
-    async fn computes_required_algorithm_without_client_value() {
-        let (mut r, _, slot) = wrap(&b"hello"[..], None, Some(Algo::Sha256)).unwrap();
+    async fn policies_choose_the_stored_algorithm() {
+        // Nothing from the client: the default (CRC64NVME), as in S3.
+        let (mut r, _, slot) = wrap(&b"hello"[..], None, Policy::ClientOrDefault).unwrap();
         r.read_to_end(&mut Vec::new()).await.unwrap();
-        let stored = Stored::decode(slot.unwrap().lock().unwrap().as_deref()).unwrap();
-        assert_eq!(stored.algorithm, "SHA256");
-        assert_eq!(stored.value, B64.encode(Sha256::checksum(b"hello")));
+        assert_eq!(
+            stored(&slot).value,
+            B64.encode(Crc64Nvme::checksum(b"hello"))
+        );
 
+        let (mut r, _, slot) = wrap(&b"hello"[..], None, Policy::Required(Algo::Sha256)).unwrap();
+        r.read_to_end(&mut Vec::new()).await.unwrap();
+        let s = stored(&slot);
+        assert_eq!(s.algorithm, "SHA256");
+        assert_eq!(s.value, B64.encode(Sha256::checksum(b"hello")));
+
+        // Required: a client checksum of another algorithm is rejected up front.
         let crc = headers(&[("x-amz-checksum-crc32", "NhCmhg==")]);
-        assert!(wrap(&b""[..], expected(&crc, None).unwrap(), Some(Algo::Sha1)).is_err());
-        let (_, _, none) = wrap(&b""[..], None, None).unwrap();
-        assert!(none.is_none());
+        assert!(
+            wrap(
+                &b""[..],
+                expected(&crc, None).unwrap(),
+                Policy::Required(Algo::Sha1)
+            )
+            .is_err()
+        );
+        // Always: the client's checksum is still verified, the other algorithm is stored.
+        let (mut r, outcome, slot) = wrap(
+            &b"hello"[..],
+            expected(&crc, None).unwrap(),
+            Policy::Always(Algo::Crc64Nvme),
+        )
+        .unwrap();
+        r.read_to_end(&mut Vec::new()).await.unwrap();
+        assert_eq!(stored(&slot).algorithm, "CRC64NVME");
+        assert_eq!(
+            outcome
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .checksum_crc32
+                .as_deref(),
+            Some("NhCmhg==")
+        );
+        let bad = headers(&[("x-amz-checksum-crc32", "AAAAAA==")]);
+        let (mut r, _, _) = wrap(
+            &b"hello"[..],
+            expected(&bad, None).unwrap(),
+            Policy::Always(Algo::Crc64Nvme),
+        )
+        .unwrap();
+        assert!(r.read_to_end(&mut Vec::new()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn newer_algorithms_are_verified() {
+        for (algo, header) in [
+            (Algo::Md5, "x-amz-checksum-md5"),
+            (Algo::Sha512, "x-amz-checksum-sha512"),
+            (Algo::XxHash64, "x-amz-checksum-xxhash64"),
+            (Algo::XxHash3, "x-amz-checksum-xxhash3"),
+            (Algo::XxHash128, "x-amz-checksum-xxhash128"),
+        ] {
+            let good = B64.encode(algo.digest(b"data"));
+            let h = headers(&[(header, &good)]);
+            let (mut r, _, slot) = wrap(
+                &b"data"[..],
+                expected(&h, None).unwrap(),
+                Policy::ClientOrDefault,
+            )
+            .unwrap();
+            r.read_to_end(&mut Vec::new()).await.unwrap();
+            assert_eq!(stored(&slot).value, good, "{algo:?}");
+            let h = headers(&[(header, "AAAA")]);
+            let (mut r, _, _) = wrap(
+                &b"data"[..],
+                expected(&h, None).unwrap(),
+                Policy::ClientOrDefault,
+            )
+            .unwrap();
+            assert!(r.read_to_end(&mut Vec::new()).await.is_err(), "{algo:?}");
+        }
     }
 
     #[test]
@@ -625,6 +789,32 @@ mod tests {
                 "{algo:?}"
             );
         }
+    }
+
+    #[test]
+    fn uploads_without_an_algorithm_get_a_full_object_crc64nvme() {
+        let parts = [
+            part(1, Algo::Crc64Nvme, b"ab"),
+            part(2, Algo::Crc64Nvme, b"cd"),
+        ];
+        let refs: Vec<&PartRecord> = parts.iter().collect();
+        let mut u = upload(Algo::Crc64Nvme, FULL_OBJECT);
+        u.checksum = None;
+        let out = complete(&u, &refs, &[], &Checksum::default()).unwrap();
+        let s = Stored::decode(out.as_deref()).unwrap();
+        assert_eq!(
+            (s.algorithm.as_str(), s.kind.as_str()),
+            ("CRC64NVME", FULL_OBJECT)
+        );
+        assert_eq!(s.value, B64.encode(Crc64Nvme::checksum(b"abcd")));
+        // Parts from before default checksums existed: no object checksum.
+        let mut old = parts.clone();
+        old[0].checksum = None;
+        let refs: Vec<&PartRecord> = old.iter().collect();
+        assert_eq!(
+            complete(&u, &refs, &[], &Checksum::default()).unwrap(),
+            None
+        );
     }
 
     #[test]
