@@ -237,6 +237,22 @@ pub struct DiskRecord {
     pub free_bytes: u64,
     /// Unix time in milliseconds of the owning node's last heartbeat for this disk.
     pub heartbeat_at: i64,
+    /// Being decommissioned: gets no new copies, and repair moves its copies elsewhere.
+    pub draining: bool,
+    /// When repair noticed the disk was down and queued its objects (unix ms).
+    pub down_since: Option<i64>,
+}
+
+/// Result of [`MetadataStore::remove_disk`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveDiskOutcome {
+    /// `dropped` replica records were deleted with it (only with `force`).
+    Removed {
+        dropped: u64,
+    },
+    NotFound,
+    /// The disk still holds this many copies; drain it and repair first, or force.
+    HasReplicas(u64),
 }
 
 /// Requests and traffic of one tenant in one hour, to be added to the meter.
@@ -332,6 +348,17 @@ pub trait MetadataStore: Send + Sync {
     async fn heartbeat_disk(&self, disk_id: DiskId, free_bytes: u64, now: i64) -> Result<()>;
     /// Every disk of every node.
     async fn list_disks(&self) -> Result<Vec<DiskRecord>>;
+    /// Starts or stops draining a disk. Returns false when the disk does not exist.
+    async fn set_disk_draining(&self, disk_id: DiskId, draining: bool) -> Result<bool>;
+    /// Forgets a disk. Refuses while replica records point at it, unless `force`: then those
+    /// records are dropped and their objects queued for repair (for a disk that is gone).
+    async fn remove_disk(&self, disk_id: DiskId, force: bool) -> Result<RemoveDiskOutcome>;
+    /// Records when repair noticed a disk down (`None` once it is back).
+    async fn set_disk_down_since(&self, disk_id: DiskId, since: Option<i64>) -> Result<()>;
+    /// Queues every object with a copy on the disk for repair; returns how many were queued.
+    async fn enqueue_disk_repairs(&self, disk_id: DiskId) -> Result<u64>;
+    /// Number of copies recorded on a disk.
+    async fn count_disk_replicas(&self, disk_id: DiskId) -> Result<u64>;
 
     // ---- buckets ----
 
@@ -512,6 +539,16 @@ pub trait MetadataStore: Send + Sync {
         after: Option<(Uuid, DiskId)>,
         limit: u32,
     ) -> Result<Vec<ReplicaEntry>>;
+    /// Ids of objects with a copy on `disk_id`, in id order, starting after `after`.
+    async fn list_disk_replicas(
+        &self,
+        disk_id: DiskId,
+        after: Option<Uuid>,
+        limit: u32,
+    ) -> Result<Vec<Uuid>>;
+    /// Ids of objects with a copy on `disk_id` whose id (hyphenated, lowercase) starts with
+    /// `prefix` (up to 8 hex digits).
+    async fn disk_replicas_with_prefix(&self, disk_id: DiskId, prefix: &str) -> Result<Vec<Uuid>>;
     /// Ids of objects whose number of copies on live disks (online, with a heartbeat newer than
     /// `alive_since`) differs from `desired_replicas`, in id order, starting after `after`.
     async fn list_misreplicated(
@@ -520,6 +557,45 @@ pub trait MetadataStore: Send + Sync {
         limit: u32,
         alive_since: i64,
     ) -> Result<Vec<Uuid>>;
+
+    // ---- repair queue ----
+    //
+    // Objects that may be short of copies: written with fewer copies than desired, lost a copy
+    // (`remove_replica`), or had `desired_replicas` changed. The backends queue them
+    // themselves; repair works through the queue instead of scanning every object.
+
+    /// Queues an object for repair (no-op if it is queued already or does not exist).
+    async fn enqueue_repair(&self, object_id: Uuid) -> Result<()>;
+    /// Queued object ids in id order, starting after `after`.
+    async fn list_repair_queue(&self, after: Option<Uuid>, limit: u32) -> Result<Vec<Uuid>>;
+    async fn dequeue_repair(&self, object_id: Uuid) -> Result<()>;
+
+    // ---- leases ----
+
+    /// Takes (or extends) the named lease for `holder` until `now + ttl_ms`. Returns false
+    /// while another holder has an unexpired lease.
+    async fn try_acquire_lease(
+        &self,
+        name: &str,
+        holder: &str,
+        now: i64,
+        ttl_ms: i64,
+    ) -> Result<bool>;
+    /// Gives the lease up if `holder` still has it.
+    async fn release_lease(&self, name: &str, holder: &str) -> Result<()>;
+}
+
+/// The first id (hyphenated) after every id that starts with `prefix`, for range scans.
+pub(crate) fn prefix_end(prefix: &str) -> Result<String> {
+    let n = u64::from_str_radix(prefix, 16)
+        .ok()
+        .filter(|_| !prefix.is_empty() && prefix.len() <= 8)
+        .ok_or_else(|| StoreError::Metadata(format!("bad id prefix {prefix:?}").into()))?;
+    if n + 1 == 1 << (4 * prefix.len()) {
+        // ffff... : anything starting with a non-hex-digit letter sorts after it.
+        return Ok("g".into());
+    }
+    Ok(format!("{:0width$x}", n + 1, width = prefix.len()))
 }
 
 /// Opens the backend named by the URL scheme.

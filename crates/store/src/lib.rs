@@ -19,14 +19,15 @@ pub use crate::{
     error::{Result, StoreError},
     list::{ListPage, ListParams, ListStart},
     meta::{
-        AccessKeyRecord, BucketRecord, NULL_VERSION, ObjectRecord, PartRecord, StorageUsage,
-        TenantRecord, TenantUpdate, UploadRecord, UsageDelta, UsageRow, VersioningMode,
-        WriteCondition,
+        AccessKeyRecord, BucketRecord, DiskRecord, NULL_VERSION, ObjectRecord, PartRecord,
+        RemoveDiskOutcome, StorageUsage, TenantRecord, TenantUpdate, UploadRecord, UsageDelta,
+        UsageRow, VersioningMode, WriteCondition,
     },
     store::{
         ChecksumSlot, CompleteChecksum, CompletedPart, CopySource, CopyWrap, DeleteResult,
-        DiskInfo, HEARTBEAT_INTERVAL, LifecycleReport, MAX_PART_NUMBER, MIN_PART_SIZE, PartsPage,
-        PutObjectRequest, RESERVED_BUCKETS, RepairReport, ScrubReport, Store, UploadsPage,
-        VersionsPage, hour_of, validate_tags,
+        DiskInfo, GcOptions, GcReport, HEARTBEAT_INTERVAL, LifecycleReport, MAX_PART_NUMBER,
+        MIN_PART_SIZE, PartsPage, PutObjectRequest, RESERVED_BUCKETS, RebalanceOptions,
+        RebalanceReport, RepairReport, ScrubReport, Store, UploadsPage, VersionsPage, hour_of,
+        validate_tags,
     },
 };

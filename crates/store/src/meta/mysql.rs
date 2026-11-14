@@ -8,10 +8,10 @@ use uuid::Uuid;
 
 use super::{
     AccessKeyRecord, BucketRecord, BucketSetting, DeleteBucketOutcome, DiskRecord, LifecycleScan,
-    MetadataStore, NULL_VERSION, ObjectRecord, PartRecord, ReplicaEntry, StorageUsage,
-    StoredObject, TenantRecord, TenantUpdate, UploadRecord, UsageDelta, UsageRow, VersioningMode,
-    WriteCondition, decode_disks, decode_tags, decode_user_metadata, encode_disks, encode_tags,
-    encode_user_metadata, is_retryable,
+    MetadataStore, NULL_VERSION, ObjectRecord, PartRecord, RemoveDiskOutcome, ReplicaEntry,
+    StorageUsage, StoredObject, TenantRecord, TenantUpdate, UploadRecord, UsageDelta, UsageRow,
+    VersioningMode, WriteCondition, decode_disks, decode_tags, decode_user_metadata, encode_disks,
+    encode_tags, encode_user_metadata, is_retryable, prefix_end,
 };
 use crate::{
     disk::DiskId,
@@ -26,6 +26,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (4, include_str!("migrations/mysql/0004_checksums.sql")),
     (5, include_str!("migrations/mysql/0005_tags.sql")),
     (6, include_str!("migrations/mysql/0006_timestamps.sql")),
+    (7, include_str!("migrations/mysql/0007_operations.sql")),
 ];
 
 macro_rules! object_select {
@@ -302,6 +303,12 @@ async fn insert_object(
         sqlx::query("INSERT INTO replicas (object_id, disk_id) VALUES (?, ?)")
             .bind(object.id.to_string())
             .bind(disk.to_string())
+            .execute(&mut *conn)
+            .await?;
+    }
+    if !object.delete_marker && replicas.len() < usize::from(object.desired_replicas) {
+        sqlx::query("INSERT INTO repair_queue (object_id) VALUES (?)")
+            .bind(object.id.to_string())
             .execute(&mut *conn)
             .await?;
     }
@@ -798,7 +805,16 @@ impl MetadataStore for MysqlMetadata {
         .bind(object_id.to_string())
         .execute(&self.pool)
         .await?;
-        Ok(res.rows_affected() == 1)
+        if res.rows_affected() == 0 {
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT IGNORE INTO repair_queue (object_id) SELECT id FROM objects WHERE id = ?",
+        )
+        .bind(object_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(true)
     }
 
     async fn set_object_tags(
@@ -999,7 +1015,7 @@ impl MetadataStore for MysqlMetadata {
 
     async fn list_disks(&self) -> Result<Vec<DiskRecord>> {
         sqlx::query(
-            "SELECT id, node_id, path, online, free_bytes, heartbeat_at FROM disks \
+            "SELECT id, node_id, path, online, free_bytes, heartbeat_at, draining, down_since FROM disks \
              ORDER BY node_id, path",
         )
         .fetch_all(&self.pool)
@@ -1013,11 +1029,81 @@ impl MetadataStore for MysqlMetadata {
                 online: r.try_get("online")?,
                 free_bytes: u64::try_from(r.try_get::<i64, _>("free_bytes")?).unwrap_or(0),
                 heartbeat_at: r.try_get("heartbeat_at")?,
+                draining: r.try_get("draining")?,
+                down_since: r.try_get("down_since")?,
             })
         })
         .collect()
     }
 
+    async fn set_disk_draining(&self, disk_id: DiskId, draining: bool) -> Result<bool> {
+        let res = sqlx::query("UPDATE disks SET draining = ? WHERE id = ?")
+            .bind(draining)
+            .bind(disk_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn remove_disk(&self, disk_id: DiskId, force: bool) -> Result<RemoveDiskOutcome> {
+        let id = disk_id.to_string();
+        let mut tx = self.pool.begin().await?;
+        let exists = sqlx::query("SELECT 1 FROM disks WHERE id = ?")
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+        if !exists {
+            return Ok(RemoveDiskOutcome::NotFound);
+        }
+        let copies: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM replicas WHERE disk_id = ?")
+            .bind(&id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let copies = u64::try_from(copies).unwrap_or(0);
+        if copies > 0 && !force {
+            return Ok(RemoveDiskOutcome::HasReplicas(copies));
+        }
+        sqlx::query("INSERT IGNORE INTO repair_queue (object_id) SELECT object_id FROM replicas WHERE disk_id = ?")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM replicas WHERE disk_id = ?")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM disks WHERE id = ?")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(RemoveDiskOutcome::Removed { dropped: copies })
+    }
+
+    async fn set_disk_down_since(&self, disk_id: DiskId, since: Option<i64>) -> Result<()> {
+        sqlx::query("UPDATE disks SET down_since = ? WHERE id = ?")
+            .bind(since)
+            .bind(disk_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn enqueue_disk_repairs(&self, disk_id: DiskId) -> Result<u64> {
+        let res = sqlx::query("INSERT IGNORE INTO repair_queue (object_id) SELECT object_id FROM replicas WHERE disk_id = ?")
+            .bind(disk_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
+    async fn count_disk_replicas(&self, disk_id: DiskId) -> Result<u64> {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM replicas WHERE disk_id = ?")
+            .bind(disk_id.to_string())
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
     async fn create_bucket(&self, bucket: &BucketRecord) -> Result<bool> {
         let res = sqlx::query(
             "INSERT INTO buckets (name, owner, replicas, created_ms) VALUES (?, ?, ?, ?)",
@@ -1074,6 +1160,13 @@ impl MetadataStore for MysqlMetadata {
         if res.rows_affected() == 0 {
             return Ok(false);
         }
+        sqlx::query(
+            "INSERT IGNORE INTO repair_queue (object_id) SELECT id FROM objects WHERE bucket = ? AND replicas_explicit = FALSE AND delete_marker = FALSE AND desired_replicas <> ?",
+        )
+        .bind(name)
+        .bind(i64::from(effective))
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "UPDATE objects SET desired_replicas = ? WHERE bucket = ? AND replicas_explicit = FALSE",
         )
@@ -1309,6 +1402,12 @@ impl MetadataStore for MysqlMetadata {
     }
 
     async fn remove_replica(&self, object_id: Uuid, disk_id: DiskId) -> Result<()> {
+        sqlx::query(
+            "INSERT IGNORE INTO repair_queue (object_id) SELECT id FROM objects WHERE id = ?",
+        )
+        .bind(object_id.to_string())
+        .execute(&self.pool)
+        .await?;
         sqlx::query("DELETE FROM replicas WHERE object_id = ? AND disk_id = ?")
             .bind(object_id.to_string())
             .bind(disk_id.to_string())
@@ -1365,5 +1464,112 @@ impl MetadataStore for MysqlMetadata {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(|r| parse_uuid(r.try_get("id")?)).collect()
+    }
+
+    async fn list_disk_replicas(
+        &self,
+        disk_id: DiskId,
+        after: Option<Uuid>,
+        limit: u32,
+    ) -> Result<Vec<Uuid>> {
+        let rows = sqlx::query(
+            "SELECT object_id FROM replicas WHERE disk_id = ? AND object_id > ? \
+             ORDER BY object_id LIMIT ?",
+        )
+        .bind(disk_id.to_string())
+        .bind(after.map(|u| u.to_string()).unwrap_or_default())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| parse_uuid(r.try_get("object_id")?))
+            .collect()
+    }
+
+    async fn disk_replicas_with_prefix(&self, disk_id: DiskId, prefix: &str) -> Result<Vec<Uuid>> {
+        let end = prefix_end(prefix)?;
+        let rows = sqlx::query(
+            "SELECT object_id FROM replicas WHERE disk_id = ? \
+             AND object_id >= ? AND object_id < ?",
+        )
+        .bind(disk_id.to_string())
+        .bind(prefix)
+        .bind(end)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| parse_uuid(r.try_get("object_id")?))
+            .collect()
+    }
+
+    async fn enqueue_repair(&self, object_id: Uuid) -> Result<()> {
+        sqlx::query(
+            "INSERT IGNORE INTO repair_queue (object_id) SELECT id FROM objects WHERE id = ?",
+        )
+        .bind(object_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_repair_queue(&self, after: Option<Uuid>, limit: u32) -> Result<Vec<Uuid>> {
+        let rows = sqlx::query(
+            "SELECT object_id FROM repair_queue WHERE object_id > ? ORDER BY object_id LIMIT ?",
+        )
+        .bind(after.map(|u| u.to_string()).unwrap_or_default())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| parse_uuid(r.try_get("object_id")?))
+            .collect()
+    }
+
+    async fn dequeue_repair(&self, object_id: Uuid) -> Result<()> {
+        sqlx::query("DELETE FROM repair_queue WHERE object_id = ?")
+            .bind(object_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn try_acquire_lease(
+        &self,
+        name: &str,
+        holder: &str,
+        now: i64,
+        ttl_ms: i64,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE leases SET holder = ?, expires_at = ? \
+             WHERE name = ? AND (holder = ? OR expires_at < ?)",
+        )
+        .bind(holder)
+        .bind(now + ttl_ms)
+        .bind(name)
+        .bind(holder)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 1 {
+            return Ok(true);
+        }
+        let res =
+            sqlx::query("INSERT IGNORE INTO leases (name, holder, expires_at) VALUES (?, ?, ?)")
+                .bind(name)
+                .bind(holder)
+                .bind(now + ttl_ms)
+                .execute(&self.pool)
+                .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn release_lease(&self, name: &str, holder: &str) -> Result<()> {
+        sqlx::query("DELETE FROM leases WHERE name = ? AND holder = ?")
+            .bind(name)
+            .bind(holder)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
