@@ -20,12 +20,12 @@ pub use crate::{
     list::{ListPage, ListParams, ListStart},
     meta::{
         AccessKeyRecord, BucketRecord, DiskRecord, NULL_VERSION, ObjectRecord, PartRecord,
-        RemoveDiskOutcome, StorageUsage, TenantRecord, TenantUpdate, UploadRecord, UsageDelta,
-        UsageRow, VersioningMode, WriteCondition,
+        RemoveDiskOutcome, RepairQueueEntry, StorageUsage, TenantRecord, TenantUpdate,
+        UploadRecord, UsageDelta, UsageRow, VersioningMode, WriteCondition,
     },
     store::{
         ChecksumSlot, CompleteChecksum, CompletedPart, CopySource, CopyWrap, DeleteResult,
-        DiskInfo, GcOptions, GcReport, HEARTBEAT_INTERVAL, LifecycleReport, MAX_PART_NUMBER,
+        DiskInfo, GcOptions, GcReport, HEARTBEAT_INTERVAL, Lease, LifecycleReport, MAX_PART_NUMBER,
         MIN_PART_SIZE, PartsPage, PutObjectRequest, RESERVED_BUCKETS, RebalanceOptions,
         RebalanceReport, RepairReport, ScrubReport, Store, UploadsPage, VersionsPage, hour_of,
         validate_tags,

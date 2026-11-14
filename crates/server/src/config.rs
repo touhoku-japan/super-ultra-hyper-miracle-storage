@@ -92,6 +92,11 @@ pub struct MaintenanceConfig {
     pub gc_grace_secs: u64,
     /// Multipart uploads older than this are aborted.
     pub abort_uploads_after_secs: u64,
+    /// Adds checksums to objects stored before every upload got one (leader only; stops once
+    /// nothing is left). 0 disables.
+    pub checksum_backfill_interval_secs: u64,
+    /// Read rate limit of the checksum backfill, in MiB/s; 0 = unlimited.
+    pub checksum_backfill_mib_per_sec: u64,
     /// How often request/traffic counters are written to the usage meter.
     pub usage_flush_secs: u64,
     /// How often stored bytes are recorded in the usage meter.
@@ -108,6 +113,8 @@ impl Default for MaintenanceConfig {
             gc_interval_secs: 24 * 3600,
             gc_grace_secs: 24 * 3600,
             abort_uploads_after_secs: 7 * 24 * 3600,
+            checksum_backfill_interval_secs: 3600,
+            checksum_backfill_mib_per_sec: 50,
             usage_flush_secs: 60,
             storage_snapshot_secs: 3600,
         }

@@ -10,7 +10,7 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
 - 起動: `cargo run -p suhms-server -- -c config.toml serve`（`GET /suhms/health` で疎通確認。認証不要）
 - 管理: `suhms gen-master-key` / `suhms tenant create|list` / `suhms key create|list|disable|enable` /
   `suhms bucket set-replicas <bucket> <n|default>` / `suhms scrub` / `suhms repair [--quick]` / `suhms gc [--grace-secs N] [--force]` /
-  `suhms rebalance [--margin-gib N] [--max-moves N]` / `suhms disk list|drain|undrain|remove [--force]` / `suhms node drain|undrain|remove [--force]`
+  `suhms rebalance [--margin-gib N] [--max-moves N]` / `suhms checksum-backfill [--max-objects N] [--mib-per-sec N]` / `suhms disk list|drain|undrain|remove [--force]` / `suhms node drain|undrain|remove [--force]`
   - tenant/key/disk/node 系はメタデータ DB だけを触るので、サーバ稼働中に実行してよい
   - ディスクの一時ファイル掃除（`Store::clear_tmp`）は `serve` 起動時のみ。管理コマンドは掃除しない（稼働中サーバの書き込み中ファイルを消さないため）
 
@@ -83,7 +83,9 @@ AWS CLI はホストにシステムインストールしていないので、公
   - repair はキュー駆動: `repair_queue` テーブルに「コピー不足で書いた / `remove_replica` でコピーを失った /
     desired_replicas が変わった」オブジェクトをメタデータ実装自身が積み、`Store::repair` はキューだけを処理して全件は見ない。
     ディスクの死活変化は repair の冒頭で検出（`disks.down_since`）: 落ちたディスク・戻ったディスク（増やしたコピーの削減用）の
-    オブジェクトを一度だけキューに積む。`repair_full` は全件確認（`list_misreplicated`）も行う保険で、既定は週 1
+    オブジェクトを一度だけキューに積む。`repair_full` は全件確認（`list_misreplicated`）も行う保険で、既定は週 1。
+    直せなかったオブジェクト（置き場所がない等）は `repair_queue.retry_at` まで待たせる（10 分から倍々、最大 6 時間。`attempts`）。
+    キューへの再投入（メタデータ側の upsert）と、使えるディスクの増加（repair を実行したプロセスが前回の集合と比較）で待ちを解除
   - repair と rebalance は DB のリース（`leases` テーブル、名前 `replicas`、TTL 60 秒をバックグラウンドで更新）で
     クラスタ全体で同時に 1 つだけ。repair は全ノードでスケジュールし、取れなかったノードは何もしない（`StoreError::Busy`）。
     ジョブ終了時は `Lease::release` で明示的に返す（CLI はプロセス終了で Drop の解放が走らないため）
@@ -96,6 +98,10 @@ AWS CLI はホストにシステムインストールしていないので、公
     メタデータにそのディスクのコピーが 1 件もないのにファイルがある場合は DB の取り違えを疑ってスキップ（`--force` で実行）。
     ID 範囲の検索に `replicas (disk_id, object_id)` インデックスを使う（PG は `COLLATE "C"`）
   - `rebalance`: heartbeat の空き容量で最も空きの少ないディスクから多いディスクへ、差が margin 以下になるまでコピーを移す（手動実行）
+- チェックサムの後付け（`server/src/backfill.rs`）: checksum 列が NULL のオブジェクト（既定チェックサム導入前のもの）を読み、
+  BLAKE3 が一致したときだけ FULL_OBJECT の CRC64NVME を付ける（`Store::read_verified`、`set_object_checksum` は NULL のときだけ更新）。
+  リース `checksums`。leader が `checksum_backfill_interval_secs` ごとに速度制限付きで実行し、何もなくなればそのプロセスでは止まる。
+  SQLite / PG は部分インデックス `objects_without_checksum`、MariaDB は id 順の走査
 - SQLite の書き込みトランザクションは `BEGIN IMMEDIATE`（管理コマンドとサーバの別プロセス間で、読んでから書くトランザクションが
   SQLITE_BUSY で失敗しないように）
 - 商用機能: テナント停止（全 S3 リクエスト拒否）、容量クォータ（論理バイト。30 秒キャッシュなので少し超過しうる）、
@@ -184,8 +190,8 @@ MIT ライセンス。依存クレートは `deny.toml` の許可リスト（MIT
 - PostgreSQL / MariaDB はこのホストでは未検証（CI の `metadata-backends` ジョブでサービスコンテナに対して store のテストを実行）。
   ローカルで試すなら `SUHMS_TEST_POSTGRES=postgres://... cargo test -p suhms-store`（テストごとに DB を作る）
 - `[cluster.tls]` を設定しないとノード間通信は平文 HTTP（HMAC 認証のみ）。その場合はプライベートネットワークか WireGuard 等で保護すること
-- 既定チェックサム（CRC64NVME）は既定チェックサム導入前に保存したオブジェクト・パートには付かない（後から計算し直す処理はない）
-- ノードが長く落ちている間、そのノードのオブジェクトはキューに残り、repair のたびに（置き場所がなくても）1 件ずつ確認される
+- チェックサムの後付けはオブジェクトのみ。既定チェックサム導入前に始まった未完了マルチパートのパートには付かない
+  （完了後のオブジェクトには後付けされる）
 - `repair_full`（週 1）は従来どおり objects の全件走査。数億件規模では間隔を延ばすか止める
 - rebalance は自動実行しない（ディスク・ノード追加後に手動で `suhms rebalance`）
 

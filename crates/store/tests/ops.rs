@@ -381,3 +381,66 @@ async fn rebalance_moves_copies_to_emptier_disks() {
         assert_eq!(env.read("rbl", k).await, k.as_bytes());
     }
 }
+
+#[tokio::test]
+async fn unrepairable_objects_wait_instead_of_being_retried_every_pass() {
+    let env = Env::new(3).await;
+    env.store.create_bucket(OWNER, "wait", None).await.unwrap();
+    env.put("wait", "k", None).await;
+    // With one of three disks draining, a third copy has nowhere to go.
+    let d0 = env.disk_id(0).await;
+    env.store.set_disk_draining(d0, true).await.unwrap();
+    let r = env.store.repair().await.unwrap();
+    assert_eq!((r.copied, r.postponed), (0, 1), "{r:?}");
+    // Not due yet: the next pass does not look at it.
+    let r = env.store.repair().await.unwrap();
+    assert_eq!(r.postponed, 0, "{r:?}");
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let meta = env.store.metadata();
+    assert!(
+        meta.list_repair_queue(None, 10, now)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let later = meta
+        .list_repair_queue(None, 10, now + 11 * 60 * 1000)
+        .await
+        .unwrap();
+    assert_eq!(later.len(), 1);
+    assert_eq!(later[0].attempts, 1);
+
+    // Undraining queues the disk's objects again, which ends the wait.
+    env.store.set_disk_draining(d0, false).await.unwrap();
+    let r = env.store.repair().await.unwrap();
+    assert_eq!(r.postponed, 0, "{r:?}");
+    assert!(
+        meta.list_repair_queue(None, 10, now + 11 * 60 * 1000)
+            .await
+            .unwrap()
+            .is_empty(),
+        "fully replicated objects leave the queue"
+    );
+
+    // New capacity also ends every wait.
+    meta.enqueue_repair(
+        env.store
+            .get_object(OWNER, "wait", "k")
+            .await
+            .unwrap()
+            .object
+            .id,
+    )
+    .await
+    .unwrap();
+    let id = meta.list_repair_queue(None, 10, now).await.unwrap()[0].object_id;
+    meta.postpone_repair(id, now + 3_600_000).await.unwrap();
+    assert_eq!(meta.reset_repair_backoff().await.unwrap(), 1);
+    assert_eq!(
+        meta.list_repair_queue(None, 10, now).await.unwrap().len(),
+        1
+    );
+}

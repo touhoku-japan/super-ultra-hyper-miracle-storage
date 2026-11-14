@@ -35,7 +35,7 @@ const LEASE_RENEW: Duration = Duration::from_secs(20);
 /// Holds a cluster-wide lease while a job runs. A background task renews it; if renewal fails
 /// for longer than the TTL (or another holder took over), [`Lease::check`] fails so the job
 /// stops. Dropping it gives the lease up.
-pub(super) struct Lease {
+pub struct Lease {
     meta: Arc<dyn MetadataStore>,
     name: &'static str,
     holder: String,
@@ -47,13 +47,14 @@ pub(super) struct Lease {
 impl Lease {
     /// Gives the lease up now. (Dropping it does so in the background, which a process that
     /// is about to exit may never get to.)
-    async fn release(mut self) -> Result<()> {
+    pub async fn release(mut self) -> Result<()> {
         self.renew.abort();
         self.released = true;
         self.meta.release_lease(self.name, &self.holder).await
     }
 
-    fn check(&self) -> Result<()> {
+    /// Fails once the lease is lost; long jobs call it between steps and stop on error.
+    pub fn check(&self) -> Result<()> {
         if self.lost.load(Ordering::Relaxed) {
             return Err(StoreError::Busy(format!(
                 "lost the {} lease; another node took over",
@@ -79,6 +80,14 @@ impl Drop for Lease {
             });
         }
     }
+}
+
+/// Wait before retrying an object that could not be repaired: 10 minutes, doubling with
+/// every failed attempt, at most 6 hours.
+fn retry_delay_ms(attempts: u32) -> i64 {
+    const BASE: i64 = 10 * 60 * 1000;
+    const MAX: i64 = 6 * 3600 * 1000;
+    (BASE << attempts.min(6)).min(MAX)
 }
 
 fn ttl_ms(d: Duration) -> i64 {
@@ -177,7 +186,9 @@ fn is_hex(name: &str, len: usize) -> bool {
 }
 
 impl Store {
-    async fn lease(&self, name: &'static str) -> Result<Lease> {
+    /// Takes a cluster-wide lease for a job, renewed in the background until released or
+    /// dropped. Fails with [`StoreError::Busy`] while another process holds it.
+    pub async fn lease(&self, name: &'static str) -> Result<Lease> {
         let ttl = ttl_ms(LEASE_TTL);
         if !self
             .meta
@@ -297,18 +308,28 @@ impl Store {
         self.queue_disk_changes(&mut report).await?;
 
         let mut after = None;
+        let now = now_millis();
         loop {
-            let ids = self.meta.list_repair_queue(after, PAGE).await?;
-            let Some(last) = ids.last() else { break };
-            after = Some(*last);
-            for id in ids {
+            let entries = self.meta.list_repair_queue(after, PAGE, now).await?;
+            let Some(last) = entries.last() else { break };
+            after = Some(last.object_id);
+            for entry in entries {
                 lease.check()?;
+                let id = entry.object_id;
                 let done = match self.meta.get_object_by_id(id).await? {
                     Some(stored) => self.repair_object(&stored, &mut report).await?,
                     None => true,
                 };
                 if done {
                     self.meta.dequeue_repair(id).await?;
+                } else {
+                    // Probably nowhere to put a copy right now (e.g. a node is down): wait
+                    // instead of retrying every pass. Queuing it again, or new capacity, ends
+                    // the wait early.
+                    self.meta
+                        .postpone_repair(id, now_millis() + retry_delay_ms(entry.attempts))
+                        .await?;
+                    report.postponed += 1;
                 }
             }
         }
@@ -337,9 +358,24 @@ impl Store {
         Ok(report)
     }
 
-    /// Queues the objects of disks that went down or came back since the last pass.
+    /// Queues the objects of disks that went down or came back since the last pass, and
+    /// ends the backoff of postponed objects when usable disks were added (or came back).
     async fn queue_disk_changes(&self, report: &mut RepairReport) -> Result<()> {
         let view = self.cluster_disks().await?;
+        let usable: HashSet<DiskId> = view
+            .iter()
+            .filter(|i| i.alive && !i.draining)
+            .map(|i| i.id)
+            .collect();
+        let grew = {
+            let mut last = self.repair_capacity.lock().expect("lock poisoned");
+            let grew = last.as_ref().is_none_or(|l| !usable.is_subset(l));
+            *last = Some(usable);
+            grew
+        };
+        if grew {
+            report.resumed += self.meta.reset_repair_backoff().await?;
+        }
         for record in self.meta.list_disks().await? {
             let alive = view.iter().any(|i| i.id == record.id && i.alive);
             match (alive, record.down_since) {
@@ -753,4 +789,20 @@ async fn has_files(objects: &Path) -> io::Result<bool> {
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retry_delay_ms;
+
+    #[test]
+    fn retry_delay_doubles_up_to_six_hours() {
+        let min = 60 * 1000;
+        assert_eq!(retry_delay_ms(0), 10 * min);
+        assert_eq!(retry_delay_ms(1), 20 * min);
+        assert_eq!(retry_delay_ms(4), 160 * min);
+        assert_eq!(retry_delay_ms(5), 320 * min);
+        assert_eq!(retry_delay_ms(6), 360 * min);
+        assert_eq!(retry_delay_ms(u32::MAX), 360 * min);
+    }
 }
