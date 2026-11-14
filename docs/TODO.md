@@ -13,14 +13,6 @@
 5. **RUSTSEC-2026-0459 の一時除外を外す** — sqlx が libsqlite3-sys >= 0.39 を許容したら更新して `deny.toml` から除外を削除
    （2026-11-13 確認: 最新の sqlx 0.9.0 / sqlx-sqlite 0.9.0 は `libsqlite3-sys >=0.30.1, <0.38.0` のままで未対応）
 
-## 運用面
-
-6. **孤立ファイルの GC** — メタデータ更新前のクラッシュや、オフラインだったディスクに残ったファイルを回収する処理がない
-7. **ディスクの恒久撤去（decommission）** — 撤去したディスクの replicas 行を消す管理操作がない
-8. **ノードの恒久撤去・リバランス** — 既存データを他ノードへ移す処理がない
-9. **repair の多重実行** — 1 ノード（leader）実行が前提。複数ノードで同時に走っても壊れないが、余分なコピーが一時的にできうる
-10. **`list_misreplicated` の全件走査** — 数億オブジェクト規模ではインデックスや差分方式への見直しが必要
-
 ## 済
 
 - ~~11. チェックサムの保存と返却（COMPOSITE / FULL_OBJECT 含む）~~
@@ -31,6 +23,11 @@
 - ~~17. チェックサムの残り~~（未指定時の CRC64NVME、MD5 / SHA512 / xxHash 系）
 - ~~18. ライフサイクルの残り~~（Date、NewerNoncurrentVersions、サイズ・タグフィルタ）
 - ~~19. オブジェクトタグ~~（Put/Get/DeleteObjectTagging、`x-amz-tagging`、タグ数ヘッダ）
+- ~~6. 孤立ファイルの GC~~（`suhms gc`、各ノードで日次。ゴミ箱経由で削除）
+- ~~7. ディスクの恒久撤去~~（`suhms disk drain|remove`）
+- ~~8. ノードの恒久撤去・リバランス~~（`suhms node drain|remove`、`suhms rebalance`）
+- ~~9. repair の多重実行~~（DB のリースで 1 台ずつ。全ノードでスケジュール）
+- ~~10. `list_misreplicated` の全件走査~~（`repair_queue` によるキュー駆動。全件確認は週 1 の `repair_full`）
 - ~~16. AWS CLI での互換確認~~（2026-11-14、AWS CLI 2.40.3 で 66 項目すべて成功。`scripts/awscli-compat.sh`）
 - ~~3. ノード間通信の暗号化~~（`[cluster.tls]` の相互 TLS。`docs/cluster-tls.md`）
 

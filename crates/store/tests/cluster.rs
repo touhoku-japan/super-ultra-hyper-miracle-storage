@@ -369,3 +369,81 @@ async fn multipart_parts_from_different_nodes_assemble_on_every_node() {
         assert_eq!(read(n, "mpu", "big").await, expected);
     }
 }
+
+#[tokio::test]
+async fn draining_a_node_moves_its_copies_to_the_other_nodes() {
+    let c = Cluster::start().await;
+    c.nodes[0]
+        .create_bucket(OWNER, "data", Some(2))
+        .await
+        .unwrap();
+    let keys = ["a", "b", "c", "d", "e", "f"];
+    for k in keys {
+        c.nodes[0]
+            .put_object(OWNER, put("data", k), k.as_bytes())
+            .await
+            .unwrap();
+    }
+    let victim = c.nodes_holding("data", "a").await[0].clone();
+    for (disk, node) in &c.disk_node {
+        if *node == victim {
+            assert!(c.nodes[0].set_disk_draining(*disk, true).await.unwrap());
+        }
+    }
+    c.refresh().await;
+    // Any node may run the repair.
+    let r = c.nodes[1].repair().await.unwrap();
+    assert!(r.drained > 0, "{r:?}");
+    assert_eq!(c.files_on(&victim), 0);
+    for k in keys {
+        let nodes = c.nodes_holding("data", k).await;
+        assert_eq!(nodes.len(), 2, "{k}: {nodes:?}");
+        assert_ne!(nodes[0], nodes[1]);
+        assert!(!nodes.contains(&victim));
+        assert_eq!(read(&c.nodes[0], "data", k).await, k.as_bytes());
+    }
+    for (disk, node) in &c.disk_node {
+        if *node == victim {
+            assert_eq!(
+                c.nodes[0].remove_disk(*disk, false).await.unwrap(),
+                suhms_store::RemoveDiskOutcome::Removed { dropped: 0 }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_node_that_comes_back_gets_its_surplus_copies_trimmed() {
+    let c = Cluster::start().await;
+    c.nodes[0]
+        .create_bucket(OWNER, "data", Some(2))
+        .await
+        .unwrap();
+    for k in ["a", "b", "c", "d"] {
+        c.nodes[0]
+            .put_object(OWNER, put("data", k), k.as_bytes())
+            .await
+            .unwrap();
+    }
+    let victim = c.nodes_holding("data", "a").await[0].clone();
+    let idx = c.nodes.iter().position(|n| n.node_id() == victim).unwrap();
+    c.crash(idx).await;
+    let survivor = &c.nodes[(idx + 1) % 3];
+    let r = survivor.repair().await.unwrap();
+    assert!(r.queued > 0 && r.copied > 0, "{r:?}");
+
+    c.recover(idx).await;
+    let r = survivor.repair().await.unwrap();
+    assert!(r.trimmed > 0, "{r:?}");
+    for k in ["a", "b", "c", "d"] {
+        let nodes = c.nodes_holding("data", k).await;
+        assert_eq!(nodes.len(), 2, "{k}: {nodes:?}");
+        assert_ne!(nodes[0], nodes[1]);
+        assert_eq!(read(survivor, "data", k).await, k.as_bytes());
+    }
+    // Settled: another pass has nothing to do.
+    assert_eq!(
+        survivor.repair().await.unwrap(),
+        suhms_store::RepairReport::default()
+    );
+}

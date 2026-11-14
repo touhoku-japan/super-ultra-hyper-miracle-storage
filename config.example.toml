@@ -78,11 +78,17 @@ requests_per_second = 200.0
 burst = 400.0
 
 [maintenance]
-# repair・放置マルチパートの削除・使用量スナップショットを実行するノード。クラスタでは 1 台だけ true にする
+# ライフサイクル・放置マルチパートの削除・使用量スナップショットを実行するノード。クラスタでは 1 台だけ true にする
 leader = true
+# repair（キューに積まれたオブジェクトの複製数を揃える）。全ノードで動き、DB のリースで同時には 1 台だけ実行する
 repair_interval_secs = 600
+# 全オブジェクトを確認する repair（キューの取りこぼし対策。数億件規模では重い）
+full_repair_interval_secs = 604800
 # 自ノードのディスクの scrub 間隔（0 で無効）
 scrub_interval_secs = 604800
+# 自ノードのディスクの孤立ファイル回収（0 で無効）と猶予（これより新しいファイルは触らない。回収したファイルはこの期間ゴミ箱に残る）
+gc_interval_secs = 86400
+gc_grace_secs = 86400
 abort_uploads_after_secs = 604800
 usage_flush_secs = 60
 storage_snapshot_secs = 3600

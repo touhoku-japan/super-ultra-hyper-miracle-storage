@@ -9,8 +9,9 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
 - Lint: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings`
 - 起動: `cargo run -p suhms-server -- -c config.toml serve`（`GET /suhms/health` で疎通確認。認証不要）
 - 管理: `suhms gen-master-key` / `suhms tenant create|list` / `suhms key create|list|disable|enable` /
-  `suhms bucket set-replicas <bucket> <n|default>` / `suhms scrub` / `suhms repair`
-  - tenant/key 系はメタデータ DB だけを触るので、サーバ稼働中に実行してよい
+  `suhms bucket set-replicas <bucket> <n|default>` / `suhms scrub` / `suhms repair [--quick]` / `suhms gc [--grace-secs N] [--force]` /
+  `suhms rebalance [--margin-gib N] [--max-moves N]` / `suhms disk list|drain|undrain|remove [--force]` / `suhms node drain|undrain|remove [--force]`
+  - tenant/key/disk/node 系はメタデータ DB だけを触るので、サーバ稼働中に実行してよい
   - ディスクの一時ファイル掃除（`Store::clear_tmp`）は `serve` 起動時のみ。管理コマンドは掃除しない（稼働中サーバの書き込み中ファイルを消さないため）
 
 開発ホストは 2 コア / 2.9GB RAM で他アプリと共有しているため、ビルドは `CARGO_BUILD_JOBS=1` で行う。
@@ -78,10 +79,30 @@ AWS CLI はホストにシステムインストールしていないので、公
       完了時は各ディスク上でローカルにパートを連結して普通のオブジェクトファイルにする（パートごとに BLAKE3 を検証）。
       ETag は S3 と同じ `md5(パートMD5の連結)-N`。完了処理中は s3s がキープアライブの空白を送る
 - S3 プロトコル層は `s3s` クレート（Apache-2.0。`openssl` feature は使わない）
+- 運用（`store/src/store/maintenance.rs`）:
+  - repair はキュー駆動: `repair_queue` テーブルに「コピー不足で書いた / `remove_replica` でコピーを失った /
+    desired_replicas が変わった」オブジェクトをメタデータ実装自身が積み、`Store::repair` はキューだけを処理して全件は見ない。
+    ディスクの死活変化は repair の冒頭で検出（`disks.down_since`）: 落ちたディスク・戻ったディスク（増やしたコピーの削減用）の
+    オブジェクトを一度だけキューに積む。`repair_full` は全件確認（`list_misreplicated`）も行う保険で、既定は週 1
+  - repair と rebalance は DB のリース（`leases` テーブル、名前 `replicas`、TTL 60 秒をバックグラウンドで更新）で
+    クラスタ全体で同時に 1 つだけ。repair は全ノードでスケジュールし、取れなかったノードは何もしない（`StoreError::Busy`）。
+    ジョブ終了時は `Lease::release` で明示的に返す（CLI はプロセス終了で Drop の解放が走らないため）
+  - ディスクの撤去: `disk drain`（`disks.draining`）で新規配置から外し、repair が他へコピーしてから draining 側を消す。
+    draining のコピーはノード重複判定に数えないので、同じノードの別ディスクにも移せる。空になったら `disk remove`
+    （コピーが残っていれば拒否。`--force` は壊れたディスク用で、replicas 行を消して再複製キューに積む）。
+    `node drain/remove` はそのノードの全ディスクに同じことをする。撤去するディスクは先にノードの設定から外すこと（起動時に再登録される）
+  - `gc`: 各ノードが自分のディスクを走査し、replicas 行のないオブジェクトファイル（猶予 `gc_grace_secs` より古いもの）を
+    `.suhms/gc/<unix秒>/` へ移し、次回以降に猶予を過ぎたゴミ箱を消す。存在しないアップロードの `.suhms/multipart/` と古い tmp も消す。
+    メタデータにそのディスクのコピーが 1 件もないのにファイルがある場合は DB の取り違えを疑ってスキップ（`--force` で実行）。
+    ID 範囲の検索に `replicas (disk_id, object_id)` インデックスを使う（PG は `COLLATE "C"`）
+  - `rebalance`: heartbeat の空き容量で最も空きの少ないディスクから多いディスクへ、差が margin 以下になるまでコピーを移す（手動実行）
+- SQLite の書き込みトランザクションは `BEGIN IMMEDIATE`（管理コマンドとサーバの別プロセス間で、読んでから書くトランザクションが
+  SQLITE_BUSY で失敗しないように）
 - 商用機能: テナント停止（全 S3 リクエスト拒否）、容量クォータ（論理バイト。30 秒キャッシュなので少し超過しうる）、
   バケット数上限、公開バケット（`[s3] allow_public_buckets` + 管理 API でバケットごとに許可。匿名は GET/HEAD のみ、
   通信量はバケット所有者に課金）、監査ログ（`suhms::audit` ターゲット。ログレベルに関係なく出力）、
-  定期メンテナンス（`[maintenance]`: 全ノードで heartbeat・メーター書き出し・scrub、leader だけ repair・放置マルチパート削除・容量スナップショット）
+  定期メンテナンス（`[maintenance]`: 全ノードで heartbeat・メーター書き出し・scrub・gc・repair（リースで 1 台ずつ）、
+  leader だけライフサイクル・放置マルチパート削除・容量スナップショット）
 - バージョニング: 全バージョンを `objects` テーブルに持つ（`version_id` / `is_latest` / `delete_marker`）。最新版の一意性は
   部分ユニークインデックス（SQLite/PG）、MariaDB は生成列 `latest_key` で担保。`MetadataStore::put_object` が
   `VersioningMode`（Unversioned / Enabled / Suspended）に従って旧版を削除・非現行化し、削除した版を返す（呼び出し側がファイル削除）。
@@ -164,11 +185,9 @@ MIT ライセンス。依存クレートは `deny.toml` の許可リスト（MIT
   ローカルで試すなら `SUHMS_TEST_POSTGRES=postgres://... cargo test -p suhms-store`（テストごとに DB を作る）
 - `[cluster.tls]` を設定しないとノード間通信は平文 HTTP（HMAC 認証のみ）。その場合はプライベートネットワークか WireGuard 等で保護すること
 - 既定チェックサム（CRC64NVME）は既定チェックサム導入前に保存したオブジェクト・パートには付かない（後から計算し直す処理はない）
-- メタデータ更新前にクラッシュした場合や、オフラインのディスク上に残った孤立ファイルの GC がない
-- ディスクの恒久撤去（decommission）時に replicas 行を消す管理操作がない
-- `list_misreplicated` は objects の全件走査。数億件規模では見直しが必要
-- repair は 1 ノードで実行する前提（複数ノードで同時実行しても壊れないが、余分なコピーが一時的にできうる）
-- ノードの恒久撤去・リバランス（既存データの移動）は未対応
+- ノードが長く落ちている間、そのノードのオブジェクトはキューに残り、repair のたびに（置き場所がなくても）1 件ずつ確認される
+- `repair_full`（週 1）は従来どおり objects の全件走査。数億件規模では間隔を延ばすか止める
+- rebalance は自動実行しない（ディスク・ノード追加後に手動で `suhms rebalance`）
 
 ## 設計上の注意
 
