@@ -223,7 +223,7 @@ impl Stored {
         s.and_then(|s| serde_json::from_str(s).ok())
     }
 
-    fn encode(&self) -> String {
+    pub fn encode(&self) -> String {
         serde_json::to_string(self).expect("checksum serializes")
     }
 

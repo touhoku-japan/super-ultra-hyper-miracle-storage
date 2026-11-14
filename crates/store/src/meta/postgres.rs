@@ -8,10 +8,10 @@ use uuid::Uuid;
 
 use super::{
     AccessKeyRecord, BucketRecord, BucketSetting, DeleteBucketOutcome, DiskRecord, LifecycleScan,
-    MetadataStore, NULL_VERSION, ObjectRecord, PartRecord, RemoveDiskOutcome, ReplicaEntry,
-    StorageUsage, StoredObject, TenantRecord, TenantUpdate, UploadRecord, UsageDelta, UsageRow,
-    VersioningMode, WriteCondition, decode_disks, decode_tags, decode_user_metadata, encode_disks,
-    encode_tags, encode_user_metadata, is_retryable, prefix_end,
+    MetadataStore, NULL_VERSION, ObjectRecord, PartRecord, RemoveDiskOutcome, RepairQueueEntry,
+    ReplicaEntry, StorageUsage, StoredObject, TenantRecord, TenantUpdate, UploadRecord, UsageDelta,
+    UsageRow, VersioningMode, WriteCondition, decode_disks, decode_tags, decode_user_metadata,
+    encode_disks, encode_tags, encode_user_metadata, is_retryable, prefix_end,
 };
 use crate::{
     disk::DiskId,
@@ -27,6 +27,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (5, include_str!("migrations/postgres/0005_tags.sql")),
     (6, include_str!("migrations/postgres/0006_timestamps.sql")),
     (7, include_str!("migrations/postgres/0007_operations.sql")),
+    (
+        8,
+        include_str!("migrations/postgres/0008_backoff_backfill.sql"),
+    ),
 ];
 
 macro_rules! object_select {
@@ -801,7 +805,7 @@ impl MetadataStore for PostgresMetadata {
         if res.rows_affected() == 0 {
             return Ok(false);
         }
-        sqlx::query("INSERT INTO repair_queue (object_id) SELECT id FROM objects WHERE id = $1 ON CONFLICT (object_id) DO NOTHING")
+        sqlx::query("INSERT INTO repair_queue (object_id) SELECT id FROM objects WHERE id = $1 ON CONFLICT (object_id) DO UPDATE SET retry_at = NULL, attempts = 0")
             .bind(object_id.to_string())
             .execute(&self.pool)
             .await?;
@@ -1054,7 +1058,7 @@ impl MetadataStore for PostgresMetadata {
         if copies > 0 && !force {
             return Ok(RemoveDiskOutcome::HasReplicas(copies));
         }
-        sqlx::query("INSERT INTO repair_queue (object_id) SELECT object_id FROM replicas WHERE disk_id = $1 ON CONFLICT (object_id) DO NOTHING")
+        sqlx::query("INSERT INTO repair_queue (object_id) SELECT object_id FROM replicas WHERE disk_id = $1 ON CONFLICT (object_id) DO UPDATE SET retry_at = NULL, attempts = 0")
             .bind(&id)
             .execute(&mut *tx)
             .await?;
@@ -1080,7 +1084,7 @@ impl MetadataStore for PostgresMetadata {
     }
 
     async fn enqueue_disk_repairs(&self, disk_id: DiskId) -> Result<u64> {
-        let res = sqlx::query("INSERT INTO repair_queue (object_id) SELECT object_id FROM replicas WHERE disk_id = $1 ON CONFLICT (object_id) DO NOTHING")
+        let res = sqlx::query("INSERT INTO repair_queue (object_id) SELECT object_id FROM replicas WHERE disk_id = $1 ON CONFLICT (object_id) DO UPDATE SET retry_at = NULL, attempts = 0")
             .bind(disk_id.to_string())
             .execute(&self.pool)
             .await?;
@@ -1148,7 +1152,7 @@ impl MetadataStore for PostgresMetadata {
             return Ok(false);
         }
         sqlx::query(
-            "INSERT INTO repair_queue (object_id) SELECT id FROM objects WHERE bucket = $1 AND replicas_explicit = FALSE AND delete_marker = FALSE AND desired_replicas <> $2 ON CONFLICT (object_id) DO NOTHING",
+            "INSERT INTO repair_queue (object_id) SELECT id FROM objects WHERE bucket = $1 AND replicas_explicit = FALSE AND delete_marker = FALSE AND desired_replicas <> $2 ON CONFLICT (object_id) DO UPDATE SET retry_at = NULL, attempts = 0",
         )
         .bind(name)
         .bind(i64::from(effective))
@@ -1390,7 +1394,7 @@ impl MetadataStore for PostgresMetadata {
     }
 
     async fn remove_replica(&self, object_id: Uuid, disk_id: DiskId) -> Result<()> {
-        sqlx::query("INSERT INTO repair_queue (object_id) SELECT id FROM objects WHERE id = $1 ON CONFLICT (object_id) DO NOTHING")
+        sqlx::query("INSERT INTO repair_queue (object_id) SELECT id FROM objects WHERE id = $1 ON CONFLICT (object_id) DO UPDATE SET retry_at = NULL, attempts = 0")
             .bind(object_id.to_string())
             .execute(&self.pool)
             .await?;
@@ -1489,24 +1493,82 @@ impl MetadataStore for PostgresMetadata {
     }
 
     async fn enqueue_repair(&self, object_id: Uuid) -> Result<()> {
-        sqlx::query("INSERT INTO repair_queue (object_id) SELECT id FROM objects WHERE id = $1 ON CONFLICT (object_id) DO NOTHING")
+        sqlx::query("INSERT INTO repair_queue (object_id) SELECT id FROM objects WHERE id = $1 ON CONFLICT (object_id) DO UPDATE SET retry_at = NULL, attempts = 0")
             .bind(object_id.to_string())
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
-    async fn list_repair_queue(&self, after: Option<Uuid>, limit: u32) -> Result<Vec<Uuid>> {
+    async fn list_repair_queue(
+        &self,
+        after: Option<Uuid>,
+        limit: u32,
+        now: i64,
+    ) -> Result<Vec<RepairQueueEntry>> {
         let rows = sqlx::query(
-            "SELECT object_id FROM repair_queue WHERE object_id > $1 ORDER BY object_id LIMIT $2",
+            "SELECT object_id, attempts FROM repair_queue WHERE object_id > $1 \
+             AND (retry_at IS NULL OR retry_at <= $2) ORDER BY object_id LIMIT $3",
+        )
+        .bind(after.map(|u| u.to_string()).unwrap_or_default())
+        .bind(now)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(RepairQueueEntry {
+                    object_id: parse_uuid(r.try_get("object_id")?)?,
+                    attempts: u32::try_from(r.try_get::<i32, _>("attempts")?).unwrap_or(0),
+                })
+            })
+            .collect()
+    }
+
+    async fn postpone_repair(&self, object_id: Uuid, retry_at: i64) -> Result<()> {
+        sqlx::query(
+            "UPDATE repair_queue SET retry_at = $1, attempts = attempts + 1 WHERE object_id = $2",
+        )
+        .bind(retry_at)
+        .bind(object_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn reset_repair_backoff(&self) -> Result<u64> {
+        let res = sqlx::query(
+            "UPDATE repair_queue SET retry_at = NULL, attempts = 0 WHERE retry_at IS NOT NULL",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    async fn list_objects_without_checksum(
+        &self,
+        after: Option<Uuid>,
+        limit: u32,
+    ) -> Result<Vec<Uuid>> {
+        let rows = sqlx::query(
+            "SELECT id FROM objects WHERE checksum IS NULL AND delete_marker = FALSE \
+             AND id > $1 ORDER BY id LIMIT $2",
         )
         .bind(after.map(|u| u.to_string()).unwrap_or_default())
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await?;
-        rows.iter()
-            .map(|r| parse_uuid(r.try_get("object_id")?))
-            .collect()
+        rows.iter().map(|r| parse_uuid(r.try_get("id")?)).collect()
+    }
+
+    async fn set_object_checksum(&self, object_id: Uuid, checksum: &str) -> Result<bool> {
+        let res =
+            sqlx::query("UPDATE objects SET checksum = $1 WHERE id = $2 AND checksum IS NULL")
+                .bind(checksum)
+                .bind(object_id.to_string())
+                .execute(&self.pool)
+                .await?;
+        Ok(res.rows_affected() == 1)
     }
 
     async fn dequeue_repair(&self, object_id: Uuid) -> Result<()> {

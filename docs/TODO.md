@@ -28,6 +28,8 @@
 - ~~8. ノードの恒久撤去・リバランス~~（`suhms node drain|remove`、`suhms rebalance`）
 - ~~9. repair の多重実行~~（DB のリースで 1 台ずつ。全ノードでスケジュール）
 - ~~10. `list_misreplicated` の全件走査~~（`repair_queue` によるキュー駆動。全件確認は週 1 の `repair_full`）
+- ~~既存オブジェクトへのチェックサム後付け~~（`suhms checksum-backfill`、leader で自動実行）
+- ~~直せないオブジェクトの repair 再試行間隔~~（10 分〜6 時間のバックオフ。ディスクの追加・復帰で即再試行）
 - ~~16. AWS CLI での互換確認~~（2026-11-14、AWS CLI 2.40.3 で 66 項目すべて成功。`scripts/awscli-compat.sh`）
 - ~~3. ノード間通信の暗号化~~（`[cluster.tls]` の相互 TLS。`docs/cluster-tls.md`）
 

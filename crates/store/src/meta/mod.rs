@@ -243,6 +243,14 @@ pub struct DiskRecord {
     pub down_since: Option<i64>,
 }
 
+/// An object in the repair queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepairQueueEntry {
+    pub object_id: Uuid,
+    /// Failed repair attempts since it was (re)queued.
+    pub attempts: u32,
+}
+
 /// Result of [`MetadataStore::remove_disk`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoveDiskOutcome {
@@ -566,8 +574,30 @@ pub trait MetadataStore: Send + Sync {
 
     /// Queues an object for repair (no-op if it is queued already or does not exist).
     async fn enqueue_repair(&self, object_id: Uuid) -> Result<()>;
-    /// Queued object ids in id order, starting after `after`.
-    async fn list_repair_queue(&self, after: Option<Uuid>, limit: u32) -> Result<Vec<Uuid>>;
+    /// Queued objects that are due (no `retry_at`, or `retry_at <= now`), in id order,
+    /// starting after `after`. Queuing an object again clears its backoff.
+    async fn list_repair_queue(
+        &self,
+        after: Option<Uuid>,
+        limit: u32,
+        now: i64,
+    ) -> Result<Vec<RepairQueueEntry>>;
+    /// Leaves an object queued but skips it until `retry_at` (unix ms); counts an attempt.
+    async fn postpone_repair(&self, object_id: Uuid, retry_at: i64) -> Result<()>;
+    /// Makes every postponed object due again (e.g. when disks were added or came back).
+    async fn reset_repair_backoff(&self) -> Result<u64>;
+
+    // ---- checksum backfill ----
+
+    /// Ids of objects (not delete markers) without a checksum, in id order, after `after`.
+    async fn list_objects_without_checksum(
+        &self,
+        after: Option<Uuid>,
+        limit: u32,
+    ) -> Result<Vec<Uuid>>;
+    /// Sets an object's checksum if it has none yet. Returns false when the object is gone or
+    /// already has one.
+    async fn set_object_checksum(&self, object_id: Uuid, checksum: &str) -> Result<bool>;
     async fn dequeue_repair(&self, object_id: Uuid) -> Result<()>;
 
     // ---- leases ----

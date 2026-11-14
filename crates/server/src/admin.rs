@@ -209,8 +209,8 @@ pub async fn repair(config: Config, full: bool) -> anyhow::Result<()> {
         store.repair().await?
     };
     println!(
-        "copied {}, trimmed {}, drained {}, queued {}, unrecoverable {}",
-        r.copied, r.trimmed, r.drained, r.queued, r.unrecoverable
+        "copied {}, trimmed {}, drained {}, queued {}, postponed {}, resumed {}, unrecoverable {}",
+        r.copied, r.trimmed, r.drained, r.queued, r.postponed, r.resumed, r.unrecoverable
     );
     if r.unrecoverable > 0 {
         bail!(
@@ -240,6 +240,34 @@ pub async fn gc(config: Config, grace_secs: Option<u64>, force: bool) -> anyhow:
             r.skipped_disks
         );
     }
+    Ok(())
+}
+
+pub async fn checksum_backfill(
+    config: Config,
+    max_objects: Option<u64>,
+    mib_per_sec: Option<u64>,
+) -> anyhow::Result<()> {
+    let store = crate::cluster::open_store(&config).await?;
+    let r = crate::backfill::backfill_checksums(
+        &store,
+        crate::backfill::BackfillOptions {
+            max_objects,
+            bytes_per_sec: mib_per_sec.map(|m| m << 20),
+        },
+    )
+    .await?;
+    println!(
+        "added checksums to {} objects; corrupt {}, unreadable {}{}",
+        r.updated,
+        r.corrupt,
+        r.failed,
+        if r.remaining {
+            " (stopped at --max-objects; run again for the rest)"
+        } else {
+            ""
+        }
+    );
     Ok(())
 }
 
