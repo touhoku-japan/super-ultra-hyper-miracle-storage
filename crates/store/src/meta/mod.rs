@@ -175,6 +175,8 @@ pub struct ObjectRecord {
     /// Checksum of the content (`x-amz-checksum-*`), opaque to the store (JSON written by
     /// the server).
     pub checksum: Option<String>,
+    /// Object tags (S3 tagging).
+    pub tags: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +194,8 @@ pub struct UploadRecord {
     pub created_at: i64,
     /// Checksum algorithm and type requested at creation (opaque to the store).
     pub checksum: Option<String>,
+    /// Tags for the completed object.
+    pub tags: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -408,6 +412,12 @@ pub trait MetadataStore: Send + Sync {
         until: Option<i64>,
     ) -> Result<bool>;
     async fn set_legal_hold(&self, object_id: Uuid, on: bool) -> Result<bool>;
+    /// Replaces an object version's tags. Returns false when it no longer exists.
+    async fn set_object_tags(
+        &self,
+        object_id: Uuid,
+        tags: &BTreeMap<String, String>,
+    ) -> Result<bool>;
     /// Changes an object version's storage class and desired replica count (lifecycle
     /// transition); repair then adds or removes copies. Returns false when it no longer exists.
     async fn set_object_storage_class(
@@ -544,6 +554,15 @@ pub(crate) fn encode_disks(d: &[DiskId]) -> String {
 
 pub(crate) fn decode_disks(s: &str) -> Result<Vec<DiskId>> {
     serde_json::from_str(s).map_err(|e| StoreError::Metadata(Box::new(e)))
+}
+
+/// Tags are stored as a JSON map; no tags is NULL.
+pub(crate) fn encode_tags(t: &BTreeMap<String, String>) -> Option<String> {
+    (!t.is_empty()).then(|| encode_user_metadata(t))
+}
+
+pub(crate) fn decode_tags(s: Option<String>) -> Result<BTreeMap<String, String>> {
+    s.map_or_else(|| Ok(BTreeMap::new()), |s| decode_user_metadata(&s))
 }
 
 pub(crate) fn decode_user_metadata(s: &str) -> Result<BTreeMap<String, String>> {

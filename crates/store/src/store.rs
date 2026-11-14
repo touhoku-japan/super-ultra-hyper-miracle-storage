@@ -97,6 +97,8 @@ pub struct PutObjectRequest {
     pub checksum: Option<ChecksumSlot>,
     /// For multipart uploads: checksum algorithm and type requested at creation.
     pub multipart_checksum: Option<String>,
+    /// Object tags. On copies, `None` keeps the source's tags (`x-amz-tagging-directive: COPY`).
+    pub tags: Option<BTreeMap<String, String>>,
     /// Object Lock retention for the new object (needs a lock-enabled bucket); without it the
     /// bucket's default retention applies.
     pub lock_mode: Option<String>,
@@ -232,6 +234,44 @@ fn check_unlocked(o: &ObjectRecord, bypass_governance: bool) -> Result<()> {
         && (mode == lock::COMPLIANCE || !bypass_governance)
     {
         return Err(StoreError::ObjectLocked);
+    }
+    Ok(())
+}
+
+/// S3's limits on object tags.
+pub const MAX_TAGS: usize = 10;
+const MAX_TAG_KEY: usize = 128;
+const MAX_TAG_VALUE: usize = 256;
+
+/// Checks a tag set against S3's rules: at most [`MAX_TAGS`] tags, keys of 1-128 and values of
+/// 0-256 characters, made of letters, digits, whitespace and `_ . : / = + - @`.
+pub fn validate_tags(tags: &BTreeMap<String, String>) -> Result<()> {
+    if tags.len() > MAX_TAGS {
+        return Err(StoreError::InvalidTag(format!(
+            "an object can have at most {MAX_TAGS} tags"
+        )));
+    }
+    let allowed = |s: &str| {
+        s.chars()
+            .all(|c| c.is_alphanumeric() || c.is_whitespace() || "_.:/=+-@".contains(c))
+    };
+    for (k, v) in tags {
+        let (kl, vl) = (k.chars().count(), v.chars().count());
+        if kl == 0 || kl > MAX_TAG_KEY {
+            return Err(StoreError::InvalidTag(format!(
+                "tag keys must be 1-{MAX_TAG_KEY} characters"
+            )));
+        }
+        if vl > MAX_TAG_VALUE {
+            return Err(StoreError::InvalidTag(format!(
+                "tag values must be at most {MAX_TAG_VALUE} characters"
+            )));
+        }
+        if !allowed(k) || !allowed(v) {
+            return Err(StoreError::InvalidTag(format!(
+                "tag {k:?} contains characters S3 does not allow"
+            )));
+        }
     }
     Ok(())
 }
@@ -722,6 +762,8 @@ impl Store {
     ) -> Result<ObjectRecord> {
         validate_key(&req.key)?;
         Self::check_user_metadata(&req.user_metadata)?;
+        let tags = req.tags.clone().unwrap_or_default();
+        validate_tags(&tags)?;
         if req.condition != WriteCondition::None {
             // Cheap early exit; the metadata store re-checks atomically at commit.
             let latest = self.meta.get_object(&req.bucket, &req.key).await?;
@@ -773,6 +815,7 @@ impl Store {
                 lock_until,
                 legal_hold: req.legal_hold,
                 checksum: take_slot(req.checksum.as_ref()),
+                tags,
             },
             replicas: outcome.written,
         };
@@ -870,6 +913,9 @@ impl Store {
             dest.content_type.clone_from(&source.object.content_type);
             dest.user_metadata.clone_from(&source.object.user_metadata);
         }
+        if dest.tags.is_none() {
+            dest.tags = Some(source.object.tags.clone());
+        }
         dest.content_md5 = None;
         let mut reader = self.read_object(&source, 0..source.object.size).await?;
         if let Some(wrap) = wrap {
@@ -890,6 +936,8 @@ impl Store {
     ) -> Result<UploadRecord> {
         validate_key(&req.key)?;
         Self::check_user_metadata(&req.user_metadata)?;
+        let tags = req.tags.clone().unwrap_or_default();
+        validate_tags(&tags)?;
         let bucket = self.owned_bucket(owner, &req.bucket).await?;
         let (replicas, explicit) = self
             .resolve_replicas(&bucket, req.storage_class.as_deref())
@@ -914,6 +962,7 @@ impl Store {
             disks: targets.iter().map(DiskRef::id).collect(),
             created_at: now_millis(),
             checksum: req.multipart_checksum,
+            tags,
         };
         self.meta.create_upload(&upload).await?;
         Ok(upload)
@@ -1366,6 +1415,7 @@ impl Store {
                 lock_until,
                 legal_hold: false,
                 checksum: object_checksum,
+                tags: upload.tags.clone(),
             },
             replicas: written.iter().map(|(d, _)| *d).collect(),
         };
@@ -1794,6 +1844,41 @@ impl Store {
         Ok(())
     }
 
+    /// Replaces the tags of an object version (the latest when `version_id` is `None`).
+    /// Returns the version that was tagged.
+    pub async fn set_object_tags(
+        &self,
+        owner: &str,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        tags: &BTreeMap<String, String>,
+    ) -> Result<ObjectRecord> {
+        validate_tags(tags)?;
+        let v = self.owned_version(owner, bucket, key, version_id).await?;
+        if !self.meta.set_object_tags(v.object.id, tags).await? {
+            return Err(StoreError::NoSuchKey {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+            });
+        }
+        Ok(v.object)
+    }
+
+    /// An object version with its tags.
+    pub async fn object_tags(
+        &self,
+        owner: &str,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> Result<ObjectRecord> {
+        Ok(self
+            .owned_version(owner, bucket, key, version_id)
+            .await?
+            .object)
+    }
+
     pub async fn set_legal_hold(
         &self,
         owner: &str,
@@ -1887,7 +1972,7 @@ impl Store {
                         .lifecycle_scan(&b.name, &rule.prefix, LifecycleScan::Current, cut)
                         .await?
                         .into_iter()
-                        .filter(|o| rule.matches_size(o.size, false))
+                        .filter(|o| rule.matches(o))
                     {
                         self.delete_object(&b.owner, &b.name, &o.key).await?;
                         report.expired += 1;
@@ -1899,7 +1984,7 @@ impl Store {
                         .await?;
                     let mut ranks = HashMap::new();
                     for o in candidates {
-                        if !rule.matches_size(o.size, o.delete_marker)
+                        if !rule.matches(&o)
                             || !self
                                 .beyond_newer(
                                     &b.name,
@@ -2052,7 +2137,7 @@ impl Store {
                 if age_from < older_cutoff
                     || o.delete_marker
                     || o.storage_class.as_deref() == Some(&t.storage_class)
-                    || !rule.matches_size(o.size, false)
+                    || !rule.matches(&o)
                 {
                     continue;
                 }

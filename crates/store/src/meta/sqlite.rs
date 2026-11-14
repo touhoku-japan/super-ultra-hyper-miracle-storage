@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::{str::FromStr, time::Duration};
 
 use async_trait::async_trait;
@@ -12,7 +13,8 @@ use super::{
     AccessKeyRecord, BucketRecord, BucketSetting, DeleteBucketOutcome, DiskRecord, LifecycleScan,
     MetadataStore, NULL_VERSION, ObjectRecord, PartRecord, ReplicaEntry, StorageUsage,
     StoredObject, TenantRecord, TenantUpdate, UploadRecord, UsageDelta, UsageRow, VersioningMode,
-    WriteCondition, decode_disks, decode_user_metadata, encode_disks, encode_user_metadata,
+    WriteCondition, decode_disks, decode_tags, decode_user_metadata, encode_disks, encode_tags,
+    encode_user_metadata,
 };
 use crate::{
     disk::DiskId,
@@ -27,6 +29,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (4, include_str!("migrations/sqlite/0004_commercial.sql")),
     (5, include_str!("migrations/sqlite/0005_versioning.sql")),
     (6, include_str!("migrations/sqlite/0006_checksums.sql")),
+    (7, include_str!("migrations/sqlite/0007_tags.sql")),
 ];
 
 macro_rules! object_select {
@@ -34,7 +37,7 @@ macro_rules! object_select {
         concat!(
             "SELECT id, bucket, object_key, size, etag, blake3, content_type, storage_class, ",
             "user_metadata, desired_replicas, replicas_explicit, created_at, version_id, ",
-            "is_latest, delete_marker, noncurrent_at, lock_mode, lock_until, legal_hold, checksum ",
+            "is_latest, delete_marker, noncurrent_at, lock_mode, lock_until, legal_hold, checksum, tags ",
             "FROM objects WHERE ",
             $where
         )
@@ -136,6 +139,7 @@ fn object_from_row(row: &SqliteRow) -> Result<ObjectRecord> {
         lock_until: row.try_get("lock_until")?,
         legal_hold: row.try_get("legal_hold")?,
         checksum: row.try_get("checksum")?,
+        tags: decode_tags(row.try_get("tags")?)?,
     })
 }
 
@@ -160,7 +164,7 @@ macro_rules! upload_select {
     ($where:literal) => {
         concat!(
             "SELECT id, bucket, object_key, content_type, storage_class, user_metadata, ",
-            "desired_replicas, replicas_explicit, disks, created_at, checksum FROM multipart_uploads WHERE ",
+            "desired_replicas, replicas_explicit, disks, created_at, checksum, tags FROM multipart_uploads WHERE ",
             $where
         )
     };
@@ -189,6 +193,7 @@ fn upload_from_row(r: &SqliteRow) -> Result<UploadRecord> {
         disks: decode_disks(r.try_get("disks")?)?,
         created_at: r.try_get("created_at")?,
         checksum: r.try_get("checksum")?,
+        tags: decode_tags(r.try_get("tags")?)?,
     })
 }
 
@@ -231,8 +236,8 @@ async fn insert_object(
     sqlx::query(
         "INSERT INTO objects (id, bucket, object_key, size, etag, blake3, content_type, \
          storage_class, user_metadata, desired_replicas, replicas_explicit, created_at, \
-         version_id, is_latest, delete_marker, lock_mode, lock_until, legal_hold, checksum) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, ?, ?, ?, ?, ?)",
+         version_id, is_latest, delete_marker, lock_mode, lock_until, legal_hold, checksum, tags) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, ?, ?, ?, ?, ?, ?)",
     )
     .bind(object.id.to_string())
     .bind(&object.bucket)
@@ -252,6 +257,7 @@ async fn insert_object(
     .bind(object.lock_until)
     .bind(object.legal_hold)
     .bind(&object.checksum)
+    .bind(encode_tags(&object.tags))
     .execute(&mut *conn)
     .await?;
     for disk in replicas {
@@ -729,6 +735,20 @@ impl MetadataStore for SqliteMetadata {
         Ok(res.rows_affected() == 1)
     }
 
+    async fn set_object_tags(
+        &self,
+        object_id: Uuid,
+        tags: &BTreeMap<String, String>,
+    ) -> Result<bool> {
+        let _guard = self.write_lock.lock().await;
+        let res = sqlx::query("UPDATE objects SET tags = ? WHERE id = ?")
+            .bind(encode_tags(tags))
+            .bind(object_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
     async fn set_legal_hold(&self, object_id: Uuid, on: bool) -> Result<bool> {
         let _guard = self.write_lock.lock().await;
         let res = sqlx::query("UPDATE objects SET legal_hold = ? WHERE id = ?")
@@ -1105,8 +1125,8 @@ impl MetadataStore for SqliteMetadata {
         }
         sqlx::query(
             "INSERT INTO multipart_uploads (id, bucket, object_key, content_type, storage_class, \
-             user_metadata, desired_replicas, replicas_explicit, disks, created_at, checksum) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             user_metadata, desired_replicas, replicas_explicit, disks, created_at, checksum, tags) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(upload.id.to_string())
         .bind(&upload.bucket)
@@ -1119,6 +1139,7 @@ impl MetadataStore for SqliteMetadata {
         .bind(encode_disks(&upload.disks))
         .bind(upload.created_at)
         .bind(&upload.checksum)
+        .bind(encode_tags(&upload.tags))
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;

@@ -771,6 +771,7 @@ mod tests {
                 }
                 .encode(),
             ),
+            tags: Default::default(),
         }
     }
 

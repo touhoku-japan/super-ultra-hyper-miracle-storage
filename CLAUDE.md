@@ -85,7 +85,11 @@ release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレ
   （`set_object_storage_class` で desired_replicas を変え、repair がコピーを増減）。複数の transition は日数が最大の
   ものだけを適用。設定時に未知のストレージクラスは InvalidStorageClass。期限・移行は日数か Date（その日時以降は全対象）、
   フィルタは prefix と ObjectSizeGreaterThan / LessThan（`And` 可）、NewerNoncurrentVersions（キーごとに新しい非現行版を
-  N 個残す）に対応。タグでのフィルタはオブジェクトタグ自体が無いので NotImplemented
+  N 個残す）、タグ（指定したタグをすべて持つものだけ。ExpiredObjectDeleteMarker との併用は S3 と同じく不可）に対応
+- オブジェクトタグ: objects / multipart_uploads の `tags` 列（JSON、空は NULL）。版ごとに持つ。`x-amz-tagging`（PUT・
+  マルチパート開始・`x-amz-tagging-directive: REPLACE` のコピー）、Put/Get/DeleteObjectTagging（versionId 可）、
+  GET/HEAD の `x-amz-tagging-count`。コピーの既定（COPY）はコピー元のタグを引き継ぐ。制限は S3 と同じ
+  （10 個まで、キー 1〜128 文字・値 256 文字まで、文字種は英数字・空白・`_ . : / = + - @`。`store::validate_tags`）
 - 書き込みの前提条件（`meta::WriteCondition`）: PUT / CompleteMultipartUpload の `If-None-Match: *` と `If-Match`
   （ETag か `*`）。メタデータのトランザクション内で最新版に対して判定（無ければ NoSuchKey、不一致は 412）
 - versionId 付きのコピー元（CopyObject / UploadPartCopy）。応答に `x-amz-copy-source-version-id`。
@@ -103,7 +107,7 @@ release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレ
   CopyObject（COPY/REPLACE）, Create/UploadPart/UploadPartCopy/Complete/Abort MultipartUpload, ListParts, ListMultipartUploads,
   条件付きリクエスト（GET/HEAD の If-Match / If-None-Match / If-(Un)Modified-Since、PUT / CompleteMultipartUpload の
   If-Match / If-None-Match: *）, チェックサム（CRC32 / CRC32C / CRC64NVME / SHA1 / SHA256 / SHA512 / MD5 / xxHash 系、
-  マルチパートの COMPOSITE / FULL_OBJECT、未指定時の CRC64NVME）, versionId 付きコピー元, ListObjectVersions / ListMultipartUploads の delimiter,
+  マルチパートの COMPOSITE / FULL_OBJECT、未指定時の CRC64NVME）, Put/Get/DeleteObjectTagging, versionId 付きコピー元, ListObjectVersions / ListMultipartUploads の delimiter,
   Put/GetBucketVersioning, ListObjectVersions, versionId 付き GET/HEAD/DELETE, Put/Get/DeleteBucketLifecycleConfiguration,
   Put/GetObjectLockConfiguration, Put/GetObjectRetention, Put/GetObjectLegalHold, Put/Get/DeleteBucketCors
 
@@ -149,7 +153,6 @@ MIT ライセンス。依存クレートは `deny.toml` の許可リスト（MIT
 - PostgreSQL / MariaDB はこのホストでは未検証（CI の `metadata-backends` ジョブでサービスコンテナに対して store のテストを実行）。
   ローカルで試すなら `SUHMS_TEST_POSTGRES=postgres://... cargo test -p suhms-store`（テストごとに DB を作る）
 - `[cluster.tls]` を設定しないとノード間通信は平文 HTTP（HMAC 認証のみ）。その場合はプライベートネットワークか WireGuard 等で保護すること
-- オブジェクトタグ（Put/GetObjectTagging）が無いので、ライフサイクルのタグフィルタも未対応
 - 既定チェックサム（CRC64NVME）は既定チェックサム導入前に保存したオブジェクト・パートには付かない（後から計算し直す処理はない）
 - メタデータ更新前にクラッシュした場合や、オフラインのディスク上に残った孤立ファイルの GC がない
 - ディスクの恒久撤去（decommission）時に replicas 行を消す管理操作がない

@@ -620,9 +620,117 @@ async fn lifecycle_dates_sizes_and_newer_versions_round_trip() {
     assert_eq!(xml_values(&xml, "Date").len(), 1, "{xml}");
     assert!(xml_values(&xml, "Date")[0].starts_with("2030-01-01T00:00:00"));
 
-    // Tag filters are not supported (no object tagging).
+    // Tag filters round-trip; they cannot be combined with ExpiredObjectDeleteMarker.
     let tagged = "<LifecycleConfiguration><Rule><ID>t</ID><Filter><Tag><Key>a</Key><Value>b</Value>\
                   </Tag></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration>\
                   </Rule></LifecycleConfiguration>";
-    assert_eq!(put(tagged.to_owned()).await.status, 501);
+    let resp = put(tagged.to_owned()).await;
+    assert_eq!(resp.status, 200, "{}", resp.text());
+    let xml = srv
+        .s3(&c, "GET", "/lcx", &[("lifecycle", "")], &[], vec![])
+        .await
+        .text();
+    assert_eq!(xml_values(&xml, "Key"), vec!["a"], "{xml}");
+    assert_eq!(xml_values(&xml, "Value"), vec!["b"]);
+    let both = "<LifecycleConfiguration><Rule><ID>t</ID><Filter><Tag><Key>a</Key><Value>b</Value>\
+                </Tag></Filter><Status>Enabled</Status><Expiration>\
+                <ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>\
+                </Rule></LifecycleConfiguration>";
+    assert_eq!(put(both.to_owned()).await.status, 400);
+}
+
+#[tokio::test]
+async fn object_tagging_over_http() {
+    let srv = Server::start(1).await;
+    let (_, c) = srv.tenant("alice").await;
+    srv.s3(&c, "PUT", "/tags", &[], &[], vec![]).await;
+    let resp = srv
+        .s3(
+            &c,
+            "PUT",
+            "/tags/a",
+            &[],
+            &[("x-amz-tagging", "env=prod&note=hello%20world")],
+            b"x".to_vec(),
+        )
+        .await;
+    assert_eq!(resp.status, 200, "{}", resp.text());
+    let resp = srv.s3(&c, "HEAD", "/tags/a", &[], &[], vec![]).await;
+    assert_eq!(resp.header("x-amz-tagging-count"), Some("2"));
+    let xml = srv
+        .s3(&c, "GET", "/tags/a", &[("tagging", "")], &[], vec![])
+        .await
+        .text();
+    assert_eq!(xml_values(&xml, "Key"), vec!["env", "note"], "{xml}");
+    assert_eq!(xml_values(&xml, "Value"), vec!["prod", "hello world"]);
+
+    // Copy keeps tags by default and replaces them with REPLACE.
+    srv.s3(
+        &c,
+        "PUT",
+        "/tags/b",
+        &[],
+        &[("x-amz-copy-source", "/tags/a")],
+        vec![],
+    )
+    .await;
+    let resp = srv.s3(&c, "HEAD", "/tags/b", &[], &[], vec![]).await;
+    assert_eq!(resp.header("x-amz-tagging-count"), Some("2"));
+    srv.s3(
+        &c,
+        "PUT",
+        "/tags/c",
+        &[],
+        &[
+            ("x-amz-copy-source", "/tags/a"),
+            ("x-amz-tagging-directive", "REPLACE"),
+            ("x-amz-tagging", "only=one"),
+        ],
+        vec![],
+    )
+    .await;
+    let resp = srv.s3(&c, "HEAD", "/tags/c", &[], &[], vec![]).await;
+    assert_eq!(resp.header("x-amz-tagging-count"), Some("1"));
+
+    // PutObjectTagging replaces the set; DeleteObjectTagging empties it.
+    let body = "<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>";
+    let resp = srv
+        .s3(
+            &c,
+            "PUT",
+            "/tags/a",
+            &[("tagging", "")],
+            &[("content-md5", &md5_b64(body))],
+            body.as_bytes().to_vec(),
+        )
+        .await;
+    assert_eq!(resp.status, 200, "{}", resp.text());
+    let xml = srv
+        .s3(&c, "GET", "/tags/a", &[("tagging", "")], &[], vec![])
+        .await
+        .text();
+    assert_eq!(xml_values(&xml, "Key"), vec!["k"]);
+    let resp = srv
+        .s3(&c, "DELETE", "/tags/a", &[("tagging", "")], &[], vec![])
+        .await;
+    assert_eq!(resp.status, 204);
+    let resp = srv.s3(&c, "HEAD", "/tags/a", &[], &[], vec![]).await;
+    assert_eq!(resp.header("x-amz-tagging-count"), None);
+
+    // Invalid tag sets are rejected.
+    let resp = srv
+        .s3(
+            &c,
+            "PUT",
+            "/tags/d",
+            &[],
+            &[("x-amz-tagging", "a=1&a=2")],
+            b"x".to_vec(),
+        )
+        .await;
+    assert_eq!(resp.error_code().as_deref(), Some("InvalidTag"));
+    let resp = srv
+        .s3(&c, "GET", "/tags/missing", &[("tagging", "")], &[], vec![])
+        .await;
+    assert_eq!(resp.status, 404);
 }
