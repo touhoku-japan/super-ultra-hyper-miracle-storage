@@ -74,12 +74,22 @@ impl Default for LimitsConfig {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MaintenanceConfig {
-    /// Run cluster-wide jobs (repair, upload cleanup, usage snapshots) on this node. Enable it
-    /// on exactly one node of a cluster.
+    /// Run cluster-wide jobs (lifecycle, upload cleanup, usage snapshots) on this node. Enable
+    /// it on exactly one node of a cluster. (Repair runs on every node; a lease in the
+    /// metadata database lets only one node at a time do it.)
     pub leader: bool,
+    /// Repair of queued objects (written short of copies, lost a copy, on a disk that went
+    /// down or is draining, ...); 0 disables.
     pub repair_interval_secs: u64,
+    /// Repair that also checks every object (a safety net for the queue); 0 disables.
+    pub full_repair_interval_secs: u64,
     /// Every node scrubs its own disks; 0 disables.
     pub scrub_interval_secs: u64,
+    /// Every node collects orphaned files on its own disks; 0 disables.
+    pub gc_interval_secs: u64,
+    /// Files younger than this are never collected, and collected files stay in the disk's
+    /// trash (`.suhms/gc/`) this long.
+    pub gc_grace_secs: u64,
     /// Multipart uploads older than this are aborted.
     pub abort_uploads_after_secs: u64,
     /// How often request/traffic counters are written to the usage meter.
@@ -93,7 +103,10 @@ impl Default for MaintenanceConfig {
         Self {
             leader: true,
             repair_interval_secs: 600,
+            full_repair_interval_secs: 7 * 24 * 3600,
             scrub_interval_secs: 7 * 24 * 3600,
+            gc_interval_secs: 24 * 3600,
+            gc_grace_secs: 24 * 3600,
             abort_uploads_after_secs: 7 * 24 * 3600,
             usage_flush_secs: 60,
             storage_snapshot_secs: 3600,

@@ -5,6 +5,7 @@
 //! <root>/.suhms/format.json      disk identity (stable across remounts/reordering)
 //! <root>/.suhms/tmp/<uuid>        in-progress writes, cleared on startup
 //! <root>/.suhms/multipart/<upload>/<blob-id>  parts of an in-progress multipart upload
+//! <root>/.suhms/gc/<unix-secs>/<blob-id>      orphaned files collected by GC (deleted later)
 //! <root>/objects/ab/cd/<blob-id>  object contents, stored verbatim
 //! ```
 
@@ -145,6 +146,26 @@ impl Disk {
         })
         .await
         .expect("cleanup task panicked")
+    }
+
+    /// `<root>/.suhms`: the disk's own bookkeeping.
+    pub fn meta_dir(&self) -> PathBuf {
+        self.root.join(META_DIR)
+    }
+
+    /// `<root>/objects`: object files.
+    pub fn objects_dir(&self) -> PathBuf {
+        self.root.join(OBJECTS_DIR)
+    }
+
+    /// Parent of every multipart upload's directory.
+    pub fn multipart_dir(&self) -> PathBuf {
+        self.root.join(META_DIR).join(MULTIPART_DIR)
+    }
+
+    /// In-progress writes.
+    pub fn tmp_dir(&self) -> PathBuf {
+        self.root.join(META_DIR).join(TMP_DIR)
     }
 
     /// Final location of a blob's file on this disk.

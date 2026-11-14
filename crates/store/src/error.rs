@@ -97,6 +97,10 @@ pub enum StoreError {
     #[error("replica count {requested} is invalid (allowed: 1..={max})")]
     InvalidReplicaCount { requested: u8, max: u8 },
 
+    /// A cluster-wide maintenance job is already running elsewhere (its lease is held).
+    #[error("{0}")]
+    Busy(String),
+
     #[error("only {written} of the required {required} replicas could be written")]
     WriteQuorum { required: usize, written: usize },
 

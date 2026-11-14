@@ -37,8 +37,36 @@ enum Command {
     Bucket(admin::BucketCmd),
     /// Re-hash every copy on this node's disks and drop missing or corrupt ones
     Scrub,
-    /// Bring every object to its desired number of copies
-    Repair,
+    /// Bring every object to its desired number of copies (checks every object unless --quick)
+    Repair {
+        /// Only the repair queue (what the server does every repair_interval_secs)
+        #[arg(long)]
+        quick: bool,
+    },
+    /// Collect files on this node's disks that no metadata refers to
+    Gc {
+        /// Leave files younger than this alone (default: [maintenance] gc_grace_secs)
+        #[arg(long)]
+        grace_secs: Option<u64>,
+        /// Also on disks for which the metadata records no copies at all
+        #[arg(long)]
+        force: bool,
+    },
+    /// Move copies from the fullest disks to the emptiest ones (after adding disks or nodes)
+    Rebalance {
+        /// Stop when free space differs by at most this many GiB
+        #[arg(long, default_value_t = 10)]
+        margin_gib: u64,
+        /// Stop after moving this many copies
+        #[arg(long)]
+        max_moves: Option<u64>,
+    },
+    /// Manage disks (draining, removal)
+    #[command(subcommand)]
+    Disk(admin::DiskCmd),
+    /// Drain or remove every disk of a node
+    #[command(subcommand)]
+    Node(admin::NodeCmd),
 }
 
 #[tokio::main]
@@ -57,7 +85,14 @@ async fn main() -> anyhow::Result<()> {
         Command::Key(cmd) => admin::key(&config, cmd).await,
         Command::Bucket(cmd) => admin::bucket(config, cmd).await,
         Command::Scrub => admin::scrub(config).await,
-        Command::Repair => admin::repair(config).await,
+        Command::Repair { quick } => admin::repair(config, !quick).await,
+        Command::Gc { grace_secs, force } => admin::gc(config, grace_secs, force).await,
+        Command::Rebalance {
+            margin_gib,
+            max_moves,
+        } => admin::rebalance(config, margin_gib, max_moves).await,
+        Command::Disk(cmd) => admin::disk(&config, cmd).await,
+        Command::Node(cmd) => admin::node(&config, cmd).await,
     }
 }
 
@@ -189,25 +224,72 @@ fn spawn_maintenance(
             Ok(())
         }
     });
-    if !m.leader {
-        return;
-    }
-    let s = Arc::clone(store);
-    every(secs(m.repair_interval_secs), "repair", move || {
+    let (s, gc) = (
+        Arc::clone(store),
+        suhms_store::GcOptions {
+            grace: secs(m.gc_grace_secs),
+            force: false,
+        },
+    );
+    every(secs(m.gc_interval_secs), "gc", move || {
         let s = Arc::clone(&s);
         async move {
-            let r = s.repair().await?;
-            if r.copied + r.trimmed + r.unrecoverable > 0 {
+            let r = s.gc(gc).await?;
+            if r != suhms_store::GcReport::default() {
                 tracing::info!(
-                    copied = r.copied,
-                    trimmed = r.trimmed,
-                    unrecoverable = r.unrecoverable,
-                    "repair finished"
+                    orphans = r.orphans,
+                    orphan_bytes = r.orphan_bytes,
+                    uploads = r.uploads,
+                    tmp = r.tmp,
+                    purged = r.purged,
+                    skipped_disks = r.skipped_disks,
+                    "garbage collection finished"
                 );
             }
             Ok(())
         }
     });
+    // Every node tries; the lease lets one at a time run, so repair survives losing a node.
+    for (period, full, name) in [
+        (m.repair_interval_secs, false, "repair"),
+        (m.full_repair_interval_secs, true, "full repair"),
+    ] {
+        let s = Arc::clone(store);
+        every(secs(period), name, move || {
+            let s = Arc::clone(&s);
+            async move {
+                let r = if full {
+                    s.repair_full().await
+                } else {
+                    s.repair().await
+                };
+                match r {
+                    Ok(r) => {
+                        if r != suhms_store::RepairReport::default() {
+                            tracing::info!(
+                                job = name,
+                                copied = r.copied,
+                                trimmed = r.trimmed,
+                                drained = r.drained,
+                                queued = r.queued,
+                                unrecoverable = r.unrecoverable,
+                                "repair finished"
+                            );
+                        }
+                        Ok(())
+                    }
+                    Err(suhms_store::StoreError::Busy(reason)) => {
+                        tracing::debug!(job = name, %reason, "skipped");
+                        Ok(())
+                    }
+                    Err(e) => Err(e.into()),
+                }
+            }
+        });
+    }
+    if !m.leader {
+        return;
+    }
     let (s, max_age) = (Arc::clone(store), secs(m.abort_uploads_after_secs));
     every(secs(3600), "abort stale uploads", move || {
         let s = Arc::clone(&s);

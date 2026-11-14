@@ -11,10 +11,10 @@ use uuid::Uuid;
 
 use super::{
     AccessKeyRecord, BucketRecord, BucketSetting, DeleteBucketOutcome, DiskRecord, LifecycleScan,
-    MetadataStore, NULL_VERSION, ObjectRecord, PartRecord, ReplicaEntry, StorageUsage,
-    StoredObject, TenantRecord, TenantUpdate, UploadRecord, UsageDelta, UsageRow, VersioningMode,
-    WriteCondition, decode_disks, decode_tags, decode_user_metadata, encode_disks, encode_tags,
-    encode_user_metadata,
+    MetadataStore, NULL_VERSION, ObjectRecord, PartRecord, RemoveDiskOutcome, ReplicaEntry,
+    StorageUsage, StoredObject, TenantRecord, TenantUpdate, UploadRecord, UsageDelta, UsageRow,
+    VersioningMode, WriteCondition, decode_disks, decode_tags, decode_user_metadata, encode_disks,
+    encode_tags, encode_user_metadata, prefix_end,
 };
 use crate::{
     disk::DiskId,
@@ -31,6 +31,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (6, include_str!("migrations/sqlite/0006_checksums.sql")),
     (7, include_str!("migrations/sqlite/0007_tags.sql")),
     (8, include_str!("migrations/sqlite/0008_timestamps.sql")),
+    (9, include_str!("migrations/sqlite/0009_operations.sql")),
 ];
 
 macro_rules! object_select {
@@ -50,7 +51,9 @@ macro_rules! object_select {
 pub struct SqliteMetadata {
     pool: SqlitePool,
     /// SQLite allows one writer; serializing write transactions here avoids lock-upgrade
-    /// deadlocks (SQLITE_BUSY) between read-then-write transactions.
+    /// deadlocks (SQLITE_BUSY) between read-then-write transactions. Across processes (an
+    /// admin command next to the server) write transactions start with `BEGIN IMMEDIATE`, so
+    /// they wait for the lock (busy timeout) instead of failing when they first write.
     write_lock: Mutex<()>,
 }
 
@@ -268,6 +271,12 @@ async fn insert_object(
             .execute(&mut *conn)
             .await?;
     }
+    if !object.delete_marker && replicas.len() < usize::from(object.desired_replicas) {
+        sqlx::query("INSERT INTO repair_queue (object_id) VALUES (?)")
+            .bind(object.id.to_string())
+            .execute(&mut *conn)
+            .await?;
+    }
     Ok(())
 }
 
@@ -435,7 +444,7 @@ async fn load_by_id(conn: &mut SqliteConnection, id: Uuid) -> Result<Option<Stor
 impl MetadataStore for SqliteMetadata {
     async fn update_tenant(&self, id: &str, update: &TenantUpdate) -> Result<bool> {
         let _guard = self.write_lock.lock().await;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let exists = sqlx::query("SELECT 1 FROM tenants WHERE id = ?")
             .bind(id)
             .fetch_optional(&mut *tx)
@@ -521,7 +530,7 @@ impl MetadataStore for SqliteMetadata {
 
     async fn add_usage(&self, deltas: &[UsageDelta]) -> Result<()> {
         let _guard = self.write_lock.lock().await;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         for d in deltas {
             sqlx::query(
                 "INSERT INTO usage_hourly (tenant_id, hour, class_a_requests, class_b_requests, \
@@ -547,7 +556,7 @@ impl MetadataStore for SqliteMetadata {
 
     async fn record_storage(&self, hour: i64, usage: &[StorageUsage]) -> Result<()> {
         let _guard = self.write_lock.lock().await;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         for u in usage {
             sqlx::query("INSERT INTO usage_hourly (tenant_id, hour, stored_objects, logical_bytes, stored_bytes) \
      VALUES (?, ?, ?, ?, ?) ON CONFLICT (tenant_id, hour) DO UPDATE SET \
@@ -609,7 +618,7 @@ impl MetadataStore for SqliteMetadata {
         version_id: &str,
     ) -> Result<Option<StoredObject>> {
         let _guard = self.write_lock.lock().await;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let Some(v) = load_version(&mut tx, bucket, key, version_id).await? else {
             return Ok(None);
         };
@@ -735,7 +744,14 @@ impl MetadataStore for SqliteMetadata {
         .bind(object_id.to_string())
         .execute(&self.pool)
         .await?;
-        Ok(res.rows_affected() == 1)
+        if res.rows_affected() == 0 {
+            return Ok(false);
+        }
+        sqlx::query("INSERT INTO repair_queue (object_id) SELECT id FROM objects WHERE id = ? ON CONFLICT (object_id) DO NOTHING")
+            .bind(object_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(true)
     }
 
     async fn set_object_tags(
@@ -944,7 +960,7 @@ impl MetadataStore for SqliteMetadata {
 
     async fn list_disks(&self) -> Result<Vec<DiskRecord>> {
         sqlx::query(
-            "SELECT id, node_id, path, online, free_bytes, heartbeat_at FROM disks \
+            "SELECT id, node_id, path, online, free_bytes, heartbeat_at, draining, down_since FROM disks \
              ORDER BY node_id, path",
         )
         .fetch_all(&self.pool)
@@ -958,11 +974,85 @@ impl MetadataStore for SqliteMetadata {
                 online: r.try_get("online")?,
                 free_bytes: u64::try_from(r.try_get::<i64, _>("free_bytes")?).unwrap_or(0),
                 heartbeat_at: r.try_get("heartbeat_at")?,
+                draining: r.try_get("draining")?,
+                down_since: r.try_get("down_since")?,
             })
         })
         .collect()
     }
 
+    async fn set_disk_draining(&self, disk_id: DiskId, draining: bool) -> Result<bool> {
+        let _guard = self.write_lock.lock().await;
+        let res = sqlx::query("UPDATE disks SET draining = ? WHERE id = ?")
+            .bind(draining)
+            .bind(disk_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn remove_disk(&self, disk_id: DiskId, force: bool) -> Result<RemoveDiskOutcome> {
+        let _guard = self.write_lock.lock().await;
+        let id = disk_id.to_string();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists = sqlx::query("SELECT 1 FROM disks WHERE id = ?")
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+        if !exists {
+            return Ok(RemoveDiskOutcome::NotFound);
+        }
+        let copies: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM replicas WHERE disk_id = ?")
+            .bind(&id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let copies = u64::try_from(copies).unwrap_or(0);
+        if copies > 0 && !force {
+            return Ok(RemoveDiskOutcome::HasReplicas(copies));
+        }
+        sqlx::query("INSERT INTO repair_queue (object_id) SELECT object_id FROM replicas WHERE disk_id = ? ON CONFLICT (object_id) DO NOTHING")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM replicas WHERE disk_id = ?")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM disks WHERE id = ?")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(RemoveDiskOutcome::Removed { dropped: copies })
+    }
+
+    async fn set_disk_down_since(&self, disk_id: DiskId, since: Option<i64>) -> Result<()> {
+        let _guard = self.write_lock.lock().await;
+        sqlx::query("UPDATE disks SET down_since = ? WHERE id = ?")
+            .bind(since)
+            .bind(disk_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn enqueue_disk_repairs(&self, disk_id: DiskId) -> Result<u64> {
+        let _guard = self.write_lock.lock().await;
+        let res = sqlx::query("INSERT INTO repair_queue (object_id) SELECT object_id FROM replicas WHERE disk_id = ? ON CONFLICT (object_id) DO NOTHING")
+            .bind(disk_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
+    async fn count_disk_replicas(&self, disk_id: DiskId) -> Result<u64> {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM replicas WHERE disk_id = ?")
+            .bind(disk_id.to_string())
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
     async fn create_bucket(&self, bucket: &BucketRecord) -> Result<bool> {
         let _guard = self.write_lock.lock().await;
         let res = sqlx::query(
@@ -1009,7 +1099,7 @@ impl MetadataStore for SqliteMetadata {
         effective: u8,
     ) -> Result<bool> {
         let _guard = self.write_lock.lock().await;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let res = sqlx::query("UPDATE buckets SET replicas = ? WHERE name = ?")
             .bind(replicas.map(i64::from))
             .bind(name)
@@ -1018,6 +1108,13 @@ impl MetadataStore for SqliteMetadata {
         if res.rows_affected() == 0 {
             return Ok(false);
         }
+        sqlx::query(
+            "INSERT INTO repair_queue (object_id) SELECT id FROM objects WHERE bucket = ? AND replicas_explicit = FALSE AND delete_marker = FALSE AND desired_replicas <> ? ON CONFLICT (object_id) DO NOTHING",
+        )
+        .bind(name)
+        .bind(i64::from(effective))
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "UPDATE objects SET desired_replicas = ? WHERE bucket = ? AND replicas_explicit = FALSE",
         )
@@ -1031,7 +1128,7 @@ impl MetadataStore for SqliteMetadata {
 
     async fn delete_bucket(&self, name: &str) -> Result<DeleteBucketOutcome> {
         let _guard = self.write_lock.lock().await;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let has_objects = sqlx::query("SELECT 1 FROM objects WHERE bucket = ? LIMIT 1")
             .bind(name)
             .fetch_optional(&mut *tx)
@@ -1060,7 +1157,7 @@ impl MetadataStore for SqliteMetadata {
         mode: VersioningMode,
     ) -> Result<Vec<StoredObject>> {
         let _guard = self.write_lock.lock().await;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let bucket_exists = sqlx::query("SELECT 1 FROM buckets WHERE name = ?")
             .bind(&object.bucket)
             .fetch_optional(&mut *tx)
@@ -1086,7 +1183,7 @@ impl MetadataStore for SqliteMetadata {
 
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<Option<StoredObject>> {
         let _guard = self.write_lock.lock().await;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let previous = take_object(&mut tx, bucket, key).await?;
         tx.commit().await?;
         Ok(previous)
@@ -1117,7 +1214,7 @@ impl MetadataStore for SqliteMetadata {
 
     async fn create_upload(&self, upload: &UploadRecord) -> Result<()> {
         let _guard = self.write_lock.lock().await;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let bucket_exists = sqlx::query("SELECT 1 FROM buckets WHERE name = ?")
             .bind(&upload.bucket)
             .fetch_optional(&mut *tx)
@@ -1186,7 +1283,7 @@ impl MetadataStore for SqliteMetadata {
 
     async fn put_part(&self, part: &PartRecord) -> Result<Option<PartRecord>> {
         let _guard = self.write_lock.lock().await;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let upload_exists = sqlx::query("SELECT 1 FROM multipart_uploads WHERE id = ?")
             .bind(part.upload_id.to_string())
             .fetch_optional(&mut *tx)
@@ -1246,7 +1343,7 @@ impl MetadataStore for SqliteMetadata {
 
     async fn delete_upload(&self, id: Uuid) -> Result<Option<(UploadRecord, Vec<PartRecord>)>> {
         let _guard = self.write_lock.lock().await;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let Some(upload) = sqlx::query(upload_select!("id = ?"))
             .bind(id.to_string())
             .fetch_optional(&mut *tx)
@@ -1275,7 +1372,7 @@ impl MetadataStore for SqliteMetadata {
         mode: VersioningMode,
     ) -> Result<(Vec<PartRecord>, Vec<StoredObject>)> {
         let _guard = self.write_lock.lock().await;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let parts = load_parts(&mut tx, upload_id).await?;
         let res = sqlx::query("DELETE FROM multipart_uploads WHERE id = ?")
             .bind(upload_id.to_string())
@@ -1306,6 +1403,10 @@ impl MetadataStore for SqliteMetadata {
 
     async fn remove_replica(&self, object_id: Uuid, disk_id: DiskId) -> Result<()> {
         let _guard = self.write_lock.lock().await;
+        sqlx::query("INSERT INTO repair_queue (object_id) SELECT id FROM objects WHERE id = ? ON CONFLICT (object_id) DO NOTHING")
+            .bind(object_id.to_string())
+            .execute(&self.pool)
+            .await?;
         sqlx::query("DELETE FROM replicas WHERE object_id = ? AND disk_id = ?")
             .bind(object_id.to_string())
             .bind(disk_id.to_string())
@@ -1362,5 +1463,113 @@ impl MetadataStore for SqliteMetadata {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(|r| parse_uuid(r.try_get("id")?)).collect()
+    }
+
+    async fn list_disk_replicas(
+        &self,
+        disk_id: DiskId,
+        after: Option<Uuid>,
+        limit: u32,
+    ) -> Result<Vec<Uuid>> {
+        let rows = sqlx::query(
+            "SELECT object_id FROM replicas WHERE disk_id = ? AND object_id > ? \
+             ORDER BY object_id LIMIT ?",
+        )
+        .bind(disk_id.to_string())
+        .bind(after.map(|u| u.to_string()).unwrap_or_default())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| parse_uuid(r.try_get("object_id")?))
+            .collect()
+    }
+
+    async fn disk_replicas_with_prefix(&self, disk_id: DiskId, prefix: &str) -> Result<Vec<Uuid>> {
+        let end = prefix_end(prefix)?;
+        let rows = sqlx::query(
+            "SELECT object_id FROM replicas WHERE disk_id = ? \
+             AND object_id >= ? AND object_id < ?",
+        )
+        .bind(disk_id.to_string())
+        .bind(prefix)
+        .bind(end)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| parse_uuid(r.try_get("object_id")?))
+            .collect()
+    }
+
+    async fn enqueue_repair(&self, object_id: Uuid) -> Result<()> {
+        let _guard = self.write_lock.lock().await;
+        sqlx::query("INSERT INTO repair_queue (object_id) SELECT id FROM objects WHERE id = ? ON CONFLICT (object_id) DO NOTHING")
+            .bind(object_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_repair_queue(&self, after: Option<Uuid>, limit: u32) -> Result<Vec<Uuid>> {
+        let rows = sqlx::query(
+            "SELECT object_id FROM repair_queue WHERE object_id > ? ORDER BY object_id LIMIT ?",
+        )
+        .bind(after.map(|u| u.to_string()).unwrap_or_default())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| parse_uuid(r.try_get("object_id")?))
+            .collect()
+    }
+
+    async fn dequeue_repair(&self, object_id: Uuid) -> Result<()> {
+        let _guard = self.write_lock.lock().await;
+        sqlx::query("DELETE FROM repair_queue WHERE object_id = ?")
+            .bind(object_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn try_acquire_lease(
+        &self,
+        name: &str,
+        holder: &str,
+        now: i64,
+        ttl_ms: i64,
+    ) -> Result<bool> {
+        let _guard = self.write_lock.lock().await;
+        let res = sqlx::query(
+            "UPDATE leases SET holder = ?, expires_at = ? \
+             WHERE name = ? AND (holder = ? OR expires_at < ?)",
+        )
+        .bind(holder)
+        .bind(now + ttl_ms)
+        .bind(name)
+        .bind(holder)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 1 {
+            return Ok(true);
+        }
+        let res = sqlx::query("INSERT INTO leases (name, holder, expires_at) VALUES (?, ?, ?) ON CONFLICT (name) DO NOTHING")
+            .bind(name)
+            .bind(holder)
+            .bind(now + ttl_ms)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn release_lease(&self, name: &str, holder: &str) -> Result<()> {
+        let _guard = self.write_lock.lock().await;
+        sqlx::query("DELETE FROM leases WHERE name = ? AND holder = ?")
+            .bind(name)
+            .bind(holder)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }

@@ -11,7 +11,7 @@ use tokio::{io::AsyncRead, sync::RwLock};
 use uuid::Uuid;
 
 use crate::{
-    blob::{self, CopyOutcome, Dest},
+    blob::{self, Dest},
     cluster::{BoxReader, DiskRef, NoPeers, Peers},
     config::StoreConfig,
     disk::{Disk, DiskId},
@@ -26,6 +26,10 @@ use crate::{
     },
     placement::{self, Candidate},
 };
+
+mod maintenance;
+
+pub use self::maintenance::{GcOptions, GcReport, RebalanceOptions, RebalanceReport};
 
 const MAX_KEY_LEN: usize = 1024;
 /// S3's limit on the total size of user-defined metadata.
@@ -52,6 +56,8 @@ pub struct DiskInfo {
     pub free: u64,
     /// Online and heartbeating (always true for this node's own opened disks).
     pub alive: bool,
+    /// Being decommissioned: gets no new copies.
+    pub draining: bool,
 }
 
 /// Where the server publishes a body's checksum once the body has been read completely; the
@@ -187,6 +193,10 @@ pub struct ScrubReport {
 pub struct RepairReport {
     pub copied: u64,
     pub trimmed: u64,
+    /// Copies removed from draining disks once enough copies existed elsewhere.
+    pub drained: u64,
+    /// Objects queued because a disk went down, came back, or started draining.
+    pub queued: u64,
     /// Objects that are short of copies and have no healthy copy on an online disk.
     pub unrecoverable: u64,
 }
@@ -201,6 +211,9 @@ pub struct Store {
     view: RwLock<Option<(Instant, Arc<Vec<DiskInfo>>)>>,
     /// Logical bytes stored per tenant, for quota checks (refreshed every [`USAGE_TTL`]).
     usage: RwLock<HashMap<String, (Instant, u64)>>,
+    /// Identifies this process as a lease holder (node id plus a random suffix, so an admin
+    /// command and the server on the same node are distinct holders).
+    instance: String,
 }
 
 fn now_millis() -> i64 {
@@ -354,12 +367,13 @@ impl Store {
             return Err(StoreError::NoDisks);
         }
         Ok(Self {
-            config,
             disks,
             meta,
             peers,
             view: RwLock::new(None),
             usage: RwLock::new(HashMap::new()),
+            instance: format!("{}/{}", config.node_id, Uuid::new_v4().simple()),
+            config,
         })
     }
 
@@ -398,6 +412,7 @@ impl Store {
                     node_id: r.node_id,
                     free: d.available_space(),
                     alive: true,
+                    draining: r.draining,
                 },
                 None => DiskInfo {
                     id: r.id,
@@ -406,6 +421,7 @@ impl Store {
                         && r.node_id != self.config.node_id,
                     node_id: r.node_id,
                     free: r.free_bytes,
+                    draining: r.draining,
                 },
             })
             .collect();
@@ -511,9 +527,14 @@ impl Store {
         Ok((self.check_replicas(n).await?, explicit))
     }
 
-    /// Picks reachable disks for `count` new copies, avoiding disks (and, when possible, nodes)
-    /// in `existing`.
-    async fn place(&self, count: usize, existing: &[DiskId]) -> Result<Vec<DiskRef>> {
+    /// Picks reachable disks for `count` new copies, avoiding the nodes of the copies in
+    /// `existing` (in a cluster), the disks in `exclude`, and draining disks.
+    async fn place(
+        &self,
+        count: usize,
+        existing: &[DiskId],
+        exclude: &[DiskId],
+    ) -> Result<Vec<DiskRef>> {
         let view = self.cluster_disks().await?;
         let existing: Vec<(DiskId, &str)> = existing
             .iter()
@@ -522,6 +543,7 @@ impl Store {
             .collect();
         let reachable: Vec<(&DiskInfo, DiskRef)> = view
             .iter()
+            .filter(|i| !i.draining && !exclude.contains(&i.id))
             .filter_map(|i| self.reach(i).map(|r| (i, r)))
             .collect();
         let candidates = reachable
@@ -775,7 +797,7 @@ impl Store {
             .resolve_replicas(bucket, req.storage_class.as_deref())
             .await?;
         let required = placement::ack_threshold(replicas);
-        let targets = self.place(usize::from(replicas), &[]).await?;
+        let targets = self.place(usize::from(replicas), &[], &[]).await?;
         if targets.len() < required {
             return Err(StoreError::WriteQuorum {
                 required,
@@ -942,7 +964,7 @@ impl Store {
         let (replicas, explicit) = self
             .resolve_replicas(&bucket, req.storage_class.as_deref())
             .await?;
-        let targets = self.place(usize::from(replicas), &[]).await?;
+        let targets = self.place(usize::from(replicas), &[], &[]).await?;
         let required = placement::ack_threshold(replicas);
         if targets.len() < required {
             return Err(StoreError::WriteQuorum {
@@ -2253,133 +2275,5 @@ impl Store {
             .filter_map(|id| self.disk(*id))
             .map(|d| d.object_path(stored.object.id))
             .collect())
-    }
-
-    // ---- maintenance ----
-
-    /// Re-hashes every copy on this node's disks and drops copies that are missing or corrupt,
-    /// so that [`Store::repair`] replaces them.
-    pub async fn scrub(&self) -> Result<ScrubReport> {
-        let mut report = ScrubReport::default();
-        let mut after = None;
-        loop {
-            let page = self.meta.list_replicas(after, PAGE).await?;
-            let Some(last) = page.last() else { break };
-            after = Some((last.object_id, last.disk_id));
-            for entry in &page {
-                let Some(disk) = self.disk(entry.disk_id) else {
-                    continue;
-                };
-                report.checked += 1;
-                let path = disk.object_path(entry.object_id);
-                let bad = match blob::hash_file(&path).await {
-                    Ok((_, hash)) => hash != entry.blake3,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-                    Err(error) => {
-                        // Possibly a failing disk rather than a bad file; leave it for now.
-                        tracing::warn!(path = %path.display(), %error, "cannot read replica during scrub");
-                        false
-                    }
-                };
-                if bad {
-                    tracing::warn!(path = %path.display(), "dropping missing or corrupt replica");
-                    self.meta
-                        .remove_replica(entry.object_id, entry.disk_id)
-                        .await?;
-                    blob::remove(disk, entry.object_id).await;
-                    report.removed += 1;
-                }
-            }
-        }
-        Ok(report)
-    }
-
-    /// Brings every object's number of copies on online disks to its desired count, copying
-    /// from verified healthy copies or removing surplus ones.
-    pub async fn repair(&self) -> Result<RepairReport> {
-        let mut report = RepairReport::default();
-        let mut after = None;
-        loop {
-            let ids = self
-                .meta
-                .list_misreplicated(after, PAGE, now_millis() - ALIVE_MS)
-                .await?;
-            let Some(last) = ids.last() else { break };
-            after = Some(*last);
-            for id in ids {
-                if let Some(stored) = self.meta.get_object_by_id(id).await? {
-                    self.repair_object(&stored, &mut report).await?;
-                }
-            }
-        }
-        Ok(report)
-    }
-
-    async fn repair_object(&self, stored: &StoredObject, report: &mut RepairReport) -> Result<()> {
-        let id = stored.object.id;
-        let desired = usize::from(stored.object.desired_replicas);
-        let mut online = self.reachable(&stored.replicas).await?;
-
-        if online.len() > desired {
-            // Remove surplus copies from the fullest disks first.
-            let view = self.cluster_disks().await?;
-            let free = |d: &DiskRef| view.iter().find(|i| i.id == d.id()).map_or(0, |i| i.free);
-            online.sort_by_key(free);
-            for disk in &online[..online.len() - desired] {
-                self.meta.remove_replica(id, disk.id()).await?;
-                disk.remove(Dest::Object(id)).await;
-                report.trimmed += 1;
-            }
-            return Ok(());
-        }
-
-        // A copy that turns out corrupt mid-repair leaves the object short; the next pass
-        // (list_misreplicated) picks it up again.
-        for target in self.place(desired - online.len(), &stored.replicas).await? {
-            loop {
-                let Some(source) = online.first().cloned() else {
-                    tracing::error!(object = %id, bucket = %stored.object.bucket, key = %stored.object.key,
-                        "no healthy copy on a reachable disk; cannot repair");
-                    report.unrecoverable += 1;
-                    return Ok(());
-                };
-                match blob::copy_replica(
-                    &source,
-                    &target,
-                    id,
-                    stored.object.size,
-                    &stored.object.blake3,
-                )
-                .await
-                {
-                    Ok(CopyOutcome::Copied) => {
-                        if self.meta.add_replica(id, target.id()).await? {
-                            report.copied += 1;
-                        } else {
-                            // Object was deleted meanwhile.
-                            target.remove(Dest::Object(id)).await;
-                            return Ok(());
-                        }
-                        break;
-                    }
-                    Ok(CopyOutcome::SourceCorrupt) => {
-                        tracing::warn!(object = %id, disk = %source.label(), "source copy is corrupt; dropping it");
-                        self.meta.remove_replica(id, source.id()).await?;
-                        source.remove(Dest::Object(id)).await;
-                        online.remove(0);
-                    }
-                    Ok(CopyOutcome::SourceUnreadable) => {
-                        // Possibly transient (e.g. a failing disk); try another copy but keep
-                        // the record. Scrub decides whether the copy is really gone.
-                        online.remove(0);
-                    }
-                    Err(error) => {
-                        tracing::warn!(object = %id, target = %target.label(), %error, "copy failed");
-                        break;
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 }
