@@ -32,3 +32,18 @@ pub async fn metadata_url(dir: &Path) -> String {
     }
     format!("sqlite://{}", dir.join("meta.db").display())
 }
+
+/// Runs a query returning one integer (e.g. `SELECT COUNT(*) ...`) on the test database.
+pub async fn query_i64(url: &str, sql: &str) -> i64 {
+    let sql = AssertSqlSafe(sql.to_owned());
+    if url.starts_with("postgres") {
+        let mut c = sqlx::PgConnection::connect(url).await.unwrap();
+        sqlx::query_scalar(sql).fetch_one(&mut c).await.unwrap()
+    } else if url.starts_with("mysql") {
+        let mut c = sqlx::MySqlConnection::connect(url).await.unwrap();
+        sqlx::query_scalar(sql).fetch_one(&mut c).await.unwrap()
+    } else {
+        let mut c = sqlx::SqliteConnection::connect(url).await.unwrap();
+        sqlx::query_scalar(sql).fetch_one(&mut c).await.unwrap()
+    }
+}

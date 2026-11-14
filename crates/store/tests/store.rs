@@ -1929,3 +1929,83 @@ async fn lifecycle_tag_filters() {
     assert!(store.head_object(OWNER, "ltg", "tmp2").await.is_ok());
     assert!(store.head_object(OWNER, "ltg", "keep").await.is_ok());
 }
+
+#[tokio::test]
+async fn every_table_gets_audit_timestamps() {
+    use suhms_store::{AccessKeyRecord, TenantUpdate, UsageDelta};
+
+    let env = Env::new(3).await;
+    let store = env.open().await;
+    let meta = store.metadata();
+    store.create_bucket(OWNER, "audit", None).await.unwrap();
+    store
+        .put_object(OWNER, put("audit", "k", None), &b"data"[..])
+        .await
+        .unwrap();
+    let upload = store
+        .create_multipart_upload(OWNER, put("audit", "mp", None))
+        .await
+        .unwrap();
+    store
+        .upload_part(OWNER, "audit", "mp", upload.id, 1, None, &b"part"[..])
+        .await
+        .unwrap();
+    meta.create_access_key(&AccessKeyRecord {
+        id: "AKAUDIT".into(),
+        tenant_id: OWNER.into(),
+        secret_enc: "x".into(),
+        active: true,
+        created_at: 0,
+    })
+    .await
+    .unwrap();
+    meta.add_usage(&[UsageDelta {
+        tenant_id: OWNER.into(),
+        hour: 0,
+        class_a: 1,
+        class_b: 0,
+        ingress_bytes: 0,
+        egress_bytes: 0,
+    }])
+    .await
+    .unwrap();
+
+    for table in [
+        "tenants",
+        "access_keys",
+        "disks",
+        "buckets",
+        "objects",
+        "replicas",
+        "multipart_uploads",
+        "multipart_parts",
+        "usage_hourly",
+        "schema_migrations",
+    ] {
+        let url = &env.meta_url;
+        let rows = common::query_i64(url, &format!("SELECT COUNT(*) FROM {table}")).await;
+        assert!(rows > 0, "{table} has no rows");
+        let missing = common::query_i64(
+            url,
+            &format!("SELECT COUNT(*) FROM {table} WHERE created_at IS NULL OR updated_at IS NULL"),
+        )
+        .await;
+        assert_eq!(missing, 0, "{table} has rows without timestamps");
+    }
+
+    // An update moves updated_at forward and leaves created_at alone.
+    let updated =
+        format!("SELECT COUNT(*) FROM tenants WHERE id = '{OWNER}' AND updated_at > created_at");
+    assert_eq!(common::query_i64(&env.meta_url, &updated).await, 0);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    meta.update_tenant(
+        OWNER,
+        &TenantUpdate {
+            suspended: Some(true),
+            ..TenantUpdate::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(common::query_i64(&env.meta_url, &updated).await, 1);
+}
