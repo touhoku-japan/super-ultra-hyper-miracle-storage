@@ -7,7 +7,7 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
 
 - テスト: `CARGO_BUILD_JOBS=1 cargo test --workspace`
 - Lint: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings`
-- 起動: `cargo run -p suhms-server -- -c config.toml serve`（`GET /_suhms/health` で疎通確認。認証不要）
+- 起動: `cargo run -p suhms-server -- -c config.toml serve`（`GET /suhms/health` で疎通確認。認証不要）
 - 管理: `suhms gen-master-key` / `suhms tenant create|list` / `suhms key create|list|disable|enable` /
   `suhms bucket set-replicas <bucket> <n|default>` / `suhms scrub` / `suhms repair`
   - tenant/key 系はメタデータ DB だけを触るので、サーバ稼働中に実行してよい
@@ -15,7 +15,9 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
 
 開発ホストは 2 コア / 2.9GB RAM で他アプリと共有しているため、ビルドは `CARGO_BUILD_JOBS=1` で行う。
 release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレートはこのホストでのビルドが重いので dev-dependency に入れない。
-実クライアントでの互換確認はホストにある `rclone` で行う（環境変数 `RCLONE_CONFIG_S_*` で設定、`force_path_style=true`）。
+実クライアントでの互換確認はホストにある `rclone`（環境変数 `RCLONE_CONFIG_S_*` で設定、`force_path_style=true`）か、
+AWS CLI v2 で `scripts/awscli-compat.sh` を実行する（主要操作を一通り叩いて PASS/FAIL を出す。パス形式のアドレッシングが必要）。
+AWS CLI はホストにシステムインストールしていないので、公式インストーラで `-i <dir> -b <dir>` を指定し任意のディレクトリに入れて使う。
 
 ## 構成
 
@@ -25,10 +27,23 @@ release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレ
     - `s3.rs` — `s3s::S3` 実装。リクエストごとに検証済みアクセスキー → テナント ID を引き、store にテナントを渡す。
       `KeyStore`（`S3Auth`）が SigV4 用にシークレットを復号して返す。body 読み取り中の s3s エラー（SHA-256 不一致等）は `body_error` で S3 エラーに戻す
     - `crypto.rs` — アクセスキーのシークレットを AES-256-GCM で暗号化（AAD = アクセスキー ID）。マスターキーは `SUHMS_MASTER_KEY` か `[auth] master_key_file`
-    - `checksum.rs` — `x-amz-checksum-*`（ヘッダ、または aws-chunked のトレーラ）を body を流しながら検証する reader。
-      不一致は EOF で読み取りエラーにし、store がコミット前に書き込みを捨てる
+    - `checksum.rs` — `x-amz-checksum-*`（ヘッダ、または aws-chunked のトレーラ）を body を流しながら検証・計算する reader。
+      不一致は EOF で読み取りエラーにし、store がコミット前に書き込みを捨てる。計算結果は `ChecksumSlot` 経由で
+      store に渡り、objects / multipart_parts の `checksum` 列に JSON（algorithm / type / value）で保存。
+      GET/HEAD は `x-amz-checksum-mode: ENABLED` のときだけ返す（Range 付きは返さない）。
+      `checksum::Policy` で保存するアルゴリズムを決める: 指定なしのアップロードは S3 と同じく CRC64NVME（`DEFAULT_ALGO`）を
+      付け、クライアントが別アルゴリズムを送ればそれも同時に計算して検証する。アルゴリズム指定なしのマルチパートは
+      パートに CRC64NVME を持たせ、完了時に FULL_OBJECT の CRC64NVME を合成する。対応アルゴリズムは CRC32 / CRC32C /
+      CRC64NVME / SHA1 / SHA256 / SHA512 / MD5 / XXHASH64 / XXHASH3 / XXHASH128（FULL_OBJECT は CRC 系のみ）。
+      マルチパートは作成時にアルゴリズムと型を決め（upload の `checksum` 列）、各パートはサーバ側でも計算する。
+      完了時に COMPOSITE（パートのチェックサムを連結してハッシュ + `-N`）か FULL_OBJECT（CRC をパートから
+      `crc_fast::checksum_combine` で合成。データは読み直さない）を求める。コピーは要求されたアルゴリズム、
+      無ければコピー元のアルゴリズムで計算し直す
     - `cluster.rs` — ノード間 API（`[cluster] listen` の別リスナー、`x-suhms-node-auth` の HMAC 認証）と
-      `HttpPeer`（`reqwest`、TLS なし。プライベートネットワーク前提）。`open_store` がクラスタ構成ならピア付きで Store を開く
+      `HttpPeer`（`reqwest`）。`open_store` がクラスタ構成ならピア付きで Store を開く
+    - `tls.rs` — ノード間の相互 TLS（`[cluster.tls]`）。rustls（暗号プロバイダは `ring`。aws-lc はビルドが重いので使わない）。
+      クラスタ CA が署名したクライアント証明書を必須にし、サーバ証明書も同じ CA でだけ検証する。HMAC 認証は残す。
+      `TlsListener` はハンドシェイクを別タスクで行う `axum::serve` 用リスナー。手順は `docs/cluster-tls.md`
     - `tenancy.rs` — アクセスキー/テナントの 10 秒キャッシュ（`Directory`。管理 API での変更は同ノードで即時無効化）、
       アクセスキーごとのレート制限（トークンバケット）、課金用メーター（`Meter`、class A/B リクエスト数・ingress/egress を
       テナント×時間で集計し定期的に `usage_hourly` へ加算）、Prometheus メトリクス
@@ -45,6 +60,14 @@ release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレ
       （リリース済みのマイグレーションは編集しない。バックエンドごとに番号は独立）。
       `postgres.rs` / `mysql.rs` は `sqlite.rs` と同じ構造（SQL の差分: プレースホルダ `$n`、`ON DUPLICATE KEY UPDATE`、
       MySQL の object_key は `VARBINARY(1024)`、PG は `COLLATE "C"`）。SQLite 以外は書き込み競合を `is_retryable` で再試行
+    - 監査用タイムスタンプ: 全テーブル（schema_migrations 含む）に `created_at`（行の挿入日時）/ `updated_at`（最終更新日時）があり、
+      DB 側で自動設定する（アプリは読み書きしない）。PG は `TIMESTAMPTZ` + `DEFAULT now()` + BEFORE UPDATE トリガー
+      （`suhms_set_updated_at()`）、MariaDB は `DATETIME(6)`（TIMESTAMP は 2038 年問題があるため。sqlx がセッションを
+      UTC にするので値は UTC）+ `ON UPDATE CURRENT_TIMESTAMP(6)`、SQLite は UTC の ISO-8601 文字列を AFTER INSERT / UPDATE
+      トリガーで設定（ADD COLUMN に非定数の既定値を付けられないため）。アプリが使う UNIX ミリ秒の列は
+      `last_modified`（objects / multipart_parts）、`initiated_at`（multipart_uploads）、`created_ms`（tenants / access_keys / buckets）。
+      Rust の構造体のフィールド名は従来どおり `created_at: i64`（管理 API の JSON を変えないため）。新しいテーブルを足すときも
+      この 2 列とトリガーを付けること
     - クラスタ: 各ノードが自ディスクの空き容量と heartbeat を `disks` に書く（`HEARTBEAT_INTERVAL`）。30 秒更新がないディスクは offline 扱い。
       `Store::cluster_disks()` が全ノードのディスク一覧（2 秒キャッシュ）。レプリカ上限は「登録済み」ディスク/ノード数で判定するので、
       ノード障害中も書き込みは過半数で成功し、復旧後に repair で補う。複数ノード構成では同一ノードに 2 コピー置かない
@@ -66,20 +89,41 @@ release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレ
 - Object Lock（`store/src/lock.rs`）: バケット作成時の `x-amz-bucket-object-lock-enabled`、既定保持期間、オブジェクト単位の
   retention（GOVERNANCE はバイパスヘッダで解除可、COMPLIANCE は短縮・削除不可）と legal hold。保護対象は「版の削除」で、
   キーの DELETE（削除マーカー追加）は可能
-- ライフサイクル（`store/src/lifecycle.rs`）: 期限切れ（現行版）、非現行版の削除、未完了マルチパートの中止。prefix 単位。
-  leader が 1 時間ごとに `Store::apply_lifecycle`。transition（ストレージクラス移行）は未対応
+- ライフサイクル（`store/src/lifecycle.rs`）: 期限切れ（現行版）、非現行版の削除、ExpiredObjectDeleteMarker
+  （他の版が無い削除マーカーの削除）、transition / noncurrent transition、未完了マルチパートの中止。prefix 単位。
+  leader が 1 時間ごとに `Store::apply_lifecycle`。transition は「ストレージクラス＝レプリカ数」の変更
+  （`set_object_storage_class` で desired_replicas を変え、repair がコピーを増減）。複数の transition は日数が最大の
+  ものだけを適用。設定時に未知のストレージクラスは InvalidStorageClass。期限・移行は日数か Date（その日時以降は全対象）、
+  フィルタは prefix と ObjectSizeGreaterThan / LessThan（`And` 可）、NewerNoncurrentVersions（キーごとに新しい非現行版を
+  N 個残す）、タグ（指定したタグをすべて持つものだけ。ExpiredObjectDeleteMarker との併用は S3 と同じく不可）に対応
+- オブジェクトタグ: objects / multipart_uploads の `tags` 列（JSON、空は NULL）。版ごとに持つ。`x-amz-tagging`（PUT・
+  マルチパート開始・`x-amz-tagging-directive: REPLACE` のコピー）、Put/Get/DeleteObjectTagging（versionId 可）、
+  GET/HEAD の `x-amz-tagging-count`。コピーの既定（COPY）はコピー元のタグを引き継ぐ。制限は S3 と同じ
+  （10 個まで、キー 1〜128 文字・値 256 文字まで、文字種は英数字・空白・`_ . : / = + - @`。`store::validate_tags`）
+- 書き込みの前提条件（`meta::WriteCondition`）: PUT / CompleteMultipartUpload の `If-None-Match: *` と `If-Match`
+  （ETag か `*`）。メタデータのトランザクション内で最新版に対して判定（無ければ NoSuchKey、不一致は 412）
+- versionId 付きのコピー元（CopyObject / UploadPartCopy）。応答に `x-amz-copy-source-version-id`。
+  削除マーカーは MethodNotAllowed。同じキーへの旧版コピー（復元）は可
+- ListObjectVersions / ListMultipartUploads の delimiter（CommonPrefixes）。store 側で `list.rs` と同じく
+  共通プレフィックスの後ろ（`PREFIX_SKIP`）へカーソルを飛ばして読む。key-marker だけ指定した ListMultipartUploads は
+  そのキーのアップロードを含めない（S3 と同じ）
+- 予約バケット名 `suhms`（`RESERVED_BUCKETS`）: ヘルスチェック `/suhms/health` 用。パス形式のときだけヘルスチェックとして扱い、
+  仮想ホスト形式（`<bucket>.<domain>/suhms/health`）はそのバケットのオブジェクトへのリクエストとして S3 に回す
 - CORS（`server/src/cors.rs`）: ルールはバケットに JSON で保存し、ミドルウェアがプリフライト（OPTIONS）と応答ヘッダを処理
 - SQLite のマイグレーションは外部キーを無効化して実行する（`objects` の再作成で replicas が CASCADE 削除されないように）
 - サーバ側暗号化（SSE）は実装しない: 「ファイルをそのまま置く」方針と矛盾するため。保存時暗号化はディスク側（LUKS 等）で行う
 - 対応済み S3 操作: ListBuckets, Create/Head/Delete Bucket, GetBucketLocation, GetBucketVersioning,
   Put/Get（Range）/Head/Delete Object, DeleteObjects, ListObjects V1/V2（encoding-type=url 対応）, presigned URL,
   CopyObject（COPY/REPLACE）, Create/UploadPart/UploadPartCopy/Complete/Abort MultipartUpload, ListParts, ListMultipartUploads,
-  条件付きリクエスト（GET/HEAD の If-Match / If-None-Match / If-(Un)Modified-Since、PUT の If-None-Match: *）,
+  条件付きリクエスト（GET/HEAD の If-Match / If-None-Match / If-(Un)Modified-Since、PUT / CompleteMultipartUpload の
+  If-Match / If-None-Match: *）, チェックサム（CRC32 / CRC32C / CRC64NVME / SHA1 / SHA256 / SHA512 / MD5 / xxHash 系、
+  マルチパートの COMPOSITE / FULL_OBJECT、未指定時の CRC64NVME）, Put/Get/DeleteObjectTagging, versionId 付きコピー元, ListObjectVersions / ListMultipartUploads の delimiter,
   Put/GetBucketVersioning, ListObjectVersions, versionId 付き GET/HEAD/DELETE, Put/Get/DeleteBucketLifecycleConfiguration,
   Put/GetObjectLockConfiguration, Put/GetObjectRetention, Put/GetObjectLegalHold, Put/Get/DeleteBucketCors
 
 ## ドキュメント・デプロイ
 
+- `docs/TODO.md` — やり残し（バックログ）。項目を片付けたらここと下の「未対応」を更新する
 - `docs/sorahost-integration.md` — SoraHost ポータル（dev-sorahost）から管理 API を使う仕様（課金計算を含む）。
   `docs/examples/SuhmsAdminClient.php` は Laravel 用クライアント例。**dev-sorahost 側の実装はこのリポジトリでは行わない**
 - `deploy/suhms.service`（systemd）、`deploy/nginx.conf`（TLS 終端。管理 API とノード間 API は公開しない）
@@ -118,10 +162,8 @@ MIT ライセンス。依存クレートは `deny.toml` の許可リスト（MIT
 - `deny.toml` で RUSTSEC-2026-0459（同梱 SQLite の脆弱性）を一時除外中。sqlx が libsqlite3-sys >= 0.39 を許容したら更新して除外を外す
 - PostgreSQL / MariaDB はこのホストでは未検証（CI の `metadata-backends` ジョブでサービスコンテナに対して store のテストを実行）。
   ローカルで試すなら `SUHMS_TEST_POSTGRES=postgres://... cargo test -p suhms-store`（テストごとに DB を作る）
-- ノード間通信は平文 HTTP（HMAC 認証のみ）。ノード間はプライベートネットワークか WireGuard 等で保護すること
-- チェックサムは検証するが保存しないので、GET で `x-amz-checksum-*` を返さない。マルチパート全体のチェックサム（COMPOSITE / FULL_OBJECT）も未対応
-- PUT の If-Match、ListMultipartUploads / ListObjectVersions の delimiter、versionId 指定のコピー元は未対応
-- 削除マーカーだけが残ったキーの自動掃除（ExpiredObjectDeleteMarker）、ライフサイクルの transition は未対応
+- `[cluster.tls]` を設定しないとノード間通信は平文 HTTP（HMAC 認証のみ）。その場合はプライベートネットワークか WireGuard 等で保護すること
+- 既定チェックサム（CRC64NVME）は既定チェックサム導入前に保存したオブジェクト・パートには付かない（後から計算し直す処理はない）
 - メタデータ更新前にクラッシュした場合や、オフラインのディスク上に残った孤立ファイルの GC がない
 - ディスクの恒久撤去（decommission）時に replicas 行を消す管理操作がない
 - `list_misreplicated` は objects の全件走査。数億件規模では見直しが必要

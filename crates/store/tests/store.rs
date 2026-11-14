@@ -5,6 +5,7 @@ mod common;
 use md5::{Digest, Md5};
 use suhms_store::{
     ListParams, ListStart, PutObjectRequest, Store, StoreConfig, StoreError, TenantRecord,
+    WriteCondition,
 };
 
 const OWNER: &str = "tenant-1";
@@ -767,7 +768,7 @@ async fn abort_and_bucket_delete_clean_up_uploads() {
             .unwrap();
     }
     let page = store
-        .list_multipart_uploads(OWNER, "mp1", "", "", "", 1)
+        .list_multipart_uploads(OWNER, "mp1", "", None, "", "", 1)
         .await
         .unwrap();
     assert_eq!(page.uploads.len(), 1);
@@ -821,12 +822,228 @@ async fn copy_object_and_conditional_put() {
     assert!(matches!(err, StoreError::InvalidRequest(_)), "{err}");
 
     let mut req = put("src1", "a", None);
-    req.if_absent = true;
+    req.condition = WriteCondition::Absent;
     let err = store.put_object(OWNER, req, &b"x"[..]).await.unwrap_err();
     assert!(matches!(err, StoreError::PreconditionFailed), "{err}");
     let mut req = put("src1", "new", None);
-    req.if_absent = true;
+    req.condition = WriteCondition::Absent;
     store.put_object(OWNER, req, &b"x"[..]).await.unwrap();
+}
+
+#[tokio::test]
+async fn if_match_guards_overwrites() {
+    let env = Env::new(1).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "cas", Some(1)).await.unwrap();
+    let first = store
+        .put_object(OWNER, put("cas", "k", None), &b"one"[..])
+        .await
+        .unwrap();
+
+    let mut req = put("cas", "k", None);
+    req.condition = WriteCondition::Matches(Some("0123".into()));
+    let err = store.put_object(OWNER, req, &b"two"[..]).await.unwrap_err();
+    assert!(matches!(err, StoreError::PreconditionFailed), "{err}");
+    assert_eq!(read_object(&store, "cas", "k").await, b"one");
+
+    let mut req = put("cas", "k", None);
+    req.condition = WriteCondition::Matches(Some(first.etag.clone()));
+    store.put_object(OWNER, req, &b"two"[..]).await.unwrap();
+    assert_eq!(read_object(&store, "cas", "k").await, b"two");
+
+    // If-Match on a missing key is NoSuchKey, as in S3; `*` needs the key to exist.
+    let mut req = put("cas", "missing", None);
+    req.condition = WriteCondition::Matches(None);
+    let err = store.put_object(OWNER, req, &b"x"[..]).await.unwrap_err();
+    assert!(matches!(err, StoreError::NoSuchKey { .. }), "{err}");
+    let mut req = put("cas", "k", None);
+    req.condition = WriteCondition::Matches(None);
+    store.put_object(OWNER, req, &b"three"[..]).await.unwrap();
+
+    // The same conditions apply to completing a multipart upload.
+    let u = store
+        .create_multipart_upload(OWNER, put("cas", "k", None))
+        .await
+        .unwrap();
+    let p = store
+        .upload_part(OWNER, "cas", "k", u.id, 1, None, &b"mp"[..])
+        .await
+        .unwrap();
+    let parts = [suhms_store::CompletedPart {
+        part_number: 1,
+        etag: p.etag,
+    }];
+    let err = store
+        .complete_multipart_upload_with(
+            OWNER,
+            "cas",
+            "k",
+            u.id,
+            &parts,
+            WriteCondition::Absent,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::PreconditionFailed), "{err}");
+    store
+        .complete_multipart_upload_with(
+            OWNER,
+            "cas",
+            "k",
+            u.id,
+            &parts,
+            WriteCondition::Matches(None),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_object(&store, "cas", "k").await, b"mp");
+}
+
+#[tokio::test]
+async fn copies_from_a_specific_version() {
+    let env = Env::new(1).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "vcp", Some(1)).await.unwrap();
+    store.set_versioning(OWNER, "vcp", "Enabled").await.unwrap();
+    let v1 = store
+        .put_object(OWNER, put("vcp", "doc", None), &b"first"[..])
+        .await
+        .unwrap();
+    store
+        .put_object(OWNER, put("vcp", "doc", None), &b"second"[..])
+        .await
+        .unwrap();
+    let src = suhms_store::CopySource {
+        bucket: "vcp",
+        key: "doc",
+        version_id: Some(&v1.version_id),
+    };
+    // Restoring an old version onto the same key is allowed (it is not a no-op).
+    let (rec, from) = store
+        .copy_object_with(OWNER, src, put("vcp", "doc", None), false, None)
+        .await
+        .unwrap();
+    assert_eq!(from.version_id, v1.version_id);
+    assert_eq!(rec.etag, v1.etag);
+    assert_eq!(read_object(&store, "vcp", "doc").await, b"first");
+
+    // A delete marker cannot be a copy source.
+    let marker = store.delete_object(OWNER, "vcp", "doc").await.unwrap();
+    let src = suhms_store::CopySource {
+        bucket: "vcp",
+        key: "doc",
+        version_id: marker.version_id.as_deref(),
+    };
+    let err = store
+        .copy_object_with(OWNER, src, put("vcp", "other", None), false, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::MethodNotAllowed), "{err}");
+
+    // Parts can be copied from old versions too.
+    let u = store
+        .create_multipart_upload(OWNER, put("vcp", "mp", None))
+        .await
+        .unwrap();
+    let src = suhms_store::CopySource {
+        bucket: "vcp",
+        key: "doc",
+        version_id: Some(&v1.version_id),
+    };
+    let (part, _) = store
+        .upload_part_copy(OWNER, "vcp", "mp", u.id, 1, src, Some(1..4), None, None)
+        .await
+        .unwrap();
+    assert_eq!(part.size, 3);
+}
+
+#[tokio::test]
+async fn delimiter_rolls_up_versions_and_uploads() {
+    let env = Env::new(1).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "dlm", Some(1)).await.unwrap();
+    store.set_versioning(OWNER, "dlm", "Enabled").await.unwrap();
+    for k in ["a/1", "a/2", "b", "c/x/1", "c/y", "d"] {
+        for _ in 0..2 {
+            store
+                .put_object(OWNER, put("dlm", k, None), &b"x"[..])
+                .await
+                .unwrap();
+        }
+        store
+            .create_multipart_upload(OWNER, put("dlm", k, None))
+            .await
+            .unwrap();
+    }
+
+    let page = store
+        .list_object_versions(OWNER, "dlm", "", Some("/"), "", None, 1000)
+        .await
+        .unwrap();
+    assert_eq!(page.common_prefixes, ["a/", "c/"]);
+    let keys: Vec<&str> = page.versions.iter().map(|v| v.key.as_str()).collect();
+    assert_eq!(keys, ["b", "b", "d", "d"]);
+    assert!(!page.truncated);
+
+    // Pages of 2 entries: a prefix counts as one entry, and markers resume after it.
+    let mut seen = Vec::new();
+    let (mut key, mut version) = (String::new(), None::<String>);
+    loop {
+        let page = store
+            .list_object_versions(OWNER, "dlm", "", Some("/"), &key, version.as_deref(), 2)
+            .await
+            .unwrap();
+        seen.extend(page.common_prefixes.iter().cloned());
+        seen.extend(page.versions.iter().map(|v| v.key.clone()));
+        if !page.truncated {
+            break;
+        }
+        key = page.next_key_marker.unwrap();
+        version = page.next_version_id_marker;
+    }
+    seen.sort();
+    assert_eq!(seen, ["a/", "b", "b", "c/", "d", "d"]);
+
+    let page = store
+        .list_object_versions(OWNER, "dlm", "c/", Some("/"), "", None, 1000)
+        .await
+        .unwrap();
+    assert_eq!(page.common_prefixes, ["c/x/"]);
+    assert_eq!(page.versions.len(), 2);
+
+    let page = store
+        .list_multipart_uploads(OWNER, "dlm", "", Some("/"), "", "", 1000)
+        .await
+        .unwrap();
+    assert_eq!(page.common_prefixes, ["a/", "c/"]);
+    let keys: Vec<&str> = page.uploads.iter().map(|u| u.key.as_str()).collect();
+    assert_eq!(keys, ["b", "d"]);
+
+    let mut seen = Vec::new();
+    let (mut key, mut id) = (String::new(), String::new());
+    loop {
+        let page = store
+            .list_multipart_uploads(OWNER, "dlm", "", Some("/"), &key, &id, 1)
+            .await
+            .unwrap();
+        seen.extend(page.common_prefixes.iter().cloned());
+        seen.extend(page.uploads.iter().map(|u| u.key.clone()));
+        if !page.truncated {
+            break;
+        }
+        key = page.next_key_marker.unwrap();
+        id = page.next_upload_id_marker.unwrap_or_default();
+    }
+    assert_eq!(seen, ["a/", "b", "c/", "d"]);
+
+    // A key marker without an upload id marker skips that key's uploads entirely.
+    let page = store
+        .list_multipart_uploads(OWNER, "dlm", "", None, "b", "", 1000)
+        .await
+        .unwrap();
+    assert_eq!(page.uploads[0].key, "c/x/1");
 }
 
 #[tokio::test]
@@ -1023,7 +1240,7 @@ async fn usage_meter_accumulates_and_snapshots() {
 
 async fn versions(store: &Store, bucket: &str) -> Vec<(String, String, bool, bool)> {
     store
-        .list_object_versions(OWNER, bucket, "", "", None, 1000)
+        .list_object_versions(OWNER, bucket, "", None, "", None, 1000)
         .await
         .unwrap()
         .versions
@@ -1276,6 +1493,7 @@ async fn lifecycle_expires_and_purges() {
         expiration_days: Some(0),
         noncurrent_days: None,
         abort_multipart_days: None,
+        ..LifecycleRule::default()
     }];
     store
         .set_lifecycle(OWNER, "lcy", Some(&rules))
@@ -1283,8 +1501,8 @@ async fn lifecycle_expires_and_purges() {
         .unwrap();
     assert_eq!(store.lifecycle(OWNER, "lcy").await.unwrap().unwrap(), rules);
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    let (expired, purged, _) = store.apply_lifecycle().await.unwrap();
-    assert_eq!((expired, purged), (2, 0));
+    let r = store.apply_lifecycle().await.unwrap();
+    assert_eq!((r.expired, r.purged), (2, 0));
     assert!(store.get_object(OWNER, "lcy", "logs/a").await.is_err());
     assert_eq!(read_object(&store, "lcy", "keep/c").await, b"x");
 
@@ -1296,11 +1514,498 @@ async fn lifecycle_expires_and_purges() {
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    let (_, purged, _) = store.apply_lifecycle().await.unwrap();
-    assert_eq!(purged, 2);
+    let r = store.apply_lifecycle().await.unwrap();
+    assert_eq!(r.purged, 2);
     let vs = versions(&store, "lcy").await;
     assert!(
         vs.iter().filter(|v| v.0.starts_with("logs/")).all(|v| v.3),
         "only markers left: {vs:?}"
     );
+
+    // The markers are now the only versions of their keys, so they expire too.
+    rules[0].expiration_days = None;
+    rules[0].expired_object_delete_marker = true;
+    store
+        .set_lifecycle(OWNER, "lcy", Some(&rules))
+        .await
+        .unwrap();
+    let r = store.apply_lifecycle().await.unwrap();
+    assert_eq!(r.markers, 2);
+    let vs = versions(&store, "lcy").await;
+    assert!(!vs.iter().any(|v| v.0.starts_with("logs/")), "{vs:?}");
+    assert!(vs.iter().any(|v| v.0 == "keep/c"));
+}
+
+#[tokio::test]
+async fn expired_delete_marker_kept_while_versions_remain() {
+    use suhms_store::lifecycle::LifecycleRule;
+    let env = Env::new(1).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "edm", Some(1)).await.unwrap();
+    store.set_versioning(OWNER, "edm", "Enabled").await.unwrap();
+    store
+        .put_object(OWNER, put("edm", "k", None), &b"x"[..])
+        .await
+        .unwrap();
+    store.delete_object(OWNER, "edm", "k").await.unwrap();
+    let rules = vec![LifecycleRule {
+        id: "m".into(),
+        enabled: true,
+        expired_object_delete_marker: true,
+        ..LifecycleRule::default()
+    }];
+    store
+        .set_lifecycle(OWNER, "edm", Some(&rules))
+        .await
+        .unwrap();
+    assert_eq!(store.apply_lifecycle().await.unwrap().markers, 0);
+    assert_eq!(versions(&store, "edm").await.len(), 2);
+}
+
+#[tokio::test]
+async fn lifecycle_transitions_change_replica_count() {
+    use suhms_store::lifecycle::{LifecycleRule, Transition};
+    let env = Env::new(3).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "tier", Some(3)).await.unwrap();
+    store
+        .put_object(OWNER, put("tier", "old", None), &b"data"[..])
+        .await
+        .unwrap();
+    assert_eq!(store.object_replicas("tier", "old").await.unwrap().len(), 3);
+
+    let mut rules = vec![LifecycleRule {
+        id: "t".into(),
+        enabled: true,
+        transitions: vec![Transition {
+            days: 0,
+            storage_class: "GLACIER".into(),
+            ..Transition::default()
+        }],
+        ..LifecycleRule::default()
+    }];
+    let err = store
+        .set_lifecycle(OWNER, "tier", Some(&rules))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::UnknownStorageClass(_)), "{err}");
+
+    // The transition with the most days that applies wins (30 days have not passed yet).
+    rules[0].transitions = vec![
+        Transition {
+            days: 0,
+            storage_class: "STANDARD_IA".into(),
+            ..Transition::default()
+        },
+        Transition {
+            days: 30,
+            storage_class: "REDUCED_REDUNDANCY".into(),
+            ..Transition::default()
+        },
+    ];
+    store
+        .set_lifecycle(OWNER, "tier", Some(&rules))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    assert_eq!(store.apply_lifecycle().await.unwrap().transitioned, 1);
+    let rec = store.head_object(OWNER, "tier", "old").await.unwrap();
+    assert!(rec.replicas_explicit);
+    assert_eq!(rec.storage_class.as_deref(), Some("STANDARD_IA"));
+    let want = 2;
+    assert_eq!(rec.desired_replicas, want);
+
+    // Repair removes the surplus copies; a second pass changes nothing.
+    let report = store.repair().await.unwrap();
+    assert_eq!(report.trimmed, 3 - u64::from(want));
+    assert_eq!(
+        store.object_replicas("tier", "old").await.unwrap().len(),
+        usize::from(want)
+    );
+    assert_eq!(store.apply_lifecycle().await.unwrap().transitioned, 0);
+}
+
+#[tokio::test]
+async fn lifecycle_size_filters_and_dates() {
+    use suhms_store::lifecycle::LifecycleRule;
+    let env = Env::new(1).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "lsz", Some(1)).await.unwrap();
+    for (k, size) in [("small", 10usize), ("mid", 100), ("big", 1000)] {
+        store
+            .put_object(OWNER, put("lsz", k, None), &vec![0u8; size][..])
+            .await
+            .unwrap();
+    }
+    // Strict bounds, as in S3: only "mid" is > 10 and < 1000.
+    let mut rules = vec![LifecycleRule {
+        id: "size".into(),
+        enabled: true,
+        expiration_days: Some(0),
+        min_size: Some(10),
+        max_size: Some(1000),
+        ..LifecycleRule::default()
+    }];
+    store
+        .set_lifecycle(OWNER, "lsz", Some(&rules))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    assert_eq!(store.apply_lifecycle().await.unwrap().expired, 1);
+    assert!(store.head_object(OWNER, "lsz", "mid").await.is_err());
+
+    // A date in the future does nothing; once reached, every current object expires.
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    rules[0] = LifecycleRule {
+        id: "date".into(),
+        enabled: true,
+        expiration_date: Some(now + 86_400_000),
+        ..LifecycleRule::default()
+    };
+    store
+        .set_lifecycle(OWNER, "lsz", Some(&rules))
+        .await
+        .unwrap();
+    assert_eq!(store.apply_lifecycle().await.unwrap().expired, 0);
+    rules[0].expiration_date = Some(now - 1);
+    store
+        .set_lifecycle(OWNER, "lsz", Some(&rules))
+        .await
+        .unwrap();
+    assert_eq!(store.apply_lifecycle().await.unwrap().expired, 2);
+}
+
+#[tokio::test]
+async fn lifecycle_keeps_newer_noncurrent_versions() {
+    use suhms_store::lifecycle::LifecycleRule;
+    let env = Env::new(1).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "lnn", Some(1)).await.unwrap();
+    store.set_versioning(OWNER, "lnn", "Enabled").await.unwrap();
+    for i in 0..5u8 {
+        store
+            .put_object(OWNER, put("lnn", "k", None), &[i][..])
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    // 1 current + 4 noncurrent; keep the 2 newest noncurrent ones.
+    let rules = vec![LifecycleRule {
+        id: "keep2".into(),
+        enabled: true,
+        noncurrent_days: Some(0),
+        newer_noncurrent_versions: Some(2),
+        ..LifecycleRule::default()
+    }];
+    store
+        .set_lifecycle(OWNER, "lnn", Some(&rules))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    assert_eq!(store.apply_lifecycle().await.unwrap().purged, 2);
+    let vs = versions(&store, "lnn").await;
+    assert_eq!(vs.len(), 3, "{vs:?}");
+    // The survivors are the newest three writes (bytes 4, 3, 2).
+    let mut kept = Vec::new();
+    for (_, v, _, _) in &vs {
+        let o = store
+            .get_object_version(OWNER, "lnn", "k", v)
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        store
+            .read_object(&o, 0..o.object.size)
+            .await
+            .unwrap()
+            .read_to_end(&mut buf)
+            .await
+            .unwrap();
+        kept.extend(buf);
+    }
+    assert_eq!(kept, [4, 3, 2]);
+    assert_eq!(store.apply_lifecycle().await.unwrap().purged, 0);
+}
+
+fn tags(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect()
+}
+
+#[tokio::test]
+async fn object_tags_follow_puts_copies_and_uploads() {
+    let env = Env::new(1).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "tag", Some(1)).await.unwrap();
+    let mut req = put("tag", "a", None);
+    req.tags = Some(tags(&[("env", "prod"), ("team", "ops")]));
+    store.put_object(OWNER, req, &b"x"[..]).await.unwrap();
+    let a = store.object_tags(OWNER, "tag", "a", None).await.unwrap();
+    assert_eq!(a.tags, tags(&[("env", "prod"), ("team", "ops")]));
+
+    // Copies keep the source's tags unless replaced.
+    store
+        .copy_object(OWNER, "tag", "a", put("tag", "b", None), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .object_tags(OWNER, "tag", "b", None)
+            .await
+            .unwrap()
+            .tags,
+        a.tags
+    );
+    let mut dest = put("tag", "c", None);
+    dest.tags = Some(tags(&[("env", "dev")]));
+    store
+        .copy_object(OWNER, "tag", "a", dest, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .object_tags(OWNER, "tag", "c", None)
+            .await
+            .unwrap()
+            .tags,
+        tags(&[("env", "dev")])
+    );
+
+    // Multipart uploads apply their tags at completion.
+    let mut req = put("tag", "mp", None);
+    req.tags = Some(tags(&[("kind", "backup")]));
+    let u = store.create_multipart_upload(OWNER, req).await.unwrap();
+    let p = store
+        .upload_part(OWNER, "tag", "mp", u.id, 1, None, &b"part"[..])
+        .await
+        .unwrap();
+    let parts = [suhms_store::CompletedPart {
+        part_number: 1,
+        etag: p.etag,
+    }];
+    store
+        .complete_multipart_upload(OWNER, "tag", "mp", u.id, &parts)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .object_tags(OWNER, "tag", "mp", None)
+            .await
+            .unwrap()
+            .tags,
+        tags(&[("kind", "backup")])
+    );
+
+    // Replacing and removing.
+    store
+        .set_object_tags(OWNER, "tag", "a", None, &tags(&[("x", "1")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .object_tags(OWNER, "tag", "a", None)
+            .await
+            .unwrap()
+            .tags,
+        tags(&[("x", "1")])
+    );
+    store
+        .set_object_tags(OWNER, "tag", "a", None, &tags(&[]))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .object_tags(OWNER, "tag", "a", None)
+            .await
+            .unwrap()
+            .tags
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn tags_are_per_version_and_validated() {
+    let env = Env::new(1).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "tgv", Some(1)).await.unwrap();
+    store.set_versioning(OWNER, "tgv", "Enabled").await.unwrap();
+    let v1 = store
+        .put_object(OWNER, put("tgv", "k", None), &b"1"[..])
+        .await
+        .unwrap();
+    store
+        .put_object(OWNER, put("tgv", "k", None), &b"2"[..])
+        .await
+        .unwrap();
+    store
+        .set_object_tags(
+            OWNER,
+            "tgv",
+            "k",
+            Some(&v1.version_id),
+            &tags(&[("old", "yes")]),
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .object_tags(OWNER, "tgv", "k", None)
+            .await
+            .unwrap()
+            .tags
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .object_tags(OWNER, "tgv", "k", Some(&v1.version_id))
+            .await
+            .unwrap()
+            .tags,
+        tags(&[("old", "yes")])
+    );
+
+    let eleven: Vec<(String, String)> = (0..11).map(|i| (format!("k{i}"), "v".into())).collect();
+    let eleven = eleven.into_iter().collect();
+    let long_key = tags(&[(&"k".repeat(129), "v")]);
+    let bad_char = tags(&[("a", "semi;colon")]);
+    for t in [eleven, long_key, bad_char] {
+        let err = store
+            .set_object_tags(OWNER, "tgv", "k", None, &t)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidTag(_)), "{err}");
+    }
+    assert!(
+        store
+            .set_object_tags(
+                OWNER,
+                "tgv",
+                "k",
+                None,
+                &tags(&[("日本語 key", "値 = 1/2 @x")])
+            )
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn lifecycle_tag_filters() {
+    use suhms_store::lifecycle::LifecycleRule;
+    let env = Env::new(1).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "ltg", Some(1)).await.unwrap();
+    for (k, t) in [
+        ("tmp1", tags(&[("temp", "true"), ("team", "a")])),
+        ("tmp2", tags(&[("temp", "true")])),
+        ("keep", tags(&[("temp", "false"), ("team", "a")])),
+    ] {
+        let mut req = put("ltg", k, None);
+        req.tags = Some(t);
+        store.put_object(OWNER, req, &b"x"[..]).await.unwrap();
+    }
+    // Every tag of the filter must match.
+    let rules = vec![LifecycleRule {
+        id: "temp".into(),
+        enabled: true,
+        expiration_days: Some(0),
+        tags: tags(&[("temp", "true"), ("team", "a")]),
+        ..LifecycleRule::default()
+    }];
+    store
+        .set_lifecycle(OWNER, "ltg", Some(&rules))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    assert_eq!(store.apply_lifecycle().await.unwrap().expired, 1);
+    assert!(store.head_object(OWNER, "ltg", "tmp1").await.is_err());
+    assert!(store.head_object(OWNER, "ltg", "tmp2").await.is_ok());
+    assert!(store.head_object(OWNER, "ltg", "keep").await.is_ok());
+}
+
+#[tokio::test]
+async fn every_table_gets_audit_timestamps() {
+    use suhms_store::{AccessKeyRecord, TenantUpdate, UsageDelta};
+
+    let env = Env::new(3).await;
+    let store = env.open().await;
+    let meta = store.metadata();
+    store.create_bucket(OWNER, "audit", None).await.unwrap();
+    store
+        .put_object(OWNER, put("audit", "k", None), &b"data"[..])
+        .await
+        .unwrap();
+    let upload = store
+        .create_multipart_upload(OWNER, put("audit", "mp", None))
+        .await
+        .unwrap();
+    store
+        .upload_part(OWNER, "audit", "mp", upload.id, 1, None, &b"part"[..])
+        .await
+        .unwrap();
+    meta.create_access_key(&AccessKeyRecord {
+        id: "AKAUDIT".into(),
+        tenant_id: OWNER.into(),
+        secret_enc: "x".into(),
+        active: true,
+        created_at: 0,
+    })
+    .await
+    .unwrap();
+    meta.add_usage(&[UsageDelta {
+        tenant_id: OWNER.into(),
+        hour: 0,
+        class_a: 1,
+        class_b: 0,
+        ingress_bytes: 0,
+        egress_bytes: 0,
+    }])
+    .await
+    .unwrap();
+
+    for table in [
+        "tenants",
+        "access_keys",
+        "disks",
+        "buckets",
+        "objects",
+        "replicas",
+        "multipart_uploads",
+        "multipart_parts",
+        "usage_hourly",
+        "schema_migrations",
+    ] {
+        let url = &env.meta_url;
+        let rows = common::query_i64(url, &format!("SELECT COUNT(*) FROM {table}")).await;
+        assert!(rows > 0, "{table} has no rows");
+        let missing = common::query_i64(
+            url,
+            &format!("SELECT COUNT(*) FROM {table} WHERE created_at IS NULL OR updated_at IS NULL"),
+        )
+        .await;
+        assert_eq!(missing, 0, "{table} has rows without timestamps");
+    }
+
+    // An update moves updated_at forward and leaves created_at alone.
+    let updated =
+        format!("SELECT COUNT(*) FROM tenants WHERE id = '{OWNER}' AND updated_at > created_at");
+    assert_eq!(common::query_i64(&env.meta_url, &updated).await, 0);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    meta.update_tenant(
+        OWNER,
+        &TenantUpdate {
+            suspended: Some(true),
+            ..TenantUpdate::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(common::query_i64(&env.meta_url, &updated).await, 1);
 }

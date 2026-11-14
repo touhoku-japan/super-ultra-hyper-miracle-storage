@@ -7,7 +7,7 @@ use crate::{
 
 /// Appended to a common prefix to form a cursor that sorts after every key under that prefix
 /// (U+10FFFF is the largest code point, so its UTF-8 encoding sorts last).
-const PREFIX_SKIP: char = '\u{10FFFF}';
+pub(crate) const PREFIX_SKIP: char = '\u{10FFFF}';
 const BATCH: u32 = 1000;
 pub const MAX_KEYS: usize = 1000;
 

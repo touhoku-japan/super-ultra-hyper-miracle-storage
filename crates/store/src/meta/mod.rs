@@ -88,6 +88,49 @@ impl VersioningMode {
     }
 }
 
+/// A precondition on the key's current (latest) version, checked atomically with a write.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum WriteCondition {
+    #[default]
+    None,
+    /// `If-None-Match: *`: the key must not exist.
+    Absent,
+    /// `If-Match`: the key must exist and have this ETag (hex, without quotes); `None` matches
+    /// any ETag (`If-Match: *`).
+    Matches(Option<String>),
+}
+
+impl WriteCondition {
+    /// Checks the condition against the key's latest version (a delete marker counts as no
+    /// object).
+    pub fn check(&self, latest: Option<&ObjectRecord>, bucket: &str, key: &str) -> Result<()> {
+        let current = latest.filter(|o| !o.delete_marker);
+        match (self, current) {
+            (Self::None, _) | (Self::Absent, None) => Ok(()),
+            (Self::Absent, Some(_)) => Err(StoreError::PreconditionFailed),
+            (Self::Matches(_), None) => Err(StoreError::NoSuchKey {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+            }),
+            (Self::Matches(etag), Some(o)) => match etag {
+                Some(e) if *e != o.etag => Err(StoreError::PreconditionFailed),
+                _ => Ok(()),
+            },
+        }
+    }
+}
+
+/// Which versions a lifecycle scan returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleScan {
+    /// Latest versions (not delete markers) created before the cutoff.
+    Current,
+    /// Noncurrent versions that became noncurrent before the cutoff.
+    Noncurrent,
+    /// Delete markers that are the latest version, created before the cutoff.
+    DeleteMarkers,
+}
+
 /// Bucket settings stored as text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BucketSetting {
@@ -129,6 +172,11 @@ pub struct ObjectRecord {
     pub lock_mode: Option<String>,
     pub lock_until: Option<i64>,
     pub legal_hold: bool,
+    /// Checksum of the content (`x-amz-checksum-*`), opaque to the store (JSON written by
+    /// the server).
+    pub checksum: Option<String>,
+    /// Object tags (S3 tagging).
+    pub tags: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +192,10 @@ pub struct UploadRecord {
     /// Disks chosen for the parts; completing concatenates the parts on each of them locally.
     pub disks: Vec<DiskId>,
     pub created_at: i64,
+    /// Checksum algorithm and type requested at creation (opaque to the store).
+    pub checksum: Option<String>,
+    /// Tags for the completed object.
+    pub tags: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +210,8 @@ pub struct PartRecord {
     /// Disks holding a copy of this part.
     pub disks: Vec<DiskId>,
     pub created_at: i64,
+    /// The part's checksum (opaque to the store).
+    pub checksum: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +292,11 @@ pub enum DeleteBucketOutcome {
     NotEmpty,
 }
 
+/// Column names: the records' `created_at: i64` (unix ms, set by the app) is stored as
+/// `last_modified` (objects, multipart_parts), `initiated_at` (multipart_uploads) or `created_ms`
+/// (tenants, access_keys, buckets). Every table also has `created_at` / `updated_at` audit
+/// timestamps that the database maintains itself (defaults and triggers); the app never writes or
+/// reads them.
 #[async_trait]
 pub trait MetadataStore: Send + Sync {
     // ---- tenants and keys ----
@@ -307,12 +366,12 @@ pub trait MetadataStore: Send + Sync {
     /// Stores `object` as the latest version of its key; earlier versions are kept or removed
     /// according to `mode`. Returns the versions that were removed (their files must be
     /// deleted). Fails with [`StoreError::NoSuchBucket`] when the bucket does not exist, and
-    /// with [`StoreError::PreconditionFailed`] when `if_absent` is set and the key exists.
+    /// with [`StoreError::PreconditionFailed`] (or `NoSuchKey`) when `cond` does not hold.
     async fn put_object(
         &self,
         object: &ObjectRecord,
         replicas: &[DiskId],
-        if_absent: bool,
+        cond: &WriteCondition,
         mode: VersioningMode,
     ) -> Result<Vec<StoredObject>>;
     /// A specific version of a key.
@@ -339,14 +398,13 @@ pub trait MetadataStore: Send + Sync {
         after: (&str, i64, &str),
         limit: u32,
     ) -> Result<Vec<ObjectRecord>>;
-    /// Lifecycle candidates under `prefix`, in key order after `after` (key, id): latest
-    /// versions created before `before`, or (with `noncurrent`) noncurrent versions that
-    /// became noncurrent before `before`.
+    /// Lifecycle candidates under `prefix`, in key order after `after` (key, id), as selected
+    /// by `scan` with `before` as the cutoff.
     async fn lifecycle_candidates(
         &self,
         bucket: &str,
         prefix: &str,
-        noncurrent: bool,
+        scan: LifecycleScan,
         before: i64,
         after: (&str, &str),
         limit: u32,
@@ -359,6 +417,20 @@ pub trait MetadataStore: Send + Sync {
         until: Option<i64>,
     ) -> Result<bool>;
     async fn set_legal_hold(&self, object_id: Uuid, on: bool) -> Result<bool>;
+    /// Replaces an object version's tags. Returns false when it no longer exists.
+    async fn set_object_tags(
+        &self,
+        object_id: Uuid,
+        tags: &BTreeMap<String, String>,
+    ) -> Result<bool>;
+    /// Changes an object version's storage class and desired replica count (lifecycle
+    /// transition); repair then adds or removes copies. Returns false when it no longer exists.
+    async fn set_object_storage_class(
+        &self,
+        object_id: Uuid,
+        storage_class: &str,
+        replicas: u8,
+    ) -> Result<bool>;
     async fn get_object(&self, bucket: &str, key: &str) -> Result<Option<StoredObject>>;
     async fn get_object_by_id(&self, id: Uuid) -> Result<Option<StoredObject>>;
     /// Removes the object and returns what was removed.
@@ -400,12 +472,14 @@ pub trait MetadataStore: Send + Sync {
     async fn delete_upload(&self, id: Uuid) -> Result<Option<(UploadRecord, Vec<PartRecord>)>>;
     /// Atomically removes the upload and stores the completed object in its place. Returns the
     /// upload's parts and the object that was replaced. Fails with
-    /// [`StoreError::NoSuchUpload`] when the upload was completed or aborted meanwhile.
+    /// [`StoreError::NoSuchUpload`] when the upload was completed or aborted meanwhile, and
+    /// like [`MetadataStore::put_object`] when `cond` does not hold.
     async fn complete_upload(
         &self,
         upload_id: Uuid,
         object: &ObjectRecord,
         replicas: &[DiskId],
+        cond: &WriteCondition,
         mode: VersioningMode,
     ) -> Result<(Vec<PartRecord>, Vec<StoredObject>)>;
 
@@ -485,6 +559,15 @@ pub(crate) fn encode_disks(d: &[DiskId]) -> String {
 
 pub(crate) fn decode_disks(s: &str) -> Result<Vec<DiskId>> {
     serde_json::from_str(s).map_err(|e| StoreError::Metadata(Box::new(e)))
+}
+
+/// Tags are stored as a JSON map; no tags is NULL.
+pub(crate) fn encode_tags(t: &BTreeMap<String, String>) -> Option<String> {
+    (!t.is_empty()).then(|| encode_user_metadata(t))
+}
+
+pub(crate) fn decode_tags(s: Option<String>) -> Result<BTreeMap<String, String>> {
+    s.map_or_else(|| Ok(BTreeMap::new()), |s| decode_user_metadata(&s))
 }
 
 pub(crate) fn decode_user_metadata(s: &str) -> Result<BTreeMap<String, String>> {

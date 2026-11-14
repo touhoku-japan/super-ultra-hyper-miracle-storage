@@ -16,13 +16,13 @@ use crate::{
     config::StoreConfig,
     disk::{Disk, DiskId},
     error::{Result, StoreError},
-    lifecycle::{self, LifecycleRule},
-    list::{self, ListPage, ListParams},
+    lifecycle::{self, LifecycleRule, Transition},
+    list::{self, ListPage, ListParams, PREFIX_SKIP},
     lock::{self, BucketLock},
     meta::{
-        self, BucketRecord, BucketSetting, DeleteBucketOutcome, MetadataStore, NULL_VERSION,
-        ObjectRecord, PartRecord, StorageUsage, StoredObject, TenantRecord, UploadRecord,
-        VersioningMode,
+        self, BucketRecord, BucketSetting, DeleteBucketOutcome, LifecycleScan, MetadataStore,
+        NULL_VERSION, ObjectRecord, PartRecord, StorageUsage, StoredObject, TenantRecord,
+        UploadRecord, VersioningMode, WriteCondition,
     },
     placement::{self, Candidate},
 };
@@ -54,6 +54,32 @@ pub struct DiskInfo {
     pub alive: bool,
 }
 
+/// Where the server publishes a body's checksum once the body has been read completely; the
+/// store records it with the object or part. The value is opaque to the store.
+pub type ChecksumSlot = Arc<std::sync::Mutex<Option<String>>>;
+
+fn take_slot(slot: Option<&ChecksumSlot>) -> Option<String> {
+    slot.and_then(|s| s.lock().ok().and_then(|mut v| v.take()))
+}
+
+/// The object a copy reads from.
+#[derive(Debug, Clone, Copy)]
+pub struct CopySource<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    /// A specific version; the latest when `None`.
+    pub version_id: Option<&'a str>,
+}
+
+/// Lets the caller wrap a copy's source stream (e.g. to compute a checksum); gets the
+/// source object.
+pub type CopyWrap = Box<dyn FnOnce(&ObjectRecord, BoxReader) -> BoxReader + Send>;
+
+/// Computes the completed object's checksum from the upload and the chosen parts (in order),
+/// or rejects the completion.
+pub type CompleteChecksum =
+    Box<dyn FnOnce(&UploadRecord, &[&PartRecord]) -> Result<Option<String>> + Send>;
+
 #[derive(Debug, Default)]
 pub struct PutObjectRequest {
     pub bucket: String,
@@ -65,8 +91,14 @@ pub struct PutObjectRequest {
     pub user_metadata: BTreeMap<String, String>,
     /// Expected MD5 (`Content-MD5`); the write fails with [`StoreError::BadDigest`] on mismatch.
     pub content_md5: Option<[u8; 16]>,
-    /// `If-None-Match: *`: fail with [`StoreError::PreconditionFailed`] if the key exists.
-    pub if_absent: bool,
+    /// Precondition on the key's current version (`If-None-Match: *`, `If-Match`).
+    pub condition: WriteCondition,
+    /// The body's checksum, filled in by the server while the body streams.
+    pub checksum: Option<ChecksumSlot>,
+    /// For multipart uploads: checksum algorithm and type requested at creation.
+    pub multipart_checksum: Option<String>,
+    /// Object tags. On copies, `None` keeps the source's tags (`x-amz-tagging-directive: COPY`).
+    pub tags: Option<BTreeMap<String, String>>,
     /// Object Lock retention for the new object (needs a lock-enabled bucket); without it the
     /// bucket's default retention applies.
     pub lock_mode: Option<String>,
@@ -86,7 +118,12 @@ pub struct DeleteResult {
 #[derive(Debug, Clone, Default)]
 pub struct VersionsPage {
     pub versions: Vec<ObjectRecord>,
+    /// Keys rolled up by the delimiter.
+    pub common_prefixes: Vec<String>,
     pub truncated: bool,
+    /// Where the next page starts (set when truncated).
+    pub next_key_marker: Option<String>,
+    pub next_version_id_marker: Option<String>,
 }
 
 /// One entry of a CompleteMultipartUpload request.
@@ -106,7 +143,37 @@ pub struct PartsPage {
 #[derive(Debug, Clone, Default)]
 pub struct UploadsPage {
     pub uploads: Vec<UploadRecord>,
+    /// Keys rolled up by the delimiter.
+    pub common_prefixes: Vec<String>,
     pub truncated: bool,
+    /// Where the next page starts (set when truncated).
+    pub next_key_marker: Option<String>,
+    pub next_upload_id_marker: Option<String>,
+}
+
+/// What one lifecycle pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LifecycleReport {
+    /// Current versions expired (deleted, or hidden by a delete marker).
+    pub expired: u64,
+    /// Noncurrent versions permanently deleted.
+    pub purged: u64,
+    /// Expired object delete markers removed.
+    pub markers: u64,
+    /// Versions moved to another storage class.
+    pub transitioned: u64,
+    pub aborted: u64,
+}
+
+/// Entries fetched per metadata query while listing with a delimiter.
+const LIST_BATCH: u32 = 1000;
+
+/// The common prefix `key` rolls up into under `prefix` and `delimiter`, if any.
+fn rolled_up<'a>(key: &'a str, prefix: &str, delimiter: Option<&str>) -> Option<&'a str> {
+    let d = delimiter.filter(|d| !d.is_empty())?;
+    let rest = key.strip_prefix(prefix)?;
+    let pos = rest.find(d)?;
+    Some(&key[..prefix.len() + pos + d.len()])
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +238,44 @@ fn check_unlocked(o: &ObjectRecord, bypass_governance: bool) -> Result<()> {
     Ok(())
 }
 
+/// S3's limits on object tags.
+pub const MAX_TAGS: usize = 10;
+const MAX_TAG_KEY: usize = 128;
+const MAX_TAG_VALUE: usize = 256;
+
+/// Checks a tag set against S3's rules: at most [`MAX_TAGS`] tags, keys of 1-128 and values of
+/// 0-256 characters, made of letters, digits, whitespace and `_ . : / = + - @`.
+pub fn validate_tags(tags: &BTreeMap<String, String>) -> Result<()> {
+    if tags.len() > MAX_TAGS {
+        return Err(StoreError::InvalidTag(format!(
+            "an object can have at most {MAX_TAGS} tags"
+        )));
+    }
+    let allowed = |s: &str| {
+        s.chars()
+            .all(|c| c.is_alphanumeric() || c.is_whitespace() || "_.:/=+-@".contains(c))
+    };
+    for (k, v) in tags {
+        let (kl, vl) = (k.chars().count(), v.chars().count());
+        if kl == 0 || kl > MAX_TAG_KEY {
+            return Err(StoreError::InvalidTag(format!(
+                "tag keys must be 1-{MAX_TAG_KEY} characters"
+            )));
+        }
+        if vl > MAX_TAG_VALUE {
+            return Err(StoreError::InvalidTag(format!(
+                "tag values must be at most {MAX_TAG_VALUE} characters"
+            )));
+        }
+        if !allowed(k) || !allowed(v) {
+            return Err(StoreError::InvalidTag(format!(
+                "tag {k:?} contains characters S3 does not allow"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_key(key: &str) -> Result<()> {
     if key.is_empty() || key.len() > MAX_KEY_LEN {
         return Err(StoreError::InvalidObjectKey);
@@ -178,8 +283,12 @@ fn validate_key(key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Bucket names the server keeps for itself (e.g. the health check at `/suhms/health`).
+pub const RESERVED_BUCKETS: &[&str] = &["suhms"];
+
 fn validate_bucket_name(name: &str) -> Result<()> {
-    let ok = (3..=63).contains(&name.len())
+    let ok = !RESERVED_BUCKETS.contains(&name)
+        && (3..=63).contains(&name.len())
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
@@ -653,9 +762,13 @@ impl Store {
     ) -> Result<ObjectRecord> {
         validate_key(&req.key)?;
         Self::check_user_metadata(&req.user_metadata)?;
-        if req.if_absent && self.meta.get_object(&req.bucket, &req.key).await?.is_some() {
+        let tags = req.tags.clone().unwrap_or_default();
+        validate_tags(&tags)?;
+        if req.condition != WriteCondition::None {
             // Cheap early exit; the metadata store re-checks atomically at commit.
-            return Err(StoreError::PreconditionFailed);
+            let latest = self.meta.get_object(&req.bucket, &req.key).await?;
+            req.condition
+                .check(latest.as_ref().map(|l| &l.object), &req.bucket, &req.key)?;
         }
         self.check_quota(&bucket.owner, 0).await?;
         let (replicas, explicit) = self
@@ -701,6 +814,8 @@ impl Store {
                 lock_mode,
                 lock_until,
                 legal_hold: req.legal_hold,
+                checksum: take_slot(req.checksum.as_ref()),
+                tags,
             },
             replicas: outcome.written,
         };
@@ -721,18 +836,18 @@ impl Store {
                 "object stored with fewer copies than requested; repair will add the rest"
             );
         }
-        self.commit_object(written, req.if_absent, mode).await
+        self.commit_object(written, &req.condition, mode).await
     }
 
     async fn commit_object(
         &self,
         written: StoredObject,
-        if_absent: bool,
+        cond: &WriteCondition,
         mode: VersioningMode,
     ) -> Result<ObjectRecord> {
         match self
             .meta
-            .put_object(&written.object, &written.replicas, if_absent, mode)
+            .put_object(&written.object, &written.replicas, cond, mode)
             .await
         {
             Ok(removed) => {
@@ -755,13 +870,37 @@ impl Store {
         owner: &str,
         src_bucket: &str,
         src_key: &str,
-        mut dest: PutObjectRequest,
+        dest: PutObjectRequest,
         replace_metadata: bool,
     ) -> Result<ObjectRecord> {
-        let src = self.owned_object(owner, src_bucket, src_key).await?;
+        let src = CopySource {
+            bucket: src_bucket,
+            key: src_key,
+            version_id: None,
+        };
+        Ok(self
+            .copy_object_with(owner, src, dest, replace_metadata, None)
+            .await?
+            .0)
+    }
+
+    /// Like [`Store::copy_object`], from a specific version if given, with the source stream
+    /// optionally wrapped by `wrap`. Returns the new object and the source version.
+    pub async fn copy_object_with(
+        &self,
+        owner: &str,
+        src: CopySource<'_>,
+        mut dest: PutObjectRequest,
+        replace_metadata: bool,
+        wrap: Option<CopyWrap>,
+    ) -> Result<(ObjectRecord, ObjectRecord)> {
+        let source = self
+            .owned_version(owner, src.bucket, src.key, src.version_id)
+            .await?;
         let bucket = self.owned_bucket(owner, &dest.bucket).await?;
-        if src_bucket == dest.bucket
-            && src_key == dest.key
+        if src.bucket == dest.bucket
+            && src.key == dest.key
+            && src.version_id.is_none()
             && !replace_metadata
             && dest.storage_class.is_none()
         {
@@ -771,12 +910,19 @@ impl Store {
             ));
         }
         if !replace_metadata {
-            dest.content_type.clone_from(&src.object.content_type);
-            dest.user_metadata.clone_from(&src.object.user_metadata);
+            dest.content_type.clone_from(&source.object.content_type);
+            dest.user_metadata.clone_from(&source.object.user_metadata);
+        }
+        if dest.tags.is_none() {
+            dest.tags = Some(source.object.tags.clone());
         }
         dest.content_md5 = None;
-        let reader = self.read_object(&src, 0..src.object.size).await?;
-        self.write_object(&bucket, dest, reader).await
+        let mut reader = self.read_object(&source, 0..source.object.size).await?;
+        if let Some(wrap) = wrap {
+            reader = wrap(&source.object, reader);
+        }
+        let written = self.write_object(&bucket, dest, reader).await?;
+        Ok((written, source.object))
     }
 
     // ---- multipart uploads ----
@@ -790,6 +936,8 @@ impl Store {
     ) -> Result<UploadRecord> {
         validate_key(&req.key)?;
         Self::check_user_metadata(&req.user_metadata)?;
+        let tags = req.tags.clone().unwrap_or_default();
+        validate_tags(&tags)?;
         let bucket = self.owned_bucket(owner, &req.bucket).await?;
         let (replicas, explicit) = self
             .resolve_replicas(&bucket, req.storage_class.as_deref())
@@ -813,6 +961,8 @@ impl Store {
             replicas_explicit: explicit,
             disks: targets.iter().map(DiskRef::id).collect(),
             created_at: now_millis(),
+            checksum: req.multipart_checksum,
+            tags,
         };
         self.meta.create_upload(&upload).await?;
         Ok(upload)
@@ -833,6 +983,17 @@ impl Store {
             .ok_or(StoreError::NoSuchUpload)
     }
 
+    /// An unfinished multipart upload of the tenant's object.
+    pub async fn get_multipart_upload(
+        &self,
+        owner: &str,
+        bucket: &str,
+        key: &str,
+        upload_id: Uuid,
+    ) -> Result<UploadRecord> {
+        self.owned_upload(owner, bucket, key, upload_id).await
+    }
+
     /// Stores one part. Re-uploading a part number replaces the earlier part.
     #[allow(clippy::too_many_arguments)]
     pub async fn upload_part<R: AsyncRead + Unpin>(
@@ -843,6 +1004,32 @@ impl Store {
         upload_id: Uuid,
         part_number: u32,
         content_md5: Option<[u8; 16]>,
+        body: R,
+    ) -> Result<PartRecord> {
+        self.upload_part_with(
+            owner,
+            bucket,
+            key,
+            upload_id,
+            part_number,
+            content_md5,
+            None,
+            body,
+        )
+        .await
+    }
+
+    /// Like [`Store::upload_part`], recording the checksum published to `checksum`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_part_with<R: AsyncRead + Unpin>(
+        &self,
+        owner: &str,
+        bucket: &str,
+        key: &str,
+        upload_id: Uuid,
+        part_number: u32,
+        content_md5: Option<[u8; 16]>,
+        checksum: Option<ChecksumSlot>,
         body: R,
     ) -> Result<PartRecord> {
         if !(1..=MAX_PART_NUMBER).contains(&part_number) {
@@ -887,6 +1074,7 @@ impl Store {
             blake3: outcome.blake3,
             disks: outcome.written,
             created_at: now_millis(),
+            checksum: take_slot(checksum.as_ref()),
         };
         match self.meta.put_part(&part).await {
             Ok(previous) => {
@@ -906,7 +1094,8 @@ impl Store {
         }
     }
 
-    /// Stores a part copied from (a byte range of) an existing object.
+    /// Stores a part copied from (a byte range of) an existing object (version). `wrap` may
+    /// wrap the source stream and fill `checksum`. Returns the part and the source version.
     #[allow(clippy::too_many_arguments)]
     pub async fn upload_part_copy(
         &self,
@@ -915,20 +1104,37 @@ impl Store {
         key: &str,
         upload_id: Uuid,
         part_number: u32,
-        src_bucket: &str,
-        src_key: &str,
+        src: CopySource<'_>,
         range: Option<std::ops::Range<u64>>,
-    ) -> Result<PartRecord> {
-        let src = self.owned_object(owner, src_bucket, src_key).await?;
-        let range = range.unwrap_or(0..src.object.size);
-        if range.start > range.end || range.end > src.object.size {
+        wrap: Option<CopyWrap>,
+        checksum: Option<ChecksumSlot>,
+    ) -> Result<(PartRecord, ObjectRecord)> {
+        let source = self
+            .owned_version(owner, src.bucket, src.key, src.version_id)
+            .await?;
+        let range = range.unwrap_or(0..source.object.size);
+        if range.start > range.end || range.end > source.object.size {
             return Err(StoreError::InvalidArgument(
                 "copy range is out of bounds".into(),
             ));
         }
-        let reader = self.read_object(&src, range).await?;
-        self.upload_part(owner, bucket, key, upload_id, part_number, None, reader)
-            .await
+        let mut reader = self.read_object(&source, range).await?;
+        if let Some(wrap) = wrap {
+            reader = wrap(&source.object, reader);
+        }
+        let part = self
+            .upload_part_with(
+                owner,
+                bucket,
+                key,
+                upload_id,
+                part_number,
+                None,
+                checksum,
+                reader,
+            )
+            .await?;
+        Ok((part, source.object))
     }
 
     pub async fn list_parts(
@@ -949,25 +1155,79 @@ impl Store {
         Ok((upload, PartsPage { parts, truncated }))
     }
 
+    /// Lists unfinished multipart uploads under `prefix` in (key, upload id) order, after
+    /// (`key_marker`, `upload_id_marker`), with keys containing `delimiter` after the prefix
+    /// rolled up into common prefixes.
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_multipart_uploads(
         &self,
         owner: &str,
         bucket: &str,
         prefix: &str,
-        after_key: &str,
-        after_id: &str,
+        delimiter: Option<&str>,
+        key_marker: &str,
+        upload_id_marker: &str,
         max_uploads: usize,
     ) -> Result<UploadsPage> {
         self.owned_bucket(owner, bucket).await?;
         let max = max_uploads.min(1000);
-        let limit = u32::try_from(max + 1).unwrap_or(u32::MAX);
-        let mut uploads = self
-            .meta
-            .list_uploads(bucket, prefix, after_key, after_id, limit)
-            .await?;
-        let truncated = uploads.len() > max;
-        uploads.truncate(max);
-        Ok(UploadsPage { uploads, truncated })
+        let mut page = UploadsPage::default();
+        if max == 0 {
+            return Ok(page);
+        }
+        // Without an upload id marker, S3 starts after every upload of `key_marker`. Skipped
+        // here rather than with a sentinel id, whose sort order would depend on the database
+        // collation.
+        let skip_key =
+            (upload_id_marker.is_empty() && !key_marker.is_empty()).then(|| key_marker.to_owned());
+        let (mut key, mut id) = match rolled_up(key_marker, prefix, delimiter) {
+            Some(cp) if cp.len() == key_marker.len() => {
+                (format!("{key_marker}{PREFIX_SKIP}"), String::new())
+            }
+            _ => (key_marker.to_owned(), upload_id_marker.to_owned()),
+        };
+        'fetch: loop {
+            let batch = self
+                .meta
+                .list_uploads(bucket, prefix, &key, &id, LIST_BATCH)
+                .await?;
+            let exhausted = batch.len() < LIST_BATCH as usize;
+            for u in batch {
+                if !u.key.starts_with(prefix) {
+                    break 'fetch;
+                }
+                if skip_key.as_deref() == Some(u.key.as_str()) {
+                    key.clone_from(&u.key);
+                    id = u.id.to_string();
+                    continue;
+                }
+                if page.uploads.len() + page.common_prefixes.len() == max {
+                    page.truncated = true;
+                    break 'fetch;
+                }
+                if let Some(cp) = rolled_up(&u.key, prefix, delimiter) {
+                    page.next_key_marker = Some(cp.to_owned());
+                    page.next_upload_id_marker = None;
+                    page.common_prefixes.push(cp.to_owned());
+                    key = format!("{cp}{PREFIX_SKIP}");
+                    id = String::new();
+                    continue 'fetch;
+                }
+                key.clone_from(&u.key);
+                id = u.id.to_string();
+                page.next_key_marker = Some(u.key.clone());
+                page.next_upload_id_marker = Some(id.clone());
+                page.uploads.push(u);
+            }
+            if exhausted {
+                break;
+            }
+        }
+        if !page.truncated {
+            page.next_key_marker = None;
+            page.next_upload_id_marker = None;
+        }
+        Ok(page)
     }
 
     async fn remove_upload_files(&self, upload: &UploadRecord, parts: &[PartRecord]) {
@@ -1008,7 +1268,36 @@ impl Store {
         upload_id: Uuid,
         requested: &[CompletedPart],
     ) -> Result<ObjectRecord> {
+        self.complete_multipart_upload_with(
+            owner,
+            bucket,
+            key,
+            upload_id,
+            requested,
+            WriteCondition::None,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Store::complete_multipart_upload`], with a precondition on the key and a
+    /// function computing the object's checksum from its parts.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn complete_multipart_upload_with(
+        &self,
+        owner: &str,
+        bucket: &str,
+        key: &str,
+        upload_id: Uuid,
+        requested: &[CompletedPart],
+        cond: WriteCondition,
+        checksum: Option<CompleteChecksum>,
+    ) -> Result<ObjectRecord> {
         let upload = self.owned_upload(owner, bucket, key, upload_id).await?;
+        if cond != WriteCondition::None {
+            let latest = self.meta.get_object(bucket, key).await?;
+            cond.check(latest.as_ref().map(|l| &l.object), bucket, key)?;
+        }
         let bucket_rec = self.require_bucket(bucket).await?;
         let mode = VersioningMode::of(&bucket_rec);
         let (lock_mode, lock_until) = Self::retention_for(&bucket_rec, None, None)?;
@@ -1061,6 +1350,10 @@ impl Store {
             md5.update(hex::decode(&p.etag).map_err(|e| StoreError::Metadata(Box::new(e)))?);
         }
         let etag = format!("{}-{}", hex::encode(md5.finalize()), chosen.len());
+        let object_checksum = match checksum {
+            Some(f) => f(&upload, &chosen)?,
+            None => None,
+        };
         let size: u64 = chosen.iter().map(|p| p.size).sum();
         self.check_quota(owner, size).await?;
         let blobs: Vec<(Uuid, String)> = chosen
@@ -1121,6 +1414,8 @@ impl Store {
                 lock_mode,
                 lock_until,
                 legal_hold: false,
+                checksum: object_checksum,
+                tags: upload.tags.clone(),
             },
             replicas: written.iter().map(|(d, _)| *d).collect(),
         };
@@ -1135,7 +1430,13 @@ impl Store {
 
         match self
             .meta
-            .complete_upload(upload_id, &new_object.object, &new_object.replicas, mode)
+            .complete_upload(
+                upload_id,
+                &new_object.object,
+                &new_object.replicas,
+                &cond,
+                mode,
+            )
             .await
         {
             Ok((parts, removed)) => {
@@ -1226,7 +1527,11 @@ impl Store {
             delete_marker: true,
             ..ObjectRecord::default()
         };
-        for prev in self.meta.put_object(&marker, &[], false, mode).await? {
+        for prev in self
+            .meta
+            .put_object(&marker, &[], &WriteCondition::None, mode)
+            .await?
+        {
             self.remove_files(&prev).await;
         }
         Ok(DeleteResult {
@@ -1295,41 +1600,81 @@ impl Store {
         Ok(v)
     }
 
-    /// Lists every version (and delete marker) under `prefix`, newest first per key.
+    /// Lists every version (and delete marker) under `prefix`, newest first per key, after
+    /// (`key_marker`, `version_marker`), with keys containing `delimiter` after the prefix
+    /// rolled up into common prefixes.
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_object_versions(
         &self,
         owner: &str,
         bucket: &str,
         prefix: &str,
+        delimiter: Option<&str>,
         key_marker: &str,
         version_marker: Option<&str>,
         max: usize,
     ) -> Result<VersionsPage> {
         self.owned_bucket(owner, bucket).await?;
-        let resume = match version_marker {
-            Some(v) if !key_marker.is_empty() => self
-                .meta
-                .get_object_version(bucket, key_marker, v)
-                .await?
-                .map(|o| (o.object.created_at, o.object.id.to_string())),
-            _ => None,
-        };
-        let (created, id) = resume.unwrap_or((i64::MIN, String::new()));
         let max = max.min(1000);
-        let limit = u32::try_from(max + 1).unwrap_or(u32::MAX);
-        let mut versions: Vec<ObjectRecord> = self
-            .meta
-            .list_object_versions(bucket, prefix, (key_marker, created, &id), limit)
-            .await?
-            .into_iter()
-            .take_while(|o| o.key.starts_with(prefix))
-            .collect();
-        let truncated = versions.len() > max;
-        versions.truncate(max);
-        Ok(VersionsPage {
-            versions,
-            truncated,
-        })
+        let mut page = VersionsPage::default();
+        if max == 0 {
+            return Ok(page);
+        }
+        // Resume point (key, created_at, id): versions after it in (key, newest first) order.
+        let mut cursor: (String, i64, String) = match rolled_up(key_marker, prefix, delimiter) {
+            Some(cp) if cp.len() == key_marker.len() => (
+                format!("{key_marker}{PREFIX_SKIP}"),
+                i64::MIN,
+                String::new(),
+            ),
+            _ => {
+                let resume = match version_marker {
+                    Some(v) if !key_marker.is_empty() => self
+                        .meta
+                        .get_object_version(bucket, key_marker, v)
+                        .await?
+                        .map(|o| (o.object.created_at, o.object.id.to_string())),
+                    _ => None,
+                };
+                let (created, id) = resume.unwrap_or((i64::MIN, String::new()));
+                (key_marker.to_owned(), created, id)
+            }
+        };
+        'fetch: loop {
+            let batch = self
+                .meta
+                .list_object_versions(bucket, prefix, (&cursor.0, cursor.1, &cursor.2), LIST_BATCH)
+                .await?;
+            let exhausted = batch.len() < LIST_BATCH as usize;
+            for o in batch {
+                if !o.key.starts_with(prefix) {
+                    break 'fetch;
+                }
+                if page.versions.len() + page.common_prefixes.len() == max {
+                    page.truncated = true;
+                    break 'fetch;
+                }
+                if let Some(cp) = rolled_up(&o.key, prefix, delimiter) {
+                    page.next_key_marker = Some(cp.to_owned());
+                    page.next_version_id_marker = None;
+                    page.common_prefixes.push(cp.to_owned());
+                    cursor = (format!("{cp}{PREFIX_SKIP}"), i64::MIN, String::new());
+                    continue 'fetch;
+                }
+                cursor = (o.key.clone(), o.created_at, o.id.to_string());
+                page.next_key_marker = Some(o.key.clone());
+                page.next_version_id_marker = Some(o.version_id.clone());
+                page.versions.push(o);
+            }
+            if exhausted {
+                break;
+            }
+        }
+        if !page.truncated {
+            page.next_key_marker = None;
+            page.next_version_id_marker = None;
+        }
+        Ok(page)
     }
 
     // ---- bucket configuration: versioning, lifecycle, object lock, CORS ----
@@ -1499,6 +1844,41 @@ impl Store {
         Ok(())
     }
 
+    /// Replaces the tags of an object version (the latest when `version_id` is `None`).
+    /// Returns the version that was tagged.
+    pub async fn set_object_tags(
+        &self,
+        owner: &str,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        tags: &BTreeMap<String, String>,
+    ) -> Result<ObjectRecord> {
+        validate_tags(tags)?;
+        let v = self.owned_version(owner, bucket, key, version_id).await?;
+        if !self.meta.set_object_tags(v.object.id, tags).await? {
+            return Err(StoreError::NoSuchKey {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+            });
+        }
+        Ok(v.object)
+    }
+
+    /// An object version with its tags.
+    pub async fn object_tags(
+        &self,
+        owner: &str,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> Result<ObjectRecord> {
+        Ok(self
+            .owned_version(owner, bucket, key, version_id)
+            .await?
+            .object)
+    }
+
     pub async fn set_legal_hold(
         &self,
         owner: &str,
@@ -1539,6 +1919,16 @@ impl Store {
         rules: Option<&[LifecycleRule]>,
     ) -> Result<()> {
         self.owned_bucket(owner, bucket).await?;
+        for rule in rules.unwrap_or_default() {
+            for t in rule.transitions.iter().chain(&rule.noncurrent_transitions) {
+                let n = *self
+                    .config
+                    .storage_classes
+                    .get(&t.storage_class)
+                    .ok_or_else(|| StoreError::UnknownStorageClass(t.storage_class.clone()))?;
+                self.check_replicas(n).await?;
+            }
+        }
         let value = rules.map(lifecycle::encode);
         self.meta
             .set_bucket_setting(bucket, BucketSetting::Lifecycle, value.as_deref())
@@ -1560,43 +1950,83 @@ impl Store {
         Ok(())
     }
 
-    /// Applies every bucket's lifecycle rules once. Returns (expired, noncurrent deleted,
-    /// uploads aborted).
-    pub async fn apply_lifecycle(&self) -> Result<(u64, u64, u64)> {
+    /// Applies every bucket's lifecycle rules once.
+    pub async fn apply_lifecycle(&self) -> Result<LifecycleReport> {
         let now = now_millis();
-        let (mut expired, mut purged, mut aborted) = (0, 0, 0);
+        let mut report = LifecycleReport::default();
         for b in self.meta.list_all_buckets().await? {
             let Some(rules) = b.lifecycle.as_deref().map(lifecycle::decode) else {
                 continue;
             };
             for rule in rules.iter().filter(|r| r.enabled) {
-                let days = |d: u32| now - i64::from(d) * 86_400_000;
-                if let Some(d) = rule.expiration_days {
+                report.transitioned += self
+                    .lifecycle_transitions(&b.name, rule, false, &rule.transitions, now)
+                    .await?;
+                report.transitioned += self
+                    .lifecycle_transitions(&b.name, rule, true, &rule.noncurrent_transitions, now)
+                    .await?;
+                if let Some(cut) =
+                    lifecycle::cutoff(now, rule.expiration_days, rule.expiration_date)
+                {
                     for o in self
-                        .lifecycle_scan(&b.name, &rule.prefix, false, days(d))
+                        .lifecycle_scan(&b.name, &rule.prefix, LifecycleScan::Current, cut)
                         .await?
+                        .into_iter()
+                        .filter(|o| rule.matches(o))
                     {
                         self.delete_object(&b.owner, &b.name, &o.key).await?;
-                        expired += 1;
+                        report.expired += 1;
                     }
                 }
-                if let Some(d) = rule.noncurrent_days {
-                    for o in self
-                        .lifecycle_scan(&b.name, &rule.prefix, true, days(d))
-                        .await?
-                    {
+                if let Some(cut) = lifecycle::cutoff(now, rule.noncurrent_days, None) {
+                    let candidates = self
+                        .lifecycle_scan(&b.name, &rule.prefix, LifecycleScan::Noncurrent, cut)
+                        .await?;
+                    let mut ranks = HashMap::new();
+                    for o in candidates {
+                        if !rule.matches(&o)
+                            || !self
+                                .beyond_newer(
+                                    &b.name,
+                                    &o,
+                                    rule.newer_noncurrent_versions,
+                                    &mut ranks,
+                                )
+                                .await?
+                        {
+                            continue;
+                        }
                         match self
                             .delete_object_version(&b.owner, &b.name, &o.key, &o.version_id, false)
                             .await
                         {
-                            Ok(_) => purged += 1,
+                            Ok(_) => report.purged += 1,
                             Err(StoreError::ObjectLocked) => {}
                             Err(e) => return Err(e),
                         }
                     }
                 }
-                if let Some(d) = rule.abort_multipart_days {
-                    let cutoff = days(d);
+                if rule.expired_object_delete_marker {
+                    // After noncurrent versions are purged, so markers they leave alone go
+                    // in the same pass.
+                    for o in self
+                        .lifecycle_scan(&b.name, &rule.prefix, LifecycleScan::DeleteMarkers, now)
+                        .await?
+                    {
+                        if self.only_version(&b.name, &o).await? {
+                            self.delete_object_version(
+                                &b.owner,
+                                &b.name,
+                                &o.key,
+                                &o.version_id,
+                                false,
+                            )
+                            .await?;
+                            report.markers += 1;
+                        }
+                    }
+                }
+                if let Some(cutoff) = lifecycle::cutoff(now, rule.abort_multipart_days, None) {
                     let uploads = self
                         .meta
                         .list_uploads(&b.name, &rule.prefix, "", "", 1000)
@@ -1604,20 +2034,138 @@ impl Store {
                     for u in uploads.into_iter().filter(|u| u.created_at < cutoff) {
                         if let Some((upload, parts)) = self.meta.delete_upload(u.id).await? {
                             self.remove_upload_files(&upload, &parts).await;
-                            aborted += 1;
+                            report.aborted += 1;
                         }
                     }
                 }
             }
         }
-        Ok((expired, purged, aborted))
+        Ok(report)
+    }
+
+    /// For `NewerNoncurrentVersions`: whether noncurrent version `o` is older than the `keep`
+    /// newest noncurrent versions of its key. `ranks` caches each key's ranking.
+    async fn beyond_newer(
+        &self,
+        bucket: &str,
+        o: &ObjectRecord,
+        keep: Option<u32>,
+        ranks: &mut HashMap<String, HashMap<Uuid, usize>>,
+    ) -> Result<bool> {
+        let Some(keep) = keep else { return Ok(true) };
+        if !ranks.contains_key(&o.key) {
+            let mut rank = HashMap::new();
+            let mut after = (o.key.clone(), i64::MAX, String::new());
+            let mut n = 0;
+            loop {
+                let page = self
+                    .meta
+                    .list_object_versions(bucket, &o.key, (&after.0, after.1, &after.2), PAGE)
+                    .await?;
+                let mine: Vec<&ObjectRecord> = page.iter().filter(|v| v.key == o.key).collect();
+                for v in mine.iter().filter(|v| !v.is_latest) {
+                    rank.insert(v.id, n);
+                    n += 1;
+                }
+                match page.last() {
+                    Some(last) if last.key == o.key && page.len() == PAGE as usize => {
+                        after = (last.key.clone(), last.created_at, last.id.to_string());
+                    }
+                    _ => break,
+                }
+            }
+            ranks.insert(o.key.clone(), rank);
+        }
+        let rank = ranks[&o.key].get(&o.id).copied().unwrap_or(usize::MAX);
+        Ok(rank >= keep as usize)
+    }
+
+    /// Whether `o` is the only version of its key.
+    async fn only_version(&self, bucket: &str, o: &ObjectRecord) -> Result<bool> {
+        let versions = self
+            .meta
+            .list_object_versions(bucket, &o.key, (&o.key, i64::MAX, ""), 2)
+            .await?;
+        Ok(versions
+            .iter()
+            .filter(|v| v.key == o.key)
+            .all(|v| v.id == o.id))
+    }
+
+    /// Moves versions old enough for a transition to its storage class (the transition whose
+    /// cutoff is earliest wins, i.e. the one with the most days). Returns how many versions
+    /// changed class.
+    async fn lifecycle_transitions(
+        &self,
+        bucket: &str,
+        rule: &LifecycleRule,
+        noncurrent: bool,
+        transitions: &[Transition],
+        now: i64,
+    ) -> Result<u64> {
+        let mut active: Vec<(i64, &Transition)> = transitions
+            .iter()
+            .filter_map(|t| {
+                let days = (t.date.is_none()).then_some(t.days);
+                lifecycle::cutoff(now, days, t.date).map(|c| (c, t))
+            })
+            .collect();
+        active.sort_by_key(|(c, _)| *c);
+        let scan = if noncurrent {
+            LifecycleScan::Noncurrent
+        } else {
+            LifecycleScan::Current
+        };
+        let mut moved = 0;
+        let mut ranks = HashMap::new();
+        // Versions older than this belong to a transition with an earlier cutoff.
+        let mut older_cutoff = i64::MIN;
+        for (cutoff, t) in active {
+            let Some(&replicas) = self.config.storage_classes.get(&t.storage_class) else {
+                tracing::warn!(bucket, class = %t.storage_class, "lifecycle transition to unknown storage class");
+                continue;
+            };
+            for o in self
+                .lifecycle_scan(bucket, &rule.prefix, scan, cutoff)
+                .await?
+            {
+                let age_from = if noncurrent {
+                    o.noncurrent_at.unwrap_or(o.created_at)
+                } else {
+                    o.created_at
+                };
+                if age_from < older_cutoff
+                    || o.delete_marker
+                    || o.storage_class.as_deref() == Some(&t.storage_class)
+                    || !rule.matches(&o)
+                {
+                    continue;
+                }
+                if noncurrent
+                    && !self
+                        .beyond_newer(bucket, &o, t.newer_noncurrent_versions, &mut ranks)
+                        .await?
+                {
+                    continue;
+                }
+                if self
+                    .meta
+                    .set_object_storage_class(o.id, &t.storage_class, replicas)
+                    .await?
+                {
+                    moved += 1;
+                }
+            }
+            older_cutoff = cutoff;
+        }
+        Ok(moved)
     }
 
     async fn lifecycle_scan(
         &self,
         bucket: &str,
         prefix: &str,
-        noncurrent: bool,
+        scan: LifecycleScan,
         before: i64,
     ) -> Result<Vec<ObjectRecord>> {
         let mut out = Vec::new();
@@ -1625,14 +2173,7 @@ impl Store {
         loop {
             let page = self
                 .meta
-                .lifecycle_candidates(
-                    bucket,
-                    prefix,
-                    noncurrent,
-                    before,
-                    (&after_key, &after_id),
-                    PAGE,
-                )
+                .lifecycle_candidates(bucket, prefix, scan, before, (&after_key, &after_id), PAGE)
                 .await?;
             let Some(last) = page.last() else { break };
             after_key.clone_from(&last.key);

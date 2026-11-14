@@ -55,6 +55,9 @@ pub enum StoreError {
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
+    #[error("invalid tag: {0}")]
+    InvalidTag(String),
+
     #[error("multipart upload does not exist")]
     NoSuchUpload,
 

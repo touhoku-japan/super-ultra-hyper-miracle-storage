@@ -22,33 +22,37 @@ use s3s::{
     auth::{S3Auth, SecretKey},
     dto::{
         AbortIncompleteMultipartUpload, AbortMultipartUploadInput, AbortMultipartUploadOutput,
-        Bucket, BucketLocationConstraint, BucketVersioningStatus, CORSRule, Checksum, CommonPrefix,
-        CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput,
-        CopyObjectOutput, CopyObjectResult, CopyPartResult, CopySource, CreateBucketInput,
-        CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
-        DefaultRetention, DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketInput,
+        Bucket, BucketLocationConstraint, BucketVersioningStatus, CORSRule, Checksum,
+        ChecksumAlgorithm, ChecksumType, CommonPrefix, CompleteMultipartUploadInput,
+        CompleteMultipartUploadOutput, CopyObjectInput, CopyObjectOutput, CopyObjectResult,
+        CopyPartResult, CopySource, CreateBucketInput, CreateBucketOutput,
+        CreateMultipartUploadInput, CreateMultipartUploadOutput, DefaultRetention,
+        DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketInput,
         DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput, DeleteBucketOutput,
-        DeleteMarkerEntry, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput,
-        DeleteObjectsOutput, DeletedObject, ETag, ETagCondition, ExpirationStatus,
-        GetBucketCorsInput, GetBucketCorsOutput, GetBucketLifecycleConfigurationInput,
-        GetBucketLifecycleConfigurationOutput, GetBucketLocationInput, GetBucketLocationOutput,
-        GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectInput,
-        GetObjectLegalHoldInput, GetObjectLegalHoldOutput, GetObjectLockConfigurationInput,
+        DeleteMarkerEntry, DeleteObjectInput, DeleteObjectOutput, DeleteObjectTaggingInput,
+        DeleteObjectTaggingOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
+        ETagCondition, ExpirationStatus, GetBucketCorsInput, GetBucketCorsOutput,
+        GetBucketLifecycleConfigurationInput, GetBucketLifecycleConfigurationOutput,
+        GetBucketLocationInput, GetBucketLocationOutput, GetBucketVersioningInput,
+        GetBucketVersioningOutput, GetObjectInput, GetObjectLegalHoldInput,
+        GetObjectLegalHoldOutput, GetObjectLockConfigurationInput,
         GetObjectLockConfigurationOutput, GetObjectOutput, GetObjectRetentionInput,
-        GetObjectRetentionOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
-        HeadObjectOutput, Initiator, LifecycleExpiration, LifecycleRule as S3LifecycleRule,
-        ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput,
-        ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
-        ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput, MultipartUpload,
-        NoncurrentVersionExpiration, Object, ObjectLockConfiguration, ObjectLockEnabled,
-        ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention,
+        GetObjectRetentionOutput, GetObjectTaggingInput, GetObjectTaggingOutput, HeadBucketInput,
+        HeadBucketOutput, HeadObjectInput, HeadObjectOutput, Initiator, LifecycleExpiration,
+        LifecycleRule as S3LifecycleRule, ListBucketsInput, ListBucketsOutput,
+        ListMultipartUploadsInput, ListMultipartUploadsOutput, ListObjectVersionsInput,
+        ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
+        ListObjectsV2Output, ListPartsInput, ListPartsOutput, MultipartUpload,
+        NoncurrentVersionExpiration, NoncurrentVersionTransition, Object, ObjectLockConfiguration,
+        ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention,
         ObjectLockRetentionMode, ObjectLockRule, ObjectStorageClass, ObjectVersion,
         ObjectVersionStorageClass, Owner, Part, PutBucketCorsInput, PutBucketCorsOutput,
         PutBucketLifecycleConfigurationInput, PutBucketLifecycleConfigurationOutput,
         PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectInput,
         PutObjectLegalHoldInput, PutObjectLegalHoldOutput, PutObjectLockConfigurationInput,
         PutObjectLockConfigurationOutput, PutObjectOutput, PutObjectRetentionInput,
-        PutObjectRetentionOutput, StorageClass, StreamingBlob, Timestamp, UploadPartCopyInput,
+        PutObjectRetentionOutput, PutObjectTaggingInput, PutObjectTaggingOutput, StorageClass,
+        StreamingBlob, Timestamp, Transition, TransitionStorageClass, UploadPartCopyInput,
         UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
     },
     s3_error,
@@ -56,15 +60,17 @@ use s3s::{
 use std::sync::atomic::Ordering;
 
 use suhms_store::{
-    CompletedPart, ListPage, ListParams, ListStart, NULL_VERSION, ObjectRecord, PutObjectRequest,
-    Store, StoreError, lifecycle::LifecycleRule, meta::StoredObject,
+    BoxReader, CompleteChecksum, CompletedPart, CopyWrap, ListPage, ListParams, ListStart,
+    NULL_VERSION, ObjectRecord, PutObjectRequest, Store, StoreError, WriteCondition,
+    lifecycle::{self, LifecycleRule},
+    meta::StoredObject,
 };
 use tokio::io::AsyncRead;
 use tokio_util::io::{ReaderStream, StreamReader};
 use uuid::Uuid;
 
 use crate::{
-    checksum,
+    checksum::{self, Algo, Policy, Stored, UploadChecksum},
     crypto::SecretCipher,
     tenancy::{Class, Tenancy},
 };
@@ -253,6 +259,7 @@ fn s3_err(e: StoreError) -> S3Error {
             )
         }
         StoreError::InvalidRequest(m) => S3Error::with_message(S3ErrorCode::InvalidRequest, m),
+        StoreError::InvalidTag(m) => S3Error::with_message(S3ErrorCode::InvalidTag, m),
         e @ (StoreError::InvalidReplicaCount { .. } | StoreError::InvalidArgument(_)) => {
             S3Error::with_message(S3ErrorCode::InvalidArgument, e.to_string())
         }
@@ -421,16 +428,123 @@ fn class_name(c: Option<StorageClass>) -> Option<String> {
     c.map(|c| c.as_str().to_owned())
 }
 
-fn copy_source(src: &CopySource) -> S3Result<(String, String)> {
+/// Bucket, key and (optional) version of `x-amz-copy-source`.
+fn copy_source(src: &CopySource) -> S3Result<(String, String, Option<String>)> {
     match src {
         CopySource::Bucket {
             bucket,
             key,
-            version_id: None,
-        } => Ok((bucket.to_string(), key.to_string())),
-        CopySource::Bucket { .. } => Err(s3_error!(NotImplemented, "versioned copy sources")),
+            version_id,
+        } => Ok((
+            bucket.to_string(),
+            key.to_string(),
+            version_id.as_deref().map(str::to_owned),
+        )),
         _ => Err(s3_error!(NotImplemented, "access point copy sources")),
     }
+}
+
+/// The write precondition of `If-Match` / `If-None-Match` on PutObject and
+/// CompleteMultipartUpload.
+fn write_condition(
+    if_match: Option<&ETagCondition>,
+    if_none_match: Option<&ETagCondition>,
+) -> S3Result<WriteCondition> {
+    match (if_match, if_none_match) {
+        (Some(_), Some(_)) => Err(s3_error!(
+            NotImplemented,
+            "If-Match and If-None-Match together"
+        )),
+        (Some(ETagCondition::Any), None) => Ok(WriteCondition::Matches(None)),
+        (Some(ETagCondition::ETag(e)), None) => {
+            Ok(WriteCondition::Matches(Some(e.value().to_owned())))
+        }
+        (None, Some(ETagCondition::Any)) => Ok(WriteCondition::Absent),
+        (None, Some(ETagCondition::ETag(_))) => Err(s3_error!(
+            NotImplemented,
+            "If-None-Match on writes supports only *"
+        )),
+        (None, None) => Ok(WriteCondition::None),
+    }
+}
+
+/// The stored checksum to return, if the client asked for checksums (`x-amz-checksum-mode`).
+fn stored_checksum(rec: &ObjectRecord, mode: Option<&s3s::dto::ChecksumMode>) -> Option<Stored> {
+    mode.filter(|m| m.as_str() == s3s::dto::ChecksumMode::ENABLED)?;
+    Stored::decode(rec.checksum.as_deref())
+}
+
+/// Wraps a copy's source stream to compute the checksum the copy needs: the requested
+/// algorithm, else the source's, else the default.
+fn copy_wrap(
+    requested: Option<Algo>,
+    slot_out: &Arc<std::sync::Mutex<Option<suhms_store::ChecksumSlot>>>,
+) -> CopyWrap {
+    let slot_out = Arc::clone(slot_out);
+    Box::new(move |src: &ObjectRecord, reader: BoxReader| -> BoxReader {
+        let algo = requested
+            .or_else(|| Stored::decode(src.checksum.as_deref())?.algo())
+            .unwrap_or(checksum::DEFAULT_ALGO);
+        match checksum::wrap(reader, None, Policy::Always(algo)) {
+            Ok((r, _, slot)) => {
+                *slot_out.lock().expect("lock") = Some(slot);
+                Box::new(r)
+            }
+            Err(_) => unreachable!("no client checksum, so the algorithms cannot conflict"),
+        }
+    })
+}
+
+/// Parses `x-amz-tagging` (URL query encoding: `k1=v1&k2=v2`).
+fn parse_tagging(header: Option<&str>) -> S3Result<Option<BTreeMap<String, String>>> {
+    let Some(header) = header else {
+        return Ok(None);
+    };
+    let decode = |s: &str| {
+        percent_encoding::percent_decode_str(&s.replace('+', " "))
+            .decode_utf8()
+            .map(|s| s.into_owned())
+            .map_err(|_| s3_error!(InvalidTag, "x-amz-tagging is not valid UTF-8"))
+    };
+    let mut tags = BTreeMap::new();
+    for pair in header.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if tags.insert(decode(k)?, decode(v)?).is_some() {
+            return Err(s3_error!(InvalidTag, "duplicate tag key"));
+        }
+    }
+    Ok(Some(tags))
+}
+
+/// The tag set of a PutObjectTagging body.
+fn tag_set_to_map(set: Vec<s3s::dto::Tag>) -> S3Result<BTreeMap<String, String>> {
+    let mut tags = BTreeMap::new();
+    for t in set {
+        let key = t
+            .key
+            .ok_or_else(|| s3_error!(MalformedXML, "a tag needs a Key"))?;
+        if tags.insert(key, t.value.unwrap_or_default()).is_some() {
+            return Err(s3_error!(InvalidTag, "duplicate tag key"));
+        }
+    }
+    Ok(tags)
+}
+
+fn map_to_tag_set(tags: &BTreeMap<String, String>) -> Vec<s3s::dto::Tag> {
+    tags.iter()
+        .map(|(k, v)| s3s::dto::Tag {
+            key: Some(k.clone()),
+            value: Some(v.clone()),
+        })
+        .collect()
+}
+
+fn tag_count(rec: &ObjectRecord) -> Option<i32> {
+    (!rec.tags.is_empty()).then(|| i32::try_from(rec.tags.len()).unwrap_or(i32::MAX))
+}
+
+fn version_header(v: &str) -> Option<String> {
+    (v != NULL_VERSION).then(|| v.to_owned())
 }
 
 /// Parses `x-amz-copy-source-range: bytes=first-last` into a half-open range.
@@ -506,6 +620,238 @@ fn body_reader(body: Option<StreamingBlob>) -> Box<dyn AsyncRead + Unpin + Send>
     match body {
         Some(blob) => Box::new(StreamReader::new(blob.map_err(io::Error::other))),
         None => Box::new(tokio::io::empty()),
+    }
+}
+
+fn lifecycle_days(d: Option<i32>) -> S3Result<Option<u32>> {
+    d.map(|d| u32::try_from(d).map_err(|_| s3_error!(InvalidArgument, "days must not be negative")))
+        .transpose()
+}
+
+fn lifecycle_count(n: Option<i32>) -> S3Result<Option<u32>> {
+    n.map(|n| {
+        u32::try_from(n).ok().filter(|n| *n >= 1).ok_or_else(|| {
+            s3_error!(
+                InvalidArgument,
+                "NewerNoncurrentVersions must be at least 1"
+            )
+        })
+    })
+    .transpose()
+}
+
+fn lifecycle_size(n: Option<i64>) -> S3Result<Option<u64>> {
+    n.map(|n| {
+        u64::try_from(n).map_err(|_| s3_error!(InvalidArgument, "object size must not be negative"))
+    })
+    .transpose()
+}
+
+/// Converts one S3 lifecycle rule into the store's form.
+fn lifecycle_rule_from_s3(i: usize, r: &S3LifecycleRule) -> S3Result<LifecycleRule> {
+    let filter = r.filter.as_ref();
+    let and = filter.and_then(|f| f.and.as_ref());
+    let mut tag_filter: Vec<s3s::dto::Tag> =
+        filter.and_then(|f| f.tag.clone()).into_iter().collect();
+    tag_filter.extend(and.and_then(|a| a.tags.clone()).unwrap_or_default());
+    let tags = tag_set_to_map(tag_filter)?;
+    let expired_markers = r
+        .expiration
+        .as_ref()
+        .and_then(|e| e.expired_object_delete_marker)
+        .unwrap_or(false);
+    if expired_markers && !tags.is_empty() {
+        return Err(s3_error!(
+            InvalidRequest,
+            "ExpiredObjectDeleteMarker cannot be used with a tag filter"
+        ));
+    }
+    let prefix = filter
+        .and_then(|f| f.prefix.clone())
+        .or_else(|| and.and_then(|a| a.prefix.clone()))
+        .or(r.prefix.clone())
+        .unwrap_or_default();
+    let min_size = lifecycle_size(
+        filter
+            .and_then(|f| f.object_size_greater_than)
+            .or_else(|| and.and_then(|a| a.object_size_greater_than)),
+    )?;
+    let max_size = lifecycle_size(
+        filter
+            .and_then(|f| f.object_size_less_than)
+            .or_else(|| and.and_then(|a| a.object_size_less_than)),
+    )?;
+    let transition = |days: Option<i32>,
+                      date: Option<&Timestamp>,
+                      class: Option<&TransitionStorageClass>,
+                      newer: Option<i32>|
+     -> S3Result<lifecycle::Transition> {
+        let class =
+            class.ok_or_else(|| s3_error!(InvalidArgument, "a transition needs a StorageClass"))?;
+        let date = date.cloned().map(millis);
+        let days = lifecycle_days(days)?;
+        if date.is_some() == days.is_some() {
+            return Err(s3_error!(
+                InvalidArgument,
+                "a transition needs exactly one of Days and Date"
+            ));
+        }
+        Ok(lifecycle::Transition {
+            days: days.unwrap_or(0),
+            storage_class: class.as_str().to_owned(),
+            date,
+            newer_noncurrent_versions: lifecycle_count(newer)?,
+        })
+    };
+    let transitions = r
+        .transitions
+        .iter()
+        .flatten()
+        .map(|t| transition(t.days, t.date.as_ref(), t.storage_class.as_ref(), None))
+        .collect::<S3Result<Vec<_>>>()?;
+    let noncurrent_transitions = r
+        .noncurrent_version_transitions
+        .iter()
+        .flatten()
+        .map(|t| {
+            transition(
+                t.noncurrent_days,
+                None,
+                t.storage_class.as_ref(),
+                t.newer_noncurrent_versions,
+            )
+        })
+        .collect::<S3Result<Vec<_>>>()?;
+    let expiration = r.expiration.as_ref();
+    let expiration_days = lifecycle_days(expiration.and_then(|e| e.days))?;
+    let expiration_date = expiration.and_then(|e| e.date.clone()).map(millis);
+    if expiration_days.is_some() && expiration_date.is_some() {
+        return Err(s3_error!(
+            InvalidArgument,
+            "an expiration needs at most one of Days and Date"
+        ));
+    }
+    let noncurrent = r.noncurrent_version_expiration.as_ref();
+    Ok(LifecycleRule {
+        id: r.id.clone().unwrap_or_else(|| format!("rule-{}", i + 1)),
+        prefix,
+        enabled: r.status.as_str() == ExpirationStatus::ENABLED,
+        expiration_days,
+        expiration_date,
+        noncurrent_days: lifecycle_days(noncurrent.and_then(|e| e.noncurrent_days))?,
+        newer_noncurrent_versions: lifecycle_count(
+            noncurrent.and_then(|e| e.newer_noncurrent_versions),
+        )?,
+        min_size,
+        max_size,
+        tags,
+        abort_multipart_days: lifecycle_days(
+            r.abort_incomplete_multipart_upload
+                .as_ref()
+                .and_then(|a| a.days_after_initiation),
+        )?,
+        expired_object_delete_marker: expiration
+            .and_then(|e| e.expired_object_delete_marker)
+            .unwrap_or(false),
+        transitions,
+        noncurrent_transitions,
+    })
+}
+
+/// Renders a stored lifecycle rule for GetBucketLifecycleConfiguration.
+fn lifecycle_rule_to_s3(r: LifecycleRule) -> S3LifecycleRule {
+    let days = |d: Option<u32>| d.and_then(|d| i32::try_from(d).ok());
+    let size = |n: Option<u64>| n.and_then(|n| i64::try_from(n).ok());
+    let has_size = r.min_size.is_some() || r.max_size.is_some();
+    let filter = if has_size || !r.tags.is_empty() {
+        s3s::dto::LifecycleRuleFilter {
+            and: Some(s3s::dto::LifecycleRuleAndOperator {
+                prefix: Some(r.prefix.clone()),
+                object_size_greater_than: size(r.min_size),
+                object_size_less_than: size(r.max_size),
+                tags: (!r.tags.is_empty()).then(|| map_to_tag_set(&r.tags)),
+            }),
+            ..Default::default()
+        }
+    } else {
+        s3s::dto::LifecycleRuleFilter {
+            prefix: Some(r.prefix.clone()),
+            ..Default::default()
+        }
+    };
+    let has_expiration = r.expiration_days.is_some()
+        || r.expiration_date.is_some()
+        || r.expired_object_delete_marker;
+    S3LifecycleRule {
+        id: Some(r.id),
+        status: ExpirationStatus::from(if r.enabled { "Enabled" } else { "Disabled" }.to_owned()),
+        filter: Some(filter),
+        expiration: has_expiration.then(|| LifecycleExpiration {
+            days: days(r.expiration_days),
+            date: r.expiration_date.map(timestamp),
+            expired_object_delete_marker: r.expired_object_delete_marker.then_some(true),
+        }),
+        noncurrent_version_expiration: r.noncurrent_days.map(|d| NoncurrentVersionExpiration {
+            noncurrent_days: days(Some(d)),
+            newer_noncurrent_versions: days(r.newer_noncurrent_versions),
+        }),
+        abort_incomplete_multipart_upload: r.abort_multipart_days.map(|d| {
+            AbortIncompleteMultipartUpload {
+                days_after_initiation: days(Some(d)),
+            }
+        }),
+        noncurrent_version_transitions: (!r.noncurrent_transitions.is_empty()).then(|| {
+            r.noncurrent_transitions
+                .iter()
+                .map(|t| NoncurrentVersionTransition {
+                    noncurrent_days: days(Some(t.days)),
+                    newer_noncurrent_versions: days(t.newer_noncurrent_versions),
+                    storage_class: Some(TransitionStorageClass::from(t.storage_class.clone())),
+                })
+                .collect()
+        }),
+        prefix: None,
+        transitions: (!r.transitions.is_empty()).then(|| {
+            r.transitions
+                .iter()
+                .map(|t| Transition {
+                    days: t.date.is_none().then(|| days(Some(t.days))).flatten(),
+                    date: t.date.map(timestamp),
+                    storage_class: Some(TransitionStorageClass::from(t.storage_class.clone())),
+                })
+                .collect()
+        }),
+    }
+}
+
+/// Passes a stream through and, at end of stream, moves the checksum published by the
+/// computing reader inside it (`from`) to the slot the store reads (`to`).
+struct Forward<R> {
+    inner: R,
+    from: Arc<std::sync::Mutex<Option<suhms_store::ChecksumSlot>>>,
+    to: suhms_store::ChecksumSlot,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for Forward<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let res = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(res, std::task::Poll::Ready(Ok(()))) && buf.filled().len() == before {
+            let value = self
+                .from
+                .lock()
+                .expect("lock")
+                .as_ref()
+                .and_then(|s| s.lock().expect("lock").clone());
+            if value.is_some() {
+                *self.to.lock().expect("lock") = value;
+            }
+        }
+        res
     }
 }
 
@@ -644,6 +990,7 @@ impl S3 for S3Service {
                 &tenant,
                 &input.bucket,
                 &prefix,
+                input.delimiter.as_deref(),
                 &key_marker,
                 input.version_id_marker.as_deref(),
                 max_keys(input.max_keys)?,
@@ -683,18 +1030,24 @@ impl S3 for S3Service {
                 });
             }
         }
-        let last = page.versions.last();
         Ok(S3Response::new(ListObjectVersionsOutput {
             name: Some(input.bucket),
             prefix: Some(enc(&prefix)),
+            delimiter: input.delimiter.as_deref().map(enc),
             key_marker: input.key_marker.as_deref().map(enc),
             version_id_marker: input.version_id_marker,
             max_keys: input.max_keys.or(Some(1000)),
             is_truncated: Some(page.truncated),
-            next_key_marker: last.filter(|_| page.truncated).map(|o| enc(&o.key)),
-            next_version_id_marker: last
-                .filter(|_| page.truncated)
-                .map(|o| o.version_id.clone()),
+            next_key_marker: page.next_key_marker.as_deref().map(enc),
+            next_version_id_marker: page.next_version_id_marker.clone(),
+            common_prefixes: Some(
+                page.common_prefixes
+                    .iter()
+                    .map(|p| CommonPrefix {
+                        prefix: Some(enc(p)),
+                    })
+                    .collect(),
+            ),
             versions: Some(versions),
             delete_markers: Some(markers),
             encoding_type: input.encoding_type,
@@ -714,34 +1067,7 @@ impl S3 for S3Service {
             .unwrap_or_default()
             .into_iter()
             .enumerate()
-            .map(|(i, r)| {
-                if r.transitions.as_ref().is_some_and(|t| !t.is_empty()) {
-                    return Err(s3_error!(NotImplemented, "lifecycle transitions"));
-                }
-                let prefix = r
-                    .filter
-                    .as_ref()
-                    .and_then(|f| f.prefix.clone())
-                    .or(r.prefix.clone())
-                    .unwrap_or_default();
-                let days = |d: Option<i32>| d.and_then(|d| u32::try_from(d).ok());
-                Ok(LifecycleRule {
-                    id: r.id.clone().unwrap_or_else(|| format!("rule-{}", i + 1)),
-                    prefix,
-                    enabled: r.status.as_str() == ExpirationStatus::ENABLED,
-                    expiration_days: days(r.expiration.as_ref().and_then(|e| e.days)),
-                    noncurrent_days: days(
-                        r.noncurrent_version_expiration
-                            .as_ref()
-                            .and_then(|e| e.noncurrent_days),
-                    ),
-                    abort_multipart_days: days(
-                        r.abort_incomplete_multipart_upload
-                            .as_ref()
-                            .and_then(|a| a.days_after_initiation),
-                    ),
-                })
-            })
+            .map(|(i, r)| lifecycle_rule_from_s3(i, &r))
             .collect::<S3Result<Vec<_>>>()?;
         self.store
             .set_lifecycle(&tenant, &input.bucket, Some(&rules))
@@ -763,38 +1089,7 @@ impl S3 for S3Service {
             .await
             .map_err(s3_err)?
             .ok_or_else(|| s3_error!(NoSuchLifecycleConfiguration))?;
-        let days = |d: Option<u32>| d.and_then(|d| i32::try_from(d).ok());
-        let rules = rules
-            .into_iter()
-            .map(|r| S3LifecycleRule {
-                id: Some(r.id),
-                status: ExpirationStatus::from(
-                    if r.enabled { "Enabled" } else { "Disabled" }.to_owned(),
-                ),
-                filter: Some(s3s::dto::LifecycleRuleFilter {
-                    prefix: Some(r.prefix),
-                    ..Default::default()
-                }),
-                expiration: r.expiration_days.map(|d| LifecycleExpiration {
-                    days: days(Some(d)),
-                    ..Default::default()
-                }),
-                noncurrent_version_expiration: r.noncurrent_days.map(|d| {
-                    NoncurrentVersionExpiration {
-                        noncurrent_days: days(Some(d)),
-                        ..Default::default()
-                    }
-                }),
-                abort_incomplete_multipart_upload: r.abort_multipart_days.map(|d| {
-                    AbortIncompleteMultipartUpload {
-                        days_after_initiation: days(Some(d)),
-                    }
-                }),
-                noncurrent_version_transitions: None,
-                prefix: None,
-                transitions: None,
-            })
-            .collect();
+        let rules = rules.into_iter().map(lifecycle_rule_to_s3).collect();
         Ok(S3Response::new(GetBucketLifecycleConfigurationOutput {
             rules: Some(rules),
             ..Default::default()
@@ -954,6 +1249,73 @@ impl S3 for S3Service {
         }))
     }
 
+    async fn put_object_tagging(
+        &self,
+        req: S3Request<PutObjectTaggingInput>,
+    ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
+        let tenant = self.tenant(&req, Class::A).await?;
+        let input = req.input;
+        let tags = tag_set_to_map(input.tagging.tag_set)?;
+        let rec = self
+            .store
+            .set_object_tags(
+                &tenant,
+                &input.bucket,
+                &input.key,
+                input.version_id.as_deref(),
+                &tags,
+            )
+            .await
+            .map_err(s3_err)?;
+        Ok(S3Response::new(PutObjectTaggingOutput {
+            version_id: version_of(&rec),
+        }))
+    }
+
+    async fn get_object_tagging(
+        &self,
+        req: S3Request<GetObjectTaggingInput>,
+    ) -> S3Result<S3Response<GetObjectTaggingOutput>> {
+        let tenant = self.tenant(&req, Class::B).await?;
+        let input = req.input;
+        let rec = self
+            .store
+            .object_tags(
+                &tenant,
+                &input.bucket,
+                &input.key,
+                input.version_id.as_deref(),
+            )
+            .await
+            .map_err(s3_err)?;
+        Ok(S3Response::new(GetObjectTaggingOutput {
+            tag_set: map_to_tag_set(&rec.tags),
+            version_id: version_of(&rec),
+        }))
+    }
+
+    async fn delete_object_tagging(
+        &self,
+        req: S3Request<DeleteObjectTaggingInput>,
+    ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
+        let tenant = self.tenant(&req, Class::B).await?;
+        let input = req.input;
+        let rec = self
+            .store
+            .set_object_tags(
+                &tenant,
+                &input.bucket,
+                &input.key,
+                input.version_id.as_deref(),
+                &BTreeMap::new(),
+            )
+            .await
+            .map_err(s3_err)?;
+        Ok(S3Response::new(DeleteObjectTaggingOutput {
+            version_id: version_of(&rec),
+        }))
+    }
+
     async fn put_object_legal_hold(
         &self,
         req: S3Request<PutObjectLegalHoldInput>,
@@ -1073,16 +1435,10 @@ impl S3 for S3Service {
         let tenant = self.tenant(&req, Class::A).await?;
         let expected = checksum::expected(&req.headers, req.trailing_headers.as_ref())?;
         let input = req.input;
-        let if_absent = match &input.if_none_match {
-            None => false,
-            Some(ETagCondition::Any) => true,
-            Some(ETagCondition::ETag(_)) => {
-                return Err(s3_error!(NotImplemented, "If-None-Match supports only *"));
-            }
-        };
-        if input.if_match.is_some() {
-            return Err(s3_error!(NotImplemented, "If-Match on PutObject"));
-        }
+        let condition = write_condition(input.if_match.as_ref(), input.if_none_match.as_ref())?;
+        let policy = Algo::of(input.checksum_algorithm.as_ref())?
+            .map_or(Policy::ClientOrDefault, Policy::Required);
+        let (body, verified, slot) = checksum::wrap(body_reader(input.body), expected, policy)?;
         let request = PutObjectRequest {
             bucket: input.bucket,
             key: input.key,
@@ -1094,14 +1450,16 @@ impl S3 for S3Service {
                 .into_iter()
                 .collect::<BTreeMap<_, _>>(),
             content_md5: parse_md5(input.content_md5.as_deref())?,
-            if_absent,
+            condition,
+            checksum: Some(slot),
+            tags: parse_tagging(input.tagging.as_deref())?,
             lock_mode: input.object_lock_mode.map(|m| m.as_str().to_owned()),
             lock_until: input.object_lock_retain_until_date.map(millis),
             legal_hold: input
                 .object_lock_legal_hold_status
                 .is_some_and(|s| s.as_str() == ObjectLockLegalHoldStatus::ON),
+            ..PutObjectRequest::default()
         };
-        let (body, verified) = checksum::wrap(body_reader(input.body), expected);
         let rec = self
             .store
             .put_object(&tenant, request, body)
@@ -1118,6 +1476,15 @@ impl S3 for S3Service {
             checksum_crc64nvme: c.checksum_crc64nvme,
             checksum_sha1: c.checksum_sha1,
             checksum_sha256: c.checksum_sha256,
+            checksum_sha512: c.checksum_sha512,
+            checksum_md5: c.checksum_md5,
+            checksum_xxhash64: c.checksum_xxhash64,
+            checksum_xxhash3: c.checksum_xxhash3,
+            checksum_xxhash128: c.checksum_xxhash128,
+            checksum_type: rec
+                .checksum
+                .is_some()
+                .then(|| ChecksumType::from_static(checksum::FULL_OBJECT)),
             ..Default::default()
         }))
     }
@@ -1128,12 +1495,17 @@ impl S3 for S3Service {
     ) -> S3Result<S3Response<CopyObjectOutput>> {
         let tenant = self.tenant(&req, Class::A).await?;
         let input = req.input;
-        let (src_bucket, src_key) = copy_source(&input.copy_source)?;
+        let (src_bucket, src_key, src_version) = copy_source(&input.copy_source)?;
         let replace = match input.metadata_directive.as_ref().map(|d| d.as_str()) {
             None | Some("COPY") => false,
             Some("REPLACE") => true,
             Some(_) => return Err(s3_error!(InvalidArgument, "invalid metadata directive")),
         };
+        let requested = Algo::of(input.checksum_algorithm.as_ref())?;
+        let slot = Arc::default();
+        let wrap = copy_wrap(requested, &slot);
+        // The slot is filled when the store opens the source, before it writes.
+        let pending: suhms_store::ChecksumSlot = Arc::default();
         let dest = PutObjectRequest {
             bucket: input.bucket,
             key: input.key,
@@ -1141,20 +1513,63 @@ impl S3 for S3Service {
             storage_class: class_name(input.storage_class),
             user_metadata: input.metadata.unwrap_or_default().into_iter().collect(),
             content_md5: None,
-            if_absent: matches!(input.if_none_match, Some(ETagCondition::Any)),
+            condition: if matches!(input.if_none_match, Some(ETagCondition::Any)) {
+                WriteCondition::Absent
+            } else {
+                WriteCondition::None
+            },
+            checksum: Some(Arc::clone(&pending)),
+            tags: match input.tagging_directive.as_ref().map(|d| d.as_str()) {
+                None | Some("COPY") => None,
+                Some("REPLACE") => {
+                    Some(parse_tagging(input.tagging.as_deref())?.unwrap_or_default())
+                }
+                Some(_) => return Err(s3_error!(InvalidArgument, "invalid tagging directive")),
+            },
             ..PutObjectRequest::default()
         };
-        let rec = self
+        let source = suhms_store::CopySource {
+            bucket: &src_bucket,
+            key: &src_key,
+            version_id: src_version.as_deref(),
+        };
+        // Forward the checksum computed while copying into the slot the store reads.
+        let forward = {
+            let (slot, pending) = (Arc::clone(&slot), Arc::clone(&pending));
+            Box::new(move |src: &ObjectRecord, reader: BoxReader| -> BoxReader {
+                let r = wrap(src, reader);
+                Box::new(Forward {
+                    inner: r,
+                    from: slot,
+                    to: pending,
+                })
+            }) as CopyWrap
+        };
+        let (rec, src) = self
             .store
-            .copy_object(&tenant, &src_bucket, &src_key, dest, replace)
+            .copy_object_with(&tenant, source, dest, replace, Some(forward))
             .await
             .map_err(s3_err)?;
+        let stored = Stored::decode(rec.checksum.as_deref());
+        let c = stored.as_ref().map(Stored::fields).unwrap_or_default();
         Ok(S3Response::new(CopyObjectOutput {
             copy_object_result: Some(CopyObjectResult {
                 e_tag: Some(etag(&rec)),
                 last_modified: Some(timestamp(rec.created_at)),
-                ..Default::default()
+                checksum_crc32: c.checksum_crc32,
+                checksum_crc32c: c.checksum_crc32c,
+                checksum_crc64nvme: c.checksum_crc64nvme,
+                checksum_sha1: c.checksum_sha1,
+                checksum_sha256: c.checksum_sha256,
+                checksum_sha512: c.checksum_sha512,
+                checksum_md5: c.checksum_md5,
+                checksum_xxhash64: c.checksum_xxhash64,
+                checksum_xxhash3: c.checksum_xxhash3,
+                checksum_xxhash128: c.checksum_xxhash128,
+                checksum_type: stored.as_ref().map(Stored::checksum_type),
             }),
+            copy_source_version_id: version_header(&src.version_id),
+            version_id: version_of(&rec),
             ..Default::default()
         }))
     }
@@ -1165,14 +1580,18 @@ impl S3 for S3Service {
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         let tenant = self.tenant(&req, Class::A).await?;
         let input = req.input;
+        let cfg = UploadChecksum::new(
+            Algo::of(input.checksum_algorithm.as_ref())?,
+            input.checksum_type.as_ref(),
+        )?;
         let request = PutObjectRequest {
             bucket: input.bucket.clone(),
             key: input.key.clone(),
             content_type: input.content_type,
             storage_class: class_name(input.storage_class),
             user_metadata: input.metadata.unwrap_or_default().into_iter().collect(),
-            content_md5: None,
-            if_absent: false,
+            multipart_checksum: cfg.as_ref().map(UploadChecksum::encode),
+            tags: parse_tagging(input.tagging.as_deref())?,
             ..PutObjectRequest::default()
         };
         let upload = self
@@ -1184,6 +1603,10 @@ impl S3 for S3Service {
             bucket: Some(input.bucket),
             key: Some(input.key),
             upload_id: Some(upload.id.to_string()),
+            checksum_algorithm: cfg
+                .as_ref()
+                .map(|c| ChecksumAlgorithm::from(c.algorithm.clone())),
+            checksum_type: cfg.map(|c| ChecksumType::from(c.kind)),
             ..Default::default()
         }))
     }
@@ -1195,16 +1618,28 @@ impl S3 for S3Service {
         let tenant = self.tenant(&req, Class::A).await?;
         let expected = checksum::expected(&req.headers, req.trailing_headers.as_ref())?;
         let input = req.input;
-        let (body, verified) = checksum::wrap(body_reader(input.body), expected);
+        let upload_id = parse_upload_id(&input.upload_id)?;
+        let upload = self
+            .store
+            .get_multipart_upload(&tenant, &input.bucket, &input.key, upload_id)
+            .await
+            .map_err(s3_err)?;
+        // Parts of uploads without an algorithm get the default, so completing can combine
+        // them into the object's full-object checksum.
+        let policy = UploadChecksum::decode(upload.checksum.as_deref())
+            .and_then(|c| c.algo())
+            .map_or(Policy::Always(checksum::DEFAULT_ALGO), Policy::Required);
+        let (body, verified, slot) = checksum::wrap(body_reader(input.body), expected, policy)?;
         let part = self
             .store
-            .upload_part(
+            .upload_part_with(
                 &tenant,
                 &input.bucket,
                 &input.key,
-                parse_upload_id(&input.upload_id)?,
+                upload_id,
                 part_number(input.part_number)?,
                 parse_md5(input.content_md5.as_deref())?,
+                Some(slot),
                 body,
             )
             .await
@@ -1218,6 +1653,11 @@ impl S3 for S3Service {
             checksum_crc64nvme: c.checksum_crc64nvme,
             checksum_sha1: c.checksum_sha1,
             checksum_sha256: c.checksum_sha256,
+            checksum_sha512: c.checksum_sha512,
+            checksum_md5: c.checksum_md5,
+            checksum_xxhash64: c.checksum_xxhash64,
+            checksum_xxhash3: c.checksum_xxhash3,
+            checksum_xxhash128: c.checksum_xxhash128,
             ..Default::default()
         }))
     }
@@ -1228,27 +1668,68 @@ impl S3 for S3Service {
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
         let tenant = self.tenant(&req, Class::A).await?;
         let input = req.input;
-        let (src_bucket, src_key) = copy_source(&input.copy_source)?;
-        let part = self
+        let (src_bucket, src_key, src_version) = copy_source(&input.copy_source)?;
+        let upload_id = parse_upload_id(&input.upload_id)?;
+        let upload = self
+            .store
+            .get_multipart_upload(&tenant, &input.bucket, &input.key, upload_id)
+            .await
+            .map_err(s3_err)?;
+        let algo = UploadChecksum::decode(upload.checksum.as_deref())
+            .and_then(|c| c.algo())
+            .unwrap_or(checksum::DEFAULT_ALGO);
+        let pending: suhms_store::ChecksumSlot = Arc::default();
+        let wrap: CopyWrap = {
+            let pending = Arc::clone(&pending);
+            Box::new(move |_: &ObjectRecord, reader: BoxReader| -> BoxReader {
+                match checksum::wrap(reader, None, Policy::Always(algo)) {
+                    Ok((r, _, slot)) => Box::new(Forward {
+                        inner: r,
+                        from: Arc::new(std::sync::Mutex::new(Some(slot))),
+                        to: pending,
+                    }),
+                    Err(_) => unreachable!("no client checksum"),
+                }
+            })
+        };
+        let (part, src) = self
             .store
             .upload_part_copy(
                 &tenant,
                 &input.bucket,
                 &input.key,
-                parse_upload_id(&input.upload_id)?,
+                upload_id,
                 part_number(input.part_number)?,
-                &src_bucket,
-                &src_key,
+                suhms_store::CopySource {
+                    bucket: &src_bucket,
+                    key: &src_key,
+                    version_id: src_version.as_deref(),
+                },
                 copy_range(input.copy_source_range.as_deref())?,
+                Some(wrap),
+                Some(pending),
             )
             .await
             .map_err(s3_err)?;
+        let c = Stored::decode(part.checksum.as_deref())
+            .map(|s| s.fields())
+            .unwrap_or_default();
         Ok(S3Response::new(UploadPartCopyOutput {
             copy_part_result: Some(CopyPartResult {
                 e_tag: Some(ETag::Strong(part.etag)),
                 last_modified: Some(timestamp(part.created_at)),
-                ..Default::default()
+                checksum_crc32: c.checksum_crc32,
+                checksum_crc32c: c.checksum_crc32c,
+                checksum_crc64nvme: c.checksum_crc64nvme,
+                checksum_sha1: c.checksum_sha1,
+                checksum_sha256: c.checksum_sha256,
+                checksum_sha512: c.checksum_sha512,
+                checksum_md5: c.checksum_md5,
+                checksum_xxhash64: c.checksum_xxhash64,
+                checksum_xxhash3: c.checksum_xxhash3,
+                checksum_xxhash128: c.checksum_xxhash128,
             }),
+            copy_source_version_id: version_header(&src.version_id),
             ..Default::default()
         }))
     }
@@ -1260,12 +1741,30 @@ impl S3 for S3Service {
         let tenant = self.tenant(&req, Class::A).await?;
         let input = req.input;
         let upload_id = parse_upload_id(&input.upload_id)?;
+        let cond = write_condition(input.if_match.as_ref(), input.if_none_match.as_ref())?;
+        let claimed = Checksum {
+            checksum_crc32: input.checksum_crc32,
+            checksum_crc32c: input.checksum_crc32c,
+            checksum_crc64nvme: input.checksum_crc64nvme,
+            checksum_sha1: input.checksum_sha1,
+            checksum_sha256: input.checksum_sha256,
+            ..Default::default()
+        };
+        let mut claimed_parts = Vec::new();
         let parts = input
             .multipart_upload
             .and_then(|m| m.parts)
             .unwrap_or_default()
             .into_iter()
             .map(|p| {
+                claimed_parts.push(Checksum {
+                    checksum_crc32: p.checksum_crc32,
+                    checksum_crc32c: p.checksum_crc32c,
+                    checksum_crc64nvme: p.checksum_crc64nvme,
+                    checksum_sha1: p.checksum_sha1,
+                    checksum_sha256: p.checksum_sha256,
+                    ..Default::default()
+                });
                 Ok(CompletedPart {
                     part_number: part_number(
                         p.part_number.ok_or_else(|| s3_error!(MalformedXML))?,
@@ -1277,20 +1776,44 @@ impl S3 for S3Service {
         if parts.is_empty() {
             return Err(s3_error!(MalformedXML, "no parts specified"));
         }
+        let finalize: CompleteChecksum = Box::new(move |upload, chosen| {
+            checksum::complete(upload, chosen, &claimed_parts, &claimed)
+        });
         // Assembling large objects takes a while; s3s keeps the connection alive meanwhile.
         let store = Arc::clone(&self.store);
         let (bucket, key) = (input.bucket, input.key);
         let future = async move {
             let rec = store
-                .complete_multipart_upload(&tenant, &bucket, &key, upload_id, &parts)
+                .complete_multipart_upload_with(
+                    &tenant,
+                    &bucket,
+                    &key,
+                    upload_id,
+                    &parts,
+                    cond,
+                    Some(finalize),
+                )
                 .await
                 .map_err(s3_err)?;
+            let stored = Stored::decode(rec.checksum.as_deref());
+            let c = stored.as_ref().map(Stored::fields).unwrap_or_default();
             Ok(CompleteMultipartUploadOutput {
                 location: Some(format!("/{bucket}/{key}")),
                 bucket: Some(bucket),
                 key: Some(key),
                 e_tag: Some(etag(&rec)),
                 version_id: version_of(&rec),
+                checksum_crc32: c.checksum_crc32,
+                checksum_crc32c: c.checksum_crc32c,
+                checksum_crc64nvme: c.checksum_crc64nvme,
+                checksum_sha1: c.checksum_sha1,
+                checksum_sha256: c.checksum_sha256,
+                checksum_sha512: c.checksum_sha512,
+                checksum_md5: c.checksum_md5,
+                checksum_xxhash64: c.checksum_xxhash64,
+                checksum_xxhash3: c.checksum_xxhash3,
+                checksum_xxhash128: c.checksum_xxhash128,
+                checksum_type: stored.as_ref().map(Stored::checksum_type),
                 ..Default::default()
             })
         };
@@ -1342,6 +1865,7 @@ impl S3 for S3Service {
             id: Some(tenant.clone()),
             display_name: None,
         };
+        let cfg = UploadChecksum::decode(upload.checksum.as_deref());
         Ok(S3Response::new(ListPartsOutput {
             bucket: Some(input.bucket),
             key: Some(input.key),
@@ -1353,6 +1877,10 @@ impl S3 for S3Service {
                 .and_then(|p| i32::try_from(p.part_number).ok()),
             max_parts: input.max_parts.or(Some(1000)),
             is_truncated: Some(page.truncated),
+            checksum_algorithm: cfg
+                .as_ref()
+                .map(|c| ChecksumAlgorithm::from(c.algorithm.clone())),
+            checksum_type: cfg.map(|c| ChecksumType::from(c.kind)),
             storage_class: Some(StorageClass::from(
                 upload
                     .storage_class
@@ -1366,12 +1894,26 @@ impl S3 for S3Service {
             parts: Some(
                 page.parts
                     .into_iter()
-                    .map(|p| Part {
-                        part_number: i32::try_from(p.part_number).ok(),
-                        e_tag: Some(ETag::Strong(p.etag)),
-                        size: Some(size_i64(p.size)),
-                        last_modified: Some(timestamp(p.created_at)),
-                        ..Default::default()
+                    .map(|p| {
+                        let c = Stored::decode(p.checksum.as_deref())
+                            .map(|s| s.fields())
+                            .unwrap_or_default();
+                        Part {
+                            part_number: i32::try_from(p.part_number).ok(),
+                            e_tag: Some(ETag::Strong(p.etag)),
+                            size: Some(size_i64(p.size)),
+                            last_modified: Some(timestamp(p.created_at)),
+                            checksum_crc32: c.checksum_crc32,
+                            checksum_crc32c: c.checksum_crc32c,
+                            checksum_crc64nvme: c.checksum_crc64nvme,
+                            checksum_sha1: c.checksum_sha1,
+                            checksum_sha256: c.checksum_sha256,
+                            checksum_sha512: c.checksum_sha512,
+                            checksum_md5: c.checksum_md5,
+                            checksum_xxhash64: c.checksum_xxhash64,
+                            checksum_xxhash3: c.checksum_xxhash3,
+                            checksum_xxhash128: c.checksum_xxhash128,
+                        }
                     })
                     .collect(),
             ),
@@ -1392,25 +1934,31 @@ impl S3 for S3Service {
                 &tenant,
                 &input.bucket,
                 input.prefix.as_deref().unwrap_or_default(),
+                input.delimiter.as_deref(),
                 input.key_marker.as_deref().unwrap_or_default(),
                 input.upload_id_marker.as_deref().unwrap_or_default(),
                 max_keys(input.max_uploads)?,
             )
             .await
             .map_err(s3_err)?;
-        let last = page
-            .uploads
-            .last()
-            .map(|u| (u.key.clone(), u.id.to_string()));
         Ok(S3Response::new(ListMultipartUploadsOutput {
             bucket: Some(input.bucket),
             prefix: input.prefix.as_deref().map(enc),
+            delimiter: input.delimiter.as_deref().map(enc),
             key_marker: input.key_marker.as_deref().map(enc),
             upload_id_marker: input.upload_id_marker,
             max_uploads: input.max_uploads.or(Some(1000)),
             is_truncated: Some(page.truncated),
-            next_key_marker: last.as_ref().map(|(k, _)| enc(k)),
-            next_upload_id_marker: last.map(|(_, id)| id),
+            next_key_marker: page.next_key_marker.as_deref().map(enc),
+            next_upload_id_marker: page.next_upload_id_marker.clone(),
+            common_prefixes: Some(
+                page.common_prefixes
+                    .iter()
+                    .map(|p| CommonPrefix {
+                        prefix: Some(enc(p)),
+                    })
+                    .collect(),
+            ),
             encoding_type: input.encoding_type,
             uploads: Some(
                 page.uploads
@@ -1482,6 +2030,10 @@ impl S3 for S3Service {
             .map_err(s3_err)?;
         self.tenancy.meter.egress(&payer, len);
         let body = ReaderStream::with_capacity(reader, READ_CHUNK);
+        // Checksums describe the whole object, so ranged reads do not get them.
+        let stored =
+            stored_checksum(rec, input.checksum_mode.as_ref()).filter(|_| input.range.is_none());
+        let c = stored.as_ref().map(Stored::fields).unwrap_or_default();
 
         Ok(S3Response::new(GetObjectOutput {
             body: Some(StreamingBlob::wrap(body)),
@@ -1493,6 +2045,19 @@ impl S3 for S3Service {
             last_modified: Some(timestamp(rec.created_at)),
             content_type: rec.content_type.clone(),
             metadata: user_metadata(rec),
+            tag_count: tag_count(rec),
+            storage_class: rec.storage_class.clone().map(StorageClass::from),
+            checksum_crc32: c.checksum_crc32,
+            checksum_crc32c: c.checksum_crc32c,
+            checksum_crc64nvme: c.checksum_crc64nvme,
+            checksum_sha1: c.checksum_sha1,
+            checksum_sha256: c.checksum_sha256,
+            checksum_sha512: c.checksum_sha512,
+            checksum_md5: c.checksum_md5,
+            checksum_xxhash64: c.checksum_xxhash64,
+            checksum_xxhash3: c.checksum_xxhash3,
+            checksum_xxhash128: c.checksum_xxhash128,
+            checksum_type: stored.as_ref().map(Stored::checksum_type),
             ..Default::default()
         }))
     }
@@ -1525,8 +2090,23 @@ impl S3 for S3Service {
             input.if_modified_since.as_ref(),
             input.if_unmodified_since.as_ref(),
         )?;
+        let stored = stored_checksum(&rec, input.checksum_mode.as_ref());
+        let c = stored.as_ref().map(Stored::fields).unwrap_or_default();
         Ok(S3Response::new(HeadObjectOutput {
+            tag_count: tag_count(&rec),
             version_id: version_of(&rec),
+            storage_class: rec.storage_class.clone().map(StorageClass::from),
+            checksum_crc32: c.checksum_crc32,
+            checksum_crc32c: c.checksum_crc32c,
+            checksum_crc64nvme: c.checksum_crc64nvme,
+            checksum_sha1: c.checksum_sha1,
+            checksum_sha256: c.checksum_sha256,
+            checksum_sha512: c.checksum_sha512,
+            checksum_md5: c.checksum_md5,
+            checksum_xxhash64: c.checksum_xxhash64,
+            checksum_xxhash3: c.checksum_xxhash3,
+            checksum_xxhash128: c.checksum_xxhash128,
+            checksum_type: stored.as_ref().map(Stored::checksum_type),
             content_length: Some(size_i64(rec.size)),
             accept_ranges: Some("bytes".to_owned()),
             e_tag: Some(etag(&rec)),

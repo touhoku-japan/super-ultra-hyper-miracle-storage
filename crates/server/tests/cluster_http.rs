@@ -9,7 +9,7 @@ use common::{Creds, Resp, signed, xml_values};
 use suhms_server::{
     admin,
     cluster::{HttpPeers, internal_router},
-    config::{ClusterConfig, Config, NodeConfig, S3Config},
+    config::{ClusterConfig, ClusterTls, Config, NodeConfig, S3Config},
     crypto::SecretCipher,
 };
 use suhms_store::{Store, StoreConfig};
@@ -17,6 +17,54 @@ use tokio::{net::TcpListener, task::JoinHandle};
 use tower::ServiceExt;
 
 const SECRET: &str = "0123456789abcdef0123456789abcdef-test";
+
+/// A cluster CA and certificates it signed, written as PEM files.
+struct Pki {
+    ca_file: PathBuf,
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+}
+
+impl Pki {
+    fn new(dir: &std::path::Path, name: &str) -> Self {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, format!("{name} CA"));
+        let cert = params.self_signed(&key).unwrap();
+        let ca_file = dir.join(format!("{name}-ca.pem"));
+        std::fs::write(&ca_file, cert.pem()).unwrap();
+        Self {
+            ca_file,
+            issuer: rcgen::Issuer::new(params, key),
+        }
+    }
+
+    /// A node certificate valid for 127.0.0.1, usable as server and as client.
+    fn node(&self, dir: &std::path::Path, name: &str) -> ClusterTls {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params =
+            rcgen::CertificateParams::new(vec!["127.0.0.1".to_owned(), "localhost".to_owned()])
+                .unwrap();
+        params.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let cert = params.signed_by(&key, &self.issuer).unwrap();
+        let (cert_file, key_file) = (
+            dir.join(format!("{name}.pem")),
+            dir.join(format!("{name}.key")),
+        );
+        std::fs::write(&cert_file, cert.pem()).unwrap();
+        std::fs::write(&key_file, key.serialize_pem()).unwrap();
+        ClusterTls {
+            cert_file,
+            key_file,
+            ca_file: self.ca_file.clone(),
+        }
+    }
+}
 
 struct Node {
     store: Arc<Store>,
@@ -29,11 +77,20 @@ struct Cluster {
     _dir: tempfile::TempDir,
     nodes: Vec<Node>,
     creds: Creds,
+    /// Node URLs, and the PKI when the cluster runs over mutual TLS.
+    urls: Vec<String>,
+    pki: Option<Pki>,
 }
 
 impl Cluster {
     async fn start() -> Self {
+        Self::start_with(false).await
+    }
+
+    async fn start_with(tls: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
+        let pki = tls.then(|| Pki::new(dir.path(), "cluster"));
+        let scheme = if tls { "https" } else { "http" };
         let meta = format!("sqlite://{}", dir.path().join("meta.db").display());
         let mut listeners = Vec::new();
         let mut nodes_cfg = Vec::new();
@@ -41,14 +98,11 @@ impl Cluster {
             let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
             nodes_cfg.push(NodeConfig {
                 id: format!("node{i}"),
-                url: format!("http://{}", l.local_addr().unwrap()),
+                url: format!("{scheme}://{}", l.local_addr().unwrap()),
             });
             listeners.push(l);
         }
-        let cluster = ClusterConfig {
-            nodes: nodes_cfg,
-            ..ClusterConfig::default()
-        };
+        let urls: Vec<String> = nodes_cfg.iter().map(|n| n.url.clone()).collect();
         let cipher = Arc::new(SecretCipher::from_hex(&SecretCipher::generate_hex()).unwrap());
         let mut nodes = Vec::new();
         for (i, listener) in listeners.into_iter().enumerate() {
@@ -73,6 +127,12 @@ impl Cluster {
                 },
                 ..Config::default()
             };
+            let node_tls = pki.as_ref().map(|p| p.node(dir.path(), &id));
+            let cluster = ClusterConfig {
+                nodes: nodes_cfg.clone(),
+                tls: node_tls.clone(),
+                ..ClusterConfig::default()
+            };
             let peers = HttpPeers::new(&cluster, &id, SECRET).unwrap();
             let store = Arc::new(
                 Store::open_with_peers(config.storage.clone(), Arc::new(peers))
@@ -80,9 +140,18 @@ impl Cluster {
                     .unwrap(),
             );
             let router = internal_router(Arc::clone(&store), SECRET);
-            let internal = tokio::spawn(async move {
-                axum::serve(listener, router).await.unwrap();
-            });
+            let internal = match node_tls {
+                Some(t) => {
+                    let config = suhms_server::tls::server_config(&t).unwrap();
+                    let listener = suhms_server::tls::TlsListener::new(listener, config).unwrap();
+                    tokio::spawn(async move {
+                        axum::serve(listener, router).await.unwrap();
+                    })
+                }
+                None => tokio::spawn(async move {
+                    axum::serve(listener, router).await.unwrap();
+                }),
+            };
             let app = suhms_server::app(
                 Arc::clone(&store),
                 suhms_server::tenancy(Arc::clone(&store), &config),
@@ -105,6 +174,8 @@ impl Cluster {
             _dir: dir,
             nodes,
             creds: Creds { key, secret },
+            urls,
+            pki,
         }
     }
 
@@ -169,7 +240,71 @@ impl Cluster {
 
 #[tokio::test]
 async fn s3_over_a_three_node_cluster() {
-    let c = Cluster::start().await;
+    exercise(Cluster::start().await).await;
+}
+
+#[tokio::test]
+async fn s3_over_a_three_node_cluster_with_mutual_tls() {
+    exercise(Cluster::start_with(true).await).await;
+}
+
+#[tokio::test]
+async fn cluster_tls_rejects_clients_outside_the_cluster() {
+    let c = Cluster::start_with(true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let pki = c.pki.as_ref().unwrap();
+    let url = format!("{}/internal/v1/ping", c.urls[0]);
+    let ping = |tls: Option<ClusterTls>, trust: PathBuf| {
+        let url = url.clone();
+        async move {
+            let ca = std::fs::read(&trust).unwrap();
+            let mut b = reqwest::Client::builder()
+                .tls_certs_only([reqwest::Certificate::from_pem(&ca).unwrap()]);
+            if let Some(t) = tls {
+                b = b.tls_backend_preconfigured(suhms_server::tls::client_config(&t).unwrap());
+            }
+            let headers = suhms_server::cluster::auth_header(SECRET, "GET", "/internal/v1/ping");
+            b.build().unwrap().get(url).headers(headers).send().await
+        }
+    };
+    // A node certificate from the cluster CA works.
+    let ok = ping(Some(pki.node(dir.path(), "admin")), pki.ca_file.clone())
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    // No client certificate: the handshake fails.
+    assert!(ping(None, pki.ca_file.clone()).await.is_err());
+    // A certificate from another CA: the handshake fails.
+    let other = Pki::new(dir.path(), "other");
+    let mut foreign = other.node(dir.path(), "intruder");
+    foreign.ca_file = pki.ca_file.clone();
+    assert!(ping(Some(foreign), pki.ca_file.clone()).await.is_err());
+}
+
+#[test]
+fn cluster_urls_must_match_the_tls_setting() {
+    let node = |url: &str| NodeConfig {
+        id: "n1".into(),
+        url: url.into(),
+    };
+    let plain = ClusterConfig {
+        nodes: vec![node("https://10.0.0.1:9100")],
+        ..ClusterConfig::default()
+    };
+    assert!(plain.validate().is_err());
+    let tls = ClusterConfig {
+        nodes: vec![node("http://10.0.0.1:9100")],
+        tls: Some(ClusterTls {
+            cert_file: "a".into(),
+            key_file: "b".into(),
+            ca_file: "c".into(),
+        }),
+        ..ClusterConfig::default()
+    };
+    assert!(tls.validate().is_err());
+}
+
+async fn exercise(c: Cluster) {
     assert_eq!(c.s3(0, "PUT", "/shared", &[], vec![]).await.status, 200);
 
     let body: Vec<u8> = (0..3_000_000u32).map(|i| (i % 253) as u8).collect();
