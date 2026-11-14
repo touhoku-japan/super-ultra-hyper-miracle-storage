@@ -292,6 +292,11 @@ pub enum DeleteBucketOutcome {
     NotEmpty,
 }
 
+/// Column names: the records' `created_at: i64` (unix ms, set by the app) is stored as
+/// `last_modified` (objects, multipart_parts), `initiated_at` (multipart_uploads) or `created_ms`
+/// (tenants, access_keys, buckets). Every table also has `created_at` / `updated_at` audit
+/// timestamps that the database maintains itself (defaults and triggers); the app never writes or
+/// reads them.
 #[async_trait]
 pub trait MetadataStore: Send + Sync {
     // ---- tenants and keys ----

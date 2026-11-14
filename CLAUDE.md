@@ -60,6 +60,14 @@ AWS CLI はホストにシステムインストールしていないので、公
       （リリース済みのマイグレーションは編集しない。バックエンドごとに番号は独立）。
       `postgres.rs` / `mysql.rs` は `sqlite.rs` と同じ構造（SQL の差分: プレースホルダ `$n`、`ON DUPLICATE KEY UPDATE`、
       MySQL の object_key は `VARBINARY(1024)`、PG は `COLLATE "C"`）。SQLite 以外は書き込み競合を `is_retryable` で再試行
+    - 監査用タイムスタンプ: 全テーブル（schema_migrations 含む）に `created_at`（行の挿入日時）/ `updated_at`（最終更新日時）があり、
+      DB 側で自動設定する（アプリは読み書きしない）。PG は `TIMESTAMPTZ` + `DEFAULT now()` + BEFORE UPDATE トリガー
+      （`suhms_set_updated_at()`）、MariaDB は `DATETIME(6)`（TIMESTAMP は 2038 年問題があるため。sqlx がセッションを
+      UTC にするので値は UTC）+ `ON UPDATE CURRENT_TIMESTAMP(6)`、SQLite は UTC の ISO-8601 文字列を AFTER INSERT / UPDATE
+      トリガーで設定（ADD COLUMN に非定数の既定値を付けられないため）。アプリが使う UNIX ミリ秒の列は
+      `last_modified`（objects / multipart_parts）、`initiated_at`（multipart_uploads）、`created_ms`（tenants / access_keys / buckets）。
+      Rust の構造体のフィールド名は従来どおり `created_at: i64`（管理 API の JSON を変えないため）。新しいテーブルを足すときも
+      この 2 列とトリガーを付けること
     - クラスタ: 各ノードが自ディスクの空き容量と heartbeat を `disks` に書く（`HEARTBEAT_INTERVAL`）。30 秒更新がないディスクは offline 扱い。
       `Store::cluster_disks()` が全ノードのディスク一覧（2 秒キャッシュ）。レプリカ上限は「登録済み」ディスク/ノード数で判定するので、
       ノード障害中も書き込みは過半数で成功し、復旧後に repair で補う。複数ノード構成では同一ノードに 2 コピー置かない

@@ -25,13 +25,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (3, include_str!("migrations/postgres/0003_versioning.sql")),
     (4, include_str!("migrations/postgres/0004_checksums.sql")),
     (5, include_str!("migrations/postgres/0005_tags.sql")),
+    (6, include_str!("migrations/postgres/0006_timestamps.sql")),
 ];
 
 macro_rules! object_select {
     ($where:literal) => {
         concat!(
             "SELECT id, bucket, object_key, size, etag, blake3, content_type, storage_class, ",
-            "user_metadata, desired_replicas, replicas_explicit, created_at, version_id, ",
+            "user_metadata, desired_replicas, replicas_explicit, last_modified, version_id, ",
             "is_latest, delete_marker, noncurrent_at, lock_mode, lock_until, legal_hold, checksum, tags ",
             "FROM objects WHERE ",
             $where
@@ -160,7 +161,7 @@ fn object_from_row(row: &PgRow) -> Result<ObjectRecord> {
         user_metadata: decode_user_metadata(row.try_get("user_metadata")?)?,
         desired_replicas: to_u8(row.try_get("desired_replicas")?)?,
         replicas_explicit: row.try_get("replicas_explicit")?,
-        created_at: row.try_get("created_at")?,
+        created_at: row.try_get("last_modified")?,
         version_id: row.try_get("version_id")?,
         is_latest: row.try_get("is_latest")?,
         delete_marker: row.try_get("delete_marker")?,
@@ -181,7 +182,7 @@ fn bucket_from_row(r: &PgRow) -> Result<BucketRecord> {
             .try_get::<Option<i64>, _>("replicas")?
             .map(to_u8)
             .transpose()?,
-        created_at: r.try_get("created_at")?,
+        created_at: r.try_get("created_ms")?,
         public_read: r.try_get("public_read")?,
         versioning: r.try_get("versioning")?,
         lifecycle: r.try_get("lifecycle")?,
@@ -194,7 +195,7 @@ macro_rules! upload_select {
     ($where:literal) => {
         concat!(
             "SELECT id, bucket, object_key, content_type, storage_class, user_metadata, ",
-            "desired_replicas, replicas_explicit, disks, created_at, checksum, tags FROM multipart_uploads WHERE ",
+            "desired_replicas, replicas_explicit, disks, initiated_at, checksum, tags FROM multipart_uploads WHERE ",
             $where
         )
     };
@@ -203,7 +204,7 @@ macro_rules! upload_select {
 macro_rules! part_select {
     ($where:literal) => {
         concat!(
-            "SELECT upload_id, part_number, blob_id, size, etag, blake3, disks, created_at, checksum ",
+            "SELECT upload_id, part_number, blob_id, size, etag, blake3, disks, last_modified, checksum ",
             "FROM multipart_parts WHERE ",
             $where
         )
@@ -221,7 +222,7 @@ fn upload_from_row(r: &PgRow) -> Result<UploadRecord> {
         desired_replicas: to_u8(r.try_get("desired_replicas")?)?,
         replicas_explicit: r.try_get("replicas_explicit")?,
         disks: decode_disks(r.try_get("disks")?)?,
-        created_at: r.try_get("created_at")?,
+        created_at: r.try_get("initiated_at")?,
         checksum: r.try_get("checksum")?,
         tags: decode_tags(r.try_get("tags")?)?,
     })
@@ -238,7 +239,7 @@ fn part_from_row(r: &PgRow) -> Result<PartRecord> {
         etag: r.try_get("etag")?,
         blake3: r.try_get("blake3")?,
         disks: decode_disks(r.try_get("disks")?)?,
-        created_at: r.try_get("created_at")?,
+        created_at: r.try_get("last_modified")?,
         checksum: r.try_get("checksum")?,
     })
 }
@@ -265,7 +266,7 @@ async fn insert_object(
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO objects (id, bucket, object_key, size, etag, blake3, content_type, \
-         storage_class, user_metadata, desired_replicas, replicas_explicit, created_at, \
+         storage_class, user_metadata, desired_replicas, replicas_explicit, last_modified, \
          version_id, is_latest, delete_marker, lock_mode, lock_until, legal_hold, checksum, tags) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, TRUE, $14, $15, $16, $17, $18, $19)",
     )
@@ -398,7 +399,7 @@ fn tenant_from_row(r: &PgRow) -> Result<TenantRecord> {
     Ok(TenantRecord {
         id: r.try_get("id")?,
         name: r.try_get("name")?,
-        created_at: r.try_get("created_at")?,
+        created_at: r.try_get("created_ms")?,
         suspended: r.try_get("suspended")?,
         quota_bytes: r.try_get::<Option<i64>, _>("quota_bytes")?.map(u64_of),
         max_buckets: r.try_get::<Option<i64>, _>("max_buckets")?.map(u64_of),
@@ -411,7 +412,7 @@ fn key_from_row(r: &PgRow) -> Result<AccessKeyRecord> {
         tenant_id: r.try_get("tenant_id")?,
         secret_enc: r.try_get("secret_enc")?,
         active: r.try_get("active")?,
-        created_at: r.try_get("created_at")?,
+        created_at: r.try_get("created_ms")?,
     })
 }
 
@@ -545,7 +546,7 @@ impl MetadataStore for PostgresMetadata {
         limit: u32,
     ) -> Result<Vec<UploadRecord>> {
         sqlx::query(upload_select!(
-            "created_at < $1 ORDER BY created_at LIMIT $2"
+            "initiated_at < $1 ORDER BY initiated_at LIMIT $2"
         ))
         .bind(created_before)
         .bind(i64::from(limit))
@@ -673,7 +674,7 @@ impl MetadataStore for PostgresMetadata {
         delete_row(&mut tx, v.object.id).await?;
         if v.object.is_latest {
             let next = sqlx::query(object_select!(
-                "bucket = $1 AND object_key = $2 ORDER BY created_at DESC, id DESC LIMIT 1"
+                "bucket = $1 AND object_key = $2 ORDER BY last_modified DESC, id DESC LIMIT 1"
             ))
             .bind(bucket)
             .bind(key)
@@ -703,8 +704,8 @@ impl MetadataStore for PostgresMetadata {
         let (key, created, id) = after;
         sqlx::query(object_select!(
             "bucket = $1 AND object_key >= $2 AND (object_key > $3 OR (object_key = $4 AND \
-             (created_at < $5 OR (created_at = $6 AND id < $7)))) \
-             ORDER BY object_key, created_at DESC, id DESC LIMIT $8"
+             (last_modified < $5 OR (last_modified = $6 AND id < $7)))) \
+             ORDER BY object_key, last_modified DESC, id DESC LIMIT $8"
         ))
         .bind(bucket)
         .bind(prefix)
@@ -737,12 +738,12 @@ impl MetadataStore for PostgresMetadata {
             ),
             LifecycleScan::Current => object_select!(
                 "bucket = $1 AND object_key >= $2 AND (object_key, id) > ($3, $4) \
-                 AND is_latest = TRUE AND delete_marker = FALSE AND created_at < $5 \
+                 AND is_latest = TRUE AND delete_marker = FALSE AND last_modified < $5 \
                  ORDER BY object_key, id LIMIT $6"
             ),
             LifecycleScan::DeleteMarkers => object_select!(
                 "bucket = $1 AND object_key >= $2 AND (object_key, id) > ($3, $4) \
-                 AND is_latest = TRUE AND delete_marker = TRUE AND created_at < $5 \
+                 AND is_latest = TRUE AND delete_marker = TRUE AND last_modified < $5 \
                  ORDER BY object_key, id LIMIT $6"
             ),
         };
@@ -845,7 +846,7 @@ impl MetadataStore for PostgresMetadata {
 
     async fn list_all_buckets(&self) -> Result<Vec<BucketRecord>> {
         sqlx::query(
-            "SELECT name, owner, replicas, created_at, public_read, versioning, lifecycle, cors, \
+            "SELECT name, owner, replicas, created_ms, public_read, versioning, lifecycle, cors, \
              object_lock FROM buckets ORDER BY name",
         )
         .fetch_all(&self.pool)
@@ -857,7 +858,7 @@ impl MetadataStore for PostgresMetadata {
 
     async fn create_tenant(&self, tenant: &TenantRecord) -> Result<bool> {
         let res = sqlx::query(
-            "INSERT INTO tenants (id, name, created_at) VALUES ($1, $2, $3) \
+            "INSERT INTO tenants (id, name, created_ms) VALUES ($1, $2, $3) \
              ON CONFLICT DO NOTHING",
         )
         .bind(&tenant.id)
@@ -869,7 +870,7 @@ impl MetadataStore for PostgresMetadata {
     }
 
     async fn get_tenant(&self, id: &str) -> Result<Option<TenantRecord>> {
-        sqlx::query("SELECT id, name, created_at, suspended, quota_bytes, max_buckets FROM tenants WHERE id = $1")
+        sqlx::query("SELECT id, name, created_ms, suspended, quota_bytes, max_buckets FROM tenants WHERE id = $1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?
@@ -879,7 +880,7 @@ impl MetadataStore for PostgresMetadata {
     }
 
     async fn get_tenant_by_name(&self, name: &str) -> Result<Option<TenantRecord>> {
-        sqlx::query("SELECT id, name, created_at, suspended, quota_bytes, max_buckets FROM tenants WHERE name = $1")
+        sqlx::query("SELECT id, name, created_ms, suspended, quota_bytes, max_buckets FROM tenants WHERE name = $1")
             .bind(name)
             .fetch_optional(&self.pool)
             .await?
@@ -889,7 +890,7 @@ impl MetadataStore for PostgresMetadata {
     }
 
     async fn list_tenants(&self) -> Result<Vec<TenantRecord>> {
-        sqlx::query("SELECT id, name, created_at, suspended, quota_bytes, max_buckets FROM tenants ORDER BY name")
+        sqlx::query("SELECT id, name, created_ms, suspended, quota_bytes, max_buckets FROM tenants ORDER BY name")
             .fetch_all(&self.pool)
             .await?
             .iter()
@@ -899,7 +900,7 @@ impl MetadataStore for PostgresMetadata {
 
     async fn create_access_key(&self, key: &AccessKeyRecord) -> Result<()> {
         sqlx::query(
-            "INSERT INTO access_keys (id, tenant_id, secret_enc, active, created_at) \
+            "INSERT INTO access_keys (id, tenant_id, secret_enc, active, created_ms) \
              VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(&key.id)
@@ -914,7 +915,7 @@ impl MetadataStore for PostgresMetadata {
 
     async fn get_access_key(&self, id: &str) -> Result<Option<AccessKeyRecord>> {
         sqlx::query(
-            "SELECT id, tenant_id, secret_enc, active, created_at FROM access_keys WHERE id = $1",
+            "SELECT id, tenant_id, secret_enc, active, created_ms FROM access_keys WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -926,8 +927,8 @@ impl MetadataStore for PostgresMetadata {
 
     async fn list_access_keys(&self, tenant_id: &str) -> Result<Vec<AccessKeyRecord>> {
         sqlx::query(
-            "SELECT id, tenant_id, secret_enc, active, created_at FROM access_keys \
-             WHERE tenant_id = $1 ORDER BY created_at, id",
+            "SELECT id, tenant_id, secret_enc, active, created_ms FROM access_keys \
+             WHERE tenant_id = $1 ORDER BY created_ms, id",
         )
         .bind(tenant_id)
         .fetch_all(&self.pool)
@@ -1011,7 +1012,7 @@ impl MetadataStore for PostgresMetadata {
 
     async fn create_bucket(&self, bucket: &BucketRecord) -> Result<bool> {
         let res = sqlx::query(
-            "INSERT INTO buckets (name, owner, replicas, created_at) VALUES ($1, $2, $3, $4) \
+            "INSERT INTO buckets (name, owner, replicas, created_ms) VALUES ($1, $2, $3, $4) \
              ON CONFLICT (name) DO NOTHING",
         )
         .bind(&bucket.name)
@@ -1025,7 +1026,7 @@ impl MetadataStore for PostgresMetadata {
 
     async fn get_bucket(&self, name: &str) -> Result<Option<BucketRecord>> {
         sqlx::query(
-            "SELECT name, owner, replicas, created_at, public_read, versioning, lifecycle, cors, object_lock FROM buckets WHERE name = $1",
+            "SELECT name, owner, replicas, created_ms, public_read, versioning, lifecycle, cors, object_lock FROM buckets WHERE name = $1",
         )
         .bind(name)
         .fetch_optional(&self.pool)
@@ -1037,7 +1038,7 @@ impl MetadataStore for PostgresMetadata {
 
     async fn list_buckets(&self, owner: &str) -> Result<Vec<BucketRecord>> {
         sqlx::query(
-            "SELECT name, owner, replicas, created_at, public_read, versioning, lifecycle, cors, object_lock FROM buckets WHERE owner = $1 ORDER BY name",
+            "SELECT name, owner, replicas, created_ms, public_read, versioning, lifecycle, cors, object_lock FROM buckets WHERE owner = $1 ORDER BY name",
         )
         .bind(owner)
         .fetch_all(&self.pool)
@@ -1147,7 +1148,7 @@ impl MetadataStore for PostgresMetadata {
         }
         sqlx::query(
             "INSERT INTO multipart_uploads (id, bucket, object_key, content_type, storage_class, \
-             user_metadata, desired_replicas, replicas_explicit, disks, created_at, checksum, tags) \
+             user_metadata, desired_replicas, replicas_explicit, disks, initiated_at, checksum, tags) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(upload.id.to_string())
@@ -1223,10 +1224,10 @@ impl MetadataStore for PostgresMetadata {
             .transpose()?;
         sqlx::query(
             "INSERT INTO multipart_parts (upload_id, part_number, blob_id, size, etag, blake3, \
-             disks, created_at, checksum) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             disks, last_modified, checksum) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
              ON CONFLICT (upload_id, part_number) DO UPDATE SET blob_id = excluded.blob_id, \
              size = excluded.size, etag = excluded.etag, blake3 = excluded.blake3, \
-             disks = excluded.disks, created_at = excluded.created_at, checksum = excluded.checksum",
+             disks = excluded.disks, last_modified = excluded.last_modified, checksum = excluded.checksum",
         )
         .bind(part.upload_id.to_string())
         .bind(i64::from(part.part_number))
