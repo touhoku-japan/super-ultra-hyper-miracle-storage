@@ -21,10 +21,6 @@
 9. **repair の多重実行** — 1 ノード（leader）実行が前提。複数ノードで同時に走っても壊れないが、余分なコピーが一時的にできうる
 10. **`list_misreplicated` の全件走査** — 数億オブジェクト規模ではインデックスや差分方式への見直しが必要
 
-## S3 互換性
-
-16. **AWS CLI での互換確認** — このホストに未インストールのため rclone でのみ確認済み
-
 ## 済
 
 - ~~11. チェックサムの保存と返却（COMPOSITE / FULL_OBJECT 含む）~~
@@ -35,6 +31,7 @@
 - ~~17. チェックサムの残り~~（未指定時の CRC64NVME、MD5 / SHA512 / xxHash 系）
 - ~~18. ライフサイクルの残り~~（Date、NewerNoncurrentVersions、サイズ・タグフィルタ）
 - ~~19. オブジェクトタグ~~（Put/Get/DeleteObjectTagging、`x-amz-tagging`、タグ数ヘッダ）
+- ~~16. AWS CLI での互換確認~~（2026-11-14、AWS CLI 2.40.3 で 66 項目すべて成功。`scripts/awscli-compat.sh`）
 - ~~3. ノード間通信の暗号化~~（`[cluster.tls]` の相互 TLS。`docs/cluster-tls.md`）
 
 ## 実装しないと決めたもの
