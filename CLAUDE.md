@@ -56,6 +56,9 @@ AWS CLI はホストにシステムインストールしていないので、公
     - `admin_api.rs` — SoraHost ポータル用の管理 API（`[admin] listen`、Bearer トークン）。`/metrics` だけ認証なし。
       運用者用 Web コンソール（`/ui/`）も配信し、管理トークンで発行したセッション cookie も受け付ける（書き込みは CSRF ヘッダ必須）。
       ディスク / ノードの drain・remove、概要、メンテナンスジョブ（`jobs.rs`、そのノードのプロセス内で実行）の API もここ
+    - `jobs.rs` — メンテナンスジョブ（scrub / repair / gc / rebalance / checksum-backfill）の実行。`[maintenance]` の定期実行も
+      コンソールからの開始もここを通り、`job_runs` テーブル（ノード × ジョブごとに最後の 1 回、実行中は heartbeat）に記録する。
+      どのノードのコンソールからも全ノードの状態が見える
     - `console.rs` — 顧客用 Web コンソール（`[console] listen`）。アクセスキーでログインし、`/s3/...` へのブラウザのリクエストを
       セッションのキーで SigV4 署名（`sigv4.rs`）して S3 サービスをプロセス内で呼ぶプロキシ。応答は常に attachment + sandbox CSP。
       **S3 と同じホスト名で公開しない**（公開バケットの HTML がセッションを使えてしまう）

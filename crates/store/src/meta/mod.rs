@@ -613,6 +613,34 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<bool>;
     /// Gives the lease up if `holder` still has it.
     async fn release_lease(&self, name: &str, holder: &str) -> Result<()>;
+
+    // ---- maintenance job state ----
+
+    /// Stores the state of a node's run of a job (one row per node and job; replaces it).
+    async fn put_job_run(&self, run: &JobRun) -> Result<()>;
+    async fn get_job_run(&self, node_id: &str, job: &str) -> Result<Option<JobRun>>;
+    async fn delete_job_run(&self, node_id: &str, job: &str) -> Result<()>;
+    /// Every node's last run of every job, by job then node.
+    async fn list_job_runs(&self) -> Result<Vec<JobRun>>;
+}
+
+/// The last run of a maintenance job on one node (`job_runs`). Every node writes only its own
+/// rows; the operator console of any node reads them all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobRun {
+    pub node_id: String,
+    pub job: String,
+    pub running: bool,
+    /// `"console"` or `"schedule"`.
+    pub started_by: String,
+    /// Unix ms.
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    /// Unix ms of the last sign of life while running; a crashed node stops updating it.
+    pub heartbeat_at: i64,
+    /// JSON report of a finished run.
+    pub result: Option<String>,
+    pub error: Option<String>,
 }
 
 /// The first id (hyphenated) after every id that starts with `prefix`, for range scans.

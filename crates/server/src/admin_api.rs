@@ -477,16 +477,12 @@ pub fn router(
     store: Arc<Store>,
     tenancy: Arc<Tenancy>,
     cipher: Arc<SecretCipher>,
+    jobs: Arc<Jobs>,
     token: &str,
     config: &Config,
 ) -> Router {
-    let m = &config.maintenance;
     let st = Admin {
-        jobs: Arc::new(Jobs::new(
-            Arc::clone(&store),
-            Duration::from_secs(m.gc_grace_secs),
-            m.checksum_backfill_mib_per_sec,
-        )),
+        jobs,
         store,
         tenancy,
         cipher,
@@ -914,8 +910,8 @@ async fn storage(State(st): State<Admin>) -> ApiResult<Vec<TenantStorage>> {
     ))
 }
 
-async fn list_jobs(State(st): State<Admin>) -> ApiResult<Vec<crate::jobs::JobState>> {
-    Ok(Json(st.jobs.list()))
+async fn list_jobs(State(st): State<Admin>) -> ApiResult<Vec<crate::jobs::JobInfo>> {
+    Ok(Json(st.jobs.list().await?))
 }
 
 async fn start_job(
@@ -924,12 +920,13 @@ async fn start_job(
     body: Option<Json<JobParams>>,
 ) -> Result<StatusCode, ApiError> {
     let params = body.map(|Json(p)| p).unwrap_or_default();
-    match st.jobs.start(&name, params) {
+    match st.jobs.start(&name, params).await {
         Ok(()) => Ok(StatusCode::ACCEPTED),
         Err(StartError::Unknown) => Err(not_found("job")),
-        Err(StartError::Running) => Err(ApiError(
+        Err(StartError::Running(node)) => Err(ApiError(
             StatusCode::CONFLICT,
-            format!("{name} is already running"),
+            format!("{name} is already running on node {node}"),
         )),
+        Err(StartError::Metadata(e)) => Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, e)),
     }
 }

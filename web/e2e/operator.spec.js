@@ -85,8 +85,12 @@ test('a maintenance job runs and shows its result', async ({ page }) => {
   const card = page.locator('section.sheet').filter({ has: page.getByRole('heading', { name: 'scrub（全コピーの検証）' }) });
   await card.getByRole('button', { name: '今すぐ実行' }).click();
   await expect(toast(page, 'scrub（全コピーの検証） を開始しました')).toBeVisible();
-  await expect(card.getByText('前回', { exact: false })).toBeVisible({ timeout: 30_000 });
-  await expect(card.locator('dl.result dt').first()).toBeVisible();
+  // This node's run, recorded with who started it and its report.
+  const run = card.getByRole('listitem').filter({ hasText: 'このノード' });
+  await expect(run.getByText('完了', { exact: true })).toBeVisible({ timeout: 30_000 });
+  await expect(run).toContainText('コンソールから開始');
+  await expect(run.locator('dl.result dt').first()).toHaveText('確認');
+  await expect(card.getByRole('button', { name: '今すぐ実行' })).toBeEnabled();
 });
 
 test('logging out of the operator console ends the session', async ({ page }) => {

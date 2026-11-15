@@ -121,6 +121,10 @@ impl Server {
             Arc::clone(&store),
             Arc::clone(&tenancy),
             Arc::clone(&cipher),
+            Arc::new(suhms_server::jobs::Jobs::from_config(
+                Arc::clone(&store),
+                &config,
+            )),
             ADMIN_TOKEN,
             &config,
         );

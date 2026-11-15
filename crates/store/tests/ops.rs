@@ -444,3 +444,46 @@ async fn unrepairable_objects_wait_instead_of_being_retried_every_pass() {
         1
     );
 }
+
+#[tokio::test]
+async fn job_runs_are_kept_per_node_and_job() {
+    let env = Env::new(1).await;
+    let meta = env.store.metadata();
+    let run = |node: &str, job: &str, running: bool| suhms_store::meta::JobRun {
+        node_id: node.into(),
+        job: job.into(),
+        running,
+        started_by: "console".into(),
+        started_at: 1_000,
+        finished_at: (!running).then_some(2_000),
+        heartbeat_at: 1_500,
+        result: (!running).then(|| r#"{"checked":3}"#.into()),
+        error: None,
+    };
+    assert_eq!(meta.get_job_run("n1", "scrub").await.unwrap(), None);
+    meta.put_job_run(&run("n2", "scrub", true)).await.unwrap();
+    meta.put_job_run(&run("n1", "scrub", true)).await.unwrap();
+    meta.put_job_run(&run("n1", "gc", false)).await.unwrap();
+    // A second write replaces the node's row for that job.
+    let mut done = run("n1", "scrub", false);
+    done.started_by = "schedule".into();
+    done.error = Some("boom".into());
+    meta.put_job_run(&done).await.unwrap();
+
+    assert_eq!(
+        meta.get_job_run("n1", "scrub").await.unwrap(),
+        Some(done.clone())
+    );
+    let all = meta.list_job_runs().await.unwrap();
+    let keys: Vec<_> = all
+        .iter()
+        .map(|r| (r.job.as_str(), r.node_id.as_str()))
+        .collect();
+    assert_eq!(keys, [("gc", "n1"), ("scrub", "n1"), ("scrub", "n2")]);
+    assert_eq!(all[1], done);
+    assert!(all[2].running && all[2].finished_at.is_none() && all[2].result.is_none());
+
+    meta.delete_job_run("n2", "scrub").await.unwrap();
+    assert_eq!(meta.get_job_run("n2", "scrub").await.unwrap(), None);
+    assert_eq!(meta.list_job_runs().await.unwrap().len(), 2);
+}
