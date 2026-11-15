@@ -17,18 +17,69 @@ pub struct Config {
     pub auth: AuthConfig,
     pub cluster: ClusterConfig,
     pub admin: AdminConfig,
+    pub console: ConsoleConfig,
     pub limits: LimitsConfig,
     pub maintenance: MaintenanceConfig,
 }
 
 /// The administration API (used by the SoraHost portal). Disabled unless `listen` is set.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AdminConfig {
     /// Keep it on a private network.
     pub listen: Option<SocketAddr>,
     /// File holding the bearer token; `SUHMS_ADMIN_TOKEN` takes precedence.
     pub token_file: Option<PathBuf>,
+    /// The operator Web console at `/ui/` on the admin listener (log in with the admin token).
+    pub ui: bool,
+    /// Lifetime of an operator console session.
+    pub ui_session_secs: u64,
+    /// Mark the operator session cookie `Secure` (only sent over HTTPS). Leave it off when the
+    /// admin listener is reached over plain HTTP on a private network or an SSH tunnel.
+    pub ui_secure_cookie: bool,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            listen: None,
+            token_file: None,
+            ui: true,
+            ui_session_secs: 8 * 3600,
+            ui_secure_cookie: false,
+        }
+    }
+}
+
+/// The customer Web console (file browser and bucket settings). Disabled unless `listen` is
+/// set. Publish it through the reverse proxy on its own host name, never on the S3 endpoint's
+/// host: public buckets serve customer content there.
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConsoleConfig {
+    pub listen: Option<SocketAddr>,
+    /// Public URL of the S3 endpoint (e.g. `https://s3.sorahost.net`), for share links
+    /// (presigned URLs). Share links are off without it.
+    pub s3_public_url: Option<String>,
+    /// Lifetime of a console session.
+    pub session_secs: u64,
+    /// Mark the session cookie `Secure`. Only turn it off for local development over HTTP.
+    pub secure_cookie: bool,
+    /// Take the client address for login rate limiting from the last `X-Forwarded-For` entry
+    /// (set it when the listener is only reachable through the reverse proxy).
+    pub trust_proxy: bool,
+}
+
+impl Default for ConsoleConfig {
+    fn default() -> Self {
+        Self {
+            listen: None,
+            s3_public_url: None,
+            session_secs: 12 * 3600,
+            secure_cookie: true,
+            trust_proxy: false,
+        }
+    }
 }
 
 impl AdminConfig {

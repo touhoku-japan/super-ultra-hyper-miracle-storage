@@ -19,6 +19,23 @@ updates:
         applies-to: security-updates
         patterns: ["*"]
 
+  # Web コンソール（web/）。ビルド時だけ使う依存（Svelte / Vite）
+  - package-ecosystem: npm
+    directory: /web
+    target-branch: develop
+    schedule:
+      interval: weekly
+      day: monday
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-patch:
+        applies-to: version-updates
+        update-types: [minor, patch]
+      npm-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
   - package-ecosystem: github-actions
     directory: /
     target-branch: develop
