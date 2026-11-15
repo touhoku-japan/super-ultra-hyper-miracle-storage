@@ -10,11 +10,11 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::{
-    AccessKeyRecord, BucketRecord, BucketSetting, DeleteBucketOutcome, DiskRecord, LifecycleScan,
-    MetadataStore, NULL_VERSION, ObjectRecord, PartRecord, RemoveDiskOutcome, RepairQueueEntry,
-    ReplicaEntry, StorageUsage, StoredObject, TenantRecord, TenantUpdate, UploadRecord, UsageDelta,
-    UsageRow, VersioningMode, WriteCondition, decode_disks, decode_tags, decode_user_metadata,
-    encode_disks, encode_tags, encode_user_metadata, prefix_end,
+    AccessKeyRecord, BucketRecord, BucketSetting, DeleteBucketOutcome, DiskRecord, JobRun,
+    LifecycleScan, MetadataStore, NULL_VERSION, ObjectRecord, PartRecord, RemoveDiskOutcome,
+    RepairQueueEntry, ReplicaEntry, StorageUsage, StoredObject, TenantRecord, TenantUpdate,
+    UploadRecord, UsageDelta, UsageRow, VersioningMode, WriteCondition, decode_disks, decode_tags,
+    decode_user_metadata, encode_disks, encode_tags, encode_user_metadata, prefix_end,
 };
 use crate::{
     disk::DiskId,
@@ -36,6 +36,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         10,
         include_str!("migrations/sqlite/0010_backoff_backfill.sql"),
     ),
+    (11, include_str!("migrations/sqlite/0011_job_runs.sql")),
 ];
 
 macro_rules! object_select {
@@ -1636,4 +1637,77 @@ impl MetadataStore for SqliteMetadata {
             .await?;
         Ok(())
     }
+
+    async fn put_job_run(&self, run: &JobRun) -> Result<()> {
+        let _guard = self.write_lock.lock().await;
+        sqlx::query(
+            "INSERT INTO job_runs (node_id, job, running, started_by, started_at, finished_at, heartbeat_at, result, error) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT (node_id, job) DO UPDATE SET running = excluded.running, started_by = excluded.started_by, \
+             started_at = excluded.started_at, finished_at = excluded.finished_at, heartbeat_at = excluded.heartbeat_at, \
+             result = excluded.result, error = excluded.error",
+        )
+        .bind(&run.node_id)
+        .bind(&run.job)
+        .bind(run.running)
+        .bind(&run.started_by)
+        .bind(run.started_at)
+        .bind(run.finished_at)
+        .bind(run.heartbeat_at)
+        .bind(&run.result)
+        .bind(&run.error)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_job_run(&self, node_id: &str, job: &str) -> Result<Option<JobRun>> {
+        sqlx::query(
+            "SELECT node_id, job, running, started_by, started_at, finished_at, heartbeat_at, result, error FROM job_runs \
+             WHERE node_id = ? AND job = ?",
+        )
+            .bind(node_id)
+            .bind(job)
+            .fetch_optional(&self.pool)
+            .await?
+            .as_ref()
+            .map(job_run_from_row)
+            .transpose()
+    }
+
+    async fn delete_job_run(&self, node_id: &str, job: &str) -> Result<()> {
+        let _guard = self.write_lock.lock().await;
+        sqlx::query("DELETE FROM job_runs WHERE node_id = ? AND job = ?")
+            .bind(node_id)
+            .bind(job)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_job_runs(&self) -> Result<Vec<JobRun>> {
+        sqlx::query(
+            "SELECT node_id, job, running, started_by, started_at, finished_at, heartbeat_at, result, error FROM job_runs \
+             ORDER BY job, node_id",
+        )
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(job_run_from_row)
+            .collect()
+    }
+}
+
+fn job_run_from_row(r: &SqliteRow) -> Result<JobRun> {
+    Ok(JobRun {
+        node_id: r.try_get("node_id")?,
+        job: r.try_get("job")?,
+        running: r.try_get("running")?,
+        started_by: r.try_get("started_by")?,
+        started_at: r.try_get("started_at")?,
+        finished_at: r.try_get("finished_at")?,
+        heartbeat_at: r.try_get("heartbeat_at")?,
+        result: r.try_get("result")?,
+        error: r.try_get("error")?,
+    })
 }

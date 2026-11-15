@@ -7,11 +7,12 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use super::{
-    AccessKeyRecord, BucketRecord, BucketSetting, DeleteBucketOutcome, DiskRecord, LifecycleScan,
-    MetadataStore, NULL_VERSION, ObjectRecord, PartRecord, RemoveDiskOutcome, RepairQueueEntry,
-    ReplicaEntry, StorageUsage, StoredObject, TenantRecord, TenantUpdate, UploadRecord, UsageDelta,
-    UsageRow, VersioningMode, WriteCondition, decode_disks, decode_tags, decode_user_metadata,
-    encode_disks, encode_tags, encode_user_metadata, is_retryable, prefix_end,
+    AccessKeyRecord, BucketRecord, BucketSetting, DeleteBucketOutcome, DiskRecord, JobRun,
+    LifecycleScan, MetadataStore, NULL_VERSION, ObjectRecord, PartRecord, RemoveDiskOutcome,
+    RepairQueueEntry, ReplicaEntry, StorageUsage, StoredObject, TenantRecord, TenantUpdate,
+    UploadRecord, UsageDelta, UsageRow, VersioningMode, WriteCondition, decode_disks, decode_tags,
+    decode_user_metadata, encode_disks, encode_tags, encode_user_metadata, is_retryable,
+    prefix_end,
 };
 use crate::{
     disk::DiskId,
@@ -31,6 +32,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         8,
         include_str!("migrations/mysql/0008_backoff_backfill.sql"),
     ),
+    (9, include_str!("migrations/mysql/0009_job_runs.sql")),
 ];
 
 macro_rules! object_select {
@@ -1633,4 +1635,75 @@ impl MetadataStore for MysqlMetadata {
             .await?;
         Ok(())
     }
+
+    async fn put_job_run(&self, run: &JobRun) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO job_runs (node_id, job, running, started_by, started_at, finished_at, heartbeat_at, result, error) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON DUPLICATE KEY UPDATE running = VALUES(running), started_by = VALUES(started_by), \
+             started_at = VALUES(started_at), finished_at = VALUES(finished_at), heartbeat_at = VALUES(heartbeat_at), \
+             result = VALUES(result), error = VALUES(error)",
+        )
+        .bind(&run.node_id)
+        .bind(&run.job)
+        .bind(run.running)
+        .bind(&run.started_by)
+        .bind(run.started_at)
+        .bind(run.finished_at)
+        .bind(run.heartbeat_at)
+        .bind(&run.result)
+        .bind(&run.error)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_job_run(&self, node_id: &str, job: &str) -> Result<Option<JobRun>> {
+        sqlx::query(
+            "SELECT node_id, job, running, started_by, started_at, finished_at, heartbeat_at, result, error FROM job_runs \
+             WHERE node_id = ? AND job = ?",
+        )
+            .bind(node_id)
+            .bind(job)
+            .fetch_optional(&self.pool)
+            .await?
+            .as_ref()
+            .map(job_run_from_row)
+            .transpose()
+    }
+
+    async fn delete_job_run(&self, node_id: &str, job: &str) -> Result<()> {
+        sqlx::query("DELETE FROM job_runs WHERE node_id = ? AND job = ?")
+            .bind(node_id)
+            .bind(job)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_job_runs(&self) -> Result<Vec<JobRun>> {
+        sqlx::query(
+            "SELECT node_id, job, running, started_by, started_at, finished_at, heartbeat_at, result, error FROM job_runs \
+             ORDER BY job, node_id",
+        )
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(job_run_from_row)
+            .collect()
+    }
+}
+
+fn job_run_from_row(r: &MySqlRow) -> Result<JobRun> {
+    Ok(JobRun {
+        node_id: r.try_get("node_id")?,
+        job: r.try_get("job")?,
+        running: r.try_get("running")?,
+        started_by: r.try_get("started_by")?,
+        started_at: r.try_get("started_at")?,
+        finished_at: r.try_get("finished_at")?,
+        heartbeat_at: r.try_get("heartbeat_at")?,
+        result: r.try_get("result")?,
+        error: r.try_get("error")?,
+    })
 }

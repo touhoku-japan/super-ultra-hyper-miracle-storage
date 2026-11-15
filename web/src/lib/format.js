@@ -47,6 +47,17 @@ export function ago(ms) {
   return `${Math.floor(s / 86400)} 日前`;
 }
 
+/** Milliseconds as "0.4 秒" / "12 秒" / "3 分 5 秒" / "2 時間 10 分". */
+export function duration(ms) {
+  if (ms === null || ms === undefined || ms < 0) return '—';
+  const s = ms / 1000;
+  if (s < 10) return `${Math.round(s * 10) / 10} 秒`;
+  if (s < 60) return `${Math.floor(s)} 秒`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} 分 ${Math.floor(s % 60)} 秒`;
+  return `${Math.floor(m / 60)} 時間 ${m % 60} 分`;
+}
+
 /** Parses "10 GiB" / "500MB" / "1.5T" / "1024" into bytes; null for empty, NaN for invalid. */
 export function parseBytes(s) {
   const t = String(s ?? '').trim();

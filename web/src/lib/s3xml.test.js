@@ -11,7 +11,7 @@ import {
   partSize,
   queryString,
 } from './s3xml.js';
-import { basename, bytes, parseBytes } from './format.js';
+import { basename, bytes, duration, parseBytes } from './format.js';
 
 test('keys are encoded per segment', () => {
   assert.equal(encodeKey("a b/c+d!'()*/日"), 'a%20b/c%2Bd%21%27%28%29%2A/%E6%97%A5');
@@ -73,4 +73,12 @@ test('helpers', () => {
   assert.ok(Number.isNaN(parseBytes('ten')));
   assert.equal(basename('a/b/c.txt'), 'c.txt');
   assert.equal(basename('a/b/'), 'b/');
+});
+
+test('duration', () => {
+  assert.equal(duration(400), '0.4 秒');
+  assert.equal(duration(12_400), '12 秒');
+  assert.equal(duration(185_000), '3 分 5 秒');
+  assert.equal(duration(7_800_000), '2 時間 10 分');
+  assert.equal(duration(null), '—');
 });
