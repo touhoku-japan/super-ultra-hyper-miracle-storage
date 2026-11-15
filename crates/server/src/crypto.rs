@@ -18,6 +18,9 @@ const NONCE_LEN: usize = 12;
 
 pub struct SecretCipher {
     cipher: Aes256Gcm,
+    /// Key for signing Web console sessions, derived from the master key so that every node
+    /// (which shares the master key) accepts a session issued by any other.
+    session_key: [u8; 32],
 }
 
 impl SecretCipher {
@@ -27,7 +30,10 @@ impl SecretCipher {
             bail!("master key must be 32 bytes (64 hex characters)");
         }
         let cipher = Aes256Gcm::new_from_slice(&bytes).context("invalid master key")?;
-        Ok(Self { cipher })
+        Ok(Self {
+            cipher,
+            session_key: derive_key(&bytes, "suhms console session v1"),
+        })
     }
 
     /// Loads the master key from `SUHMS_MASTER_KEY` or the configured file.
@@ -44,6 +50,11 @@ impl SecretCipher {
         let key = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read master key file {}", path.display()))?;
         Self::from_hex(&key).with_context(|| format!("master key file {}", path.display()))
+    }
+
+    /// The key that signs customer console sessions.
+    pub fn session_key(&self) -> &[u8; 32] {
+        &self.session_key
     }
 
     pub fn generate_hex() -> String {
@@ -91,6 +102,14 @@ impl SecretCipher {
             .map_err(|_| anyhow::anyhow!("secret cannot be decrypted (wrong master key?)"))?;
         String::from_utf8(plain).context("decrypted secret is not UTF-8")
     }
+}
+
+/// HMAC-SHA256(`secret`, `label`): a key for one purpose derived from a shared secret.
+pub fn derive_key(secret: &[u8], label: &str) -> [u8; 32] {
+    use hmac::{Hmac, KeyInit as _, Mac};
+    let mut m = Hmac::<sha2::Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
+    m.update(label.as_bytes());
+    m.finalize().into_bytes().into()
 }
 
 /// A random string over `alphabet`, without modulo bias.

@@ -13,13 +13,16 @@ S3 互換のオブジェクトストレージ（Rust 製）。SoraHost の社内
 - メタデータ DB: SQLite（単一ノード）/ PostgreSQL / MariaDB
 - マルチテナント: テナントごとのアクセスキー、容量クォータ、停止、レート制限、課金用の使用量計測、管理 API
 - バージョニング、Object Lock（WORM）、ライフサイクル、CORS、公開バケット
+- Web コンソール: 顧客用（ファイルブラウザ・バケット設定・使用量）と運用者用（テナント・ディスク/ノード・メンテナンス）
 
 ドキュメント: [`docs/sorahost-integration.md`](docs/sorahost-integration.md)（SoraHost 連携・課金）、
+[`docs/webui.md`](docs/webui.md)（Web コンソール）、
 [`deploy/`](deploy/)（systemd・nginx）、[`config.example.toml`](config.example.toml)（全設定項目）
 
 ## 使い方
 
 ```sh
+(cd web && npm ci && npm run build)  # Web コンソール（バイナリに埋め込まれる。省略すると案内ページだけになる）
 cargo build --release -p suhms-server
 cp config.example.toml config.toml   # disks / metadata_url / master_key_file を環境に合わせる
 ./target/release/suhms gen-master-key > /etc/suhms/master.key && chmod 600 /etc/suhms/master.key
@@ -41,5 +44,7 @@ rclone mkdir s:backups && rclone copy ./data s:backups/
 
 ```sh
 CARGO_BUILD_JOBS=1 cargo test --workspace
-curl http://127.0.0.1:9000/suhms/health
+curl http://127.0.0.1:9000/super-ultra-hyper-miracle-storage/health
+(cd web && npm test)                       # コンソールの単体テスト
+SUHMS_CONSOLE=http://127.0.0.1:9300 npm --prefix web run dev   # コンソールの開発サーバ（API は suhms へプロキシ）
 ```

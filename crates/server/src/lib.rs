@@ -7,11 +7,16 @@ pub mod backfill;
 pub mod checksum;
 pub mod cluster;
 pub mod config;
+pub mod console;
 pub mod cors;
 pub mod crypto;
+pub mod jobs;
 pub mod s3;
+pub mod session;
+pub mod sigv4;
 pub mod tenancy;
 pub mod tls;
+pub mod web;
 
 use std::{convert::Infallible, sync::Arc};
 
@@ -25,10 +30,12 @@ use tower_http::trace::TraceLayer;
 
 use crate::{config::Config, crypto::SecretCipher, tenancy::Tenancy};
 
-/// Health check path. `suhms` is a reserved bucket name ([`suhms_store::RESERVED_BUCKETS`]), so
-/// on path-style requests this never shadows a bucket; virtual-hosted requests for a bucket
-/// (`<bucket>.<domain>/suhms/health`) still reach the object of that key.
-pub const HEALTH_PATH: &str = "/suhms/health";
+/// Health check path. `super-ultra-hyper-miracle-storage` is a reserved bucket name
+/// ([`suhms_store::RESERVED_BUCKETS`]), so on path-style requests this never shadows a bucket;
+/// virtual-hosted requests for a bucket
+/// (`<bucket>.<domain>/super-ultra-hyper-miracle-storage/health`) still reach the object of that
+/// key.
+pub const HEALTH_PATH: &str = "/super-ultra-hyper-miracle-storage/health";
 
 /// Whether the request's Host names a bucket under one of the virtual-hosting `domains`.
 fn is_bucket_host(req: &Request<Body>, domains: &[String]) -> bool {

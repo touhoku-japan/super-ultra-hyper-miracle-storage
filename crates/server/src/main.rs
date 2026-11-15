@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use clap::{Parser, Subcommand};
 use suhms_server::{
@@ -124,14 +124,17 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             Arc::clone(&tenancy),
             Arc::clone(&cipher),
             &token,
-            config.s3.allow_public_buckets,
+            &config,
         );
         let listener = TcpListener::bind(addr).await?;
-        tracing::info!(%addr, "admin API up");
+        tracing::info!(%addr, ui = config.admin.ui, "admin API up");
         tokio::spawn(async move {
-            if let Err(error) = axum::serve(listener, admin)
-                .with_graceful_shutdown(shutdown_signal())
-                .await
+            if let Err(error) = axum::serve(
+                listener,
+                admin.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await
             {
                 tracing::error!(%error, "admin listener failed");
             }
@@ -174,7 +177,41 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         }
     }
 
-    let app = app(Arc::clone(&store), Arc::clone(&tenancy), cipher, &config)?;
+    let app = app(
+        Arc::clone(&store),
+        Arc::clone(&tenancy),
+        Arc::clone(&cipher),
+        &config,
+    )?;
+
+    if let Some(addr) = config.console.listen {
+        let console = suhms_server::console::router(
+            Arc::clone(&store),
+            Arc::clone(&tenancy),
+            cipher,
+            app.clone(),
+            &config,
+        );
+        if !suhms_server::web::is_built() {
+            tracing::warn!(
+                "this binary was built without the Web console (web/dist); the console shows a placeholder page"
+            );
+        }
+        let listener = TcpListener::bind(addr).await?;
+        tracing::info!(%addr, "customer console up");
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(
+                listener,
+                console.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            {
+                tracing::error!(%error, "console listener failed");
+            }
+        });
+    }
+
     let listener = TcpListener::bind(config.server.listen).await?;
     tracing::info!(addr = %listener.local_addr()?, "listening");
     axum::serve(listener, app)

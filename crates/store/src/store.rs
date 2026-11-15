@@ -302,8 +302,10 @@ fn validate_key(key: &str) -> Result<()> {
     Ok(())
 }
 
-/// Bucket names the server keeps for itself (e.g. the health check at `/suhms/health`).
-pub const RESERVED_BUCKETS: &[&str] = &["suhms"];
+/// Bucket names the server keeps for itself: the health check at
+/// `/super-ultra-hyper-miracle-storage/health`, and `suhms` (the old health check path, kept
+/// reserved so that no customer bucket takes over URLs that monitors may still poll).
+pub const RESERVED_BUCKETS: &[&str] = &["super-ultra-hyper-miracle-storage", "suhms"];
 
 fn validate_bucket_name(name: &str) -> Result<()> {
     let ok = !RESERVED_BUCKETS.contains(&name)
