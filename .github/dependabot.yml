@@ -1,0 +1,31 @@
+# Dependabot の設定。
+# - バージョン更新（定期）は develop 向けに PR を作る（普段の develop → main の流れに合わせる）
+# - 脆弱性修正（security updates）は GitHub の仕様で常にデフォルトブランチ（main）向け。まとめて 1 本の PR にする
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    target-branch: develop
+    schedule:
+      interval: weekly
+      day: monday
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        applies-to: version-updates
+        update-types: [minor, patch]
+      cargo-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: develop
+    schedule:
+      interval: weekly
+      day: monday
+      timezone: Asia/Tokyo
+    groups:
+      actions:
+        patterns: ["*"]
