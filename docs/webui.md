@@ -104,13 +104,29 @@ MinIO Console のように、ブラウザで操作・設定できる画面。202
    （運用者用。`http://localhost:5173/ui/` ではなく `http://localhost:5173/` で開き、API だけをプロキシする）。
    ローカルの HTTP で顧客用コンソールを試すときは `[console] secure_cookie = false`
 
+## テスト
+
+- Rust: プロキシ・セッション・CSRF・テナント間アクセス・ジョブ等を `crates/server/tests/console.rs` で（ルータを in-process で叩く）
+- フロントエンドの純粋な関数（XML 生成・URL エンコード等）: `npm test`（`web/src/lib/s3xml.test.js`、Node の test runner）
+- ブラウザ E2E: `web/e2e/`（Playwright + Chromium）。`e2e/server.js` が一時ディレクトリにディスク 3 本・SQLite の設定を作り、
+  空いているポートで本物の `suhms serve`（S3・管理 API・顧客用コンソール）を起動して、顧客用と運用者用の両方を操作する。
+  対象: ログイン（失敗時の表示）、バケットの作成・削除、日本語名のアップロード、65 MiB のマルチパート（読み戻して SHA-256 を照合）、
+  タグ、共有リンク（cookie なしで取得）、ダウンロード、フォルダ、バケット数の上限、運用者によるテナント作成・キー発行・停止・
+  キーの無効化（開いている顧客セッションへの反映）、ディスク一覧、ジョブの実行、HTML オブジェクトがダウンロードになり
+  スクリプトが動かないこと、CSRF ヘッダなしの拒否、cookie の属性と `frame-ancestors`
+  ```sh
+  cd web && npm run build && cd .. && cargo build -p suhms-server   # コンソールを埋め込んだバイナリ
+  cd web && npx playwright install chromium-headless-shell          # 初回のみ（CI は --with-deps も付ける）
+  npm run e2e                                                        # SUHMS_BIN で別のバイナリ、SUHMS_E2E_KEEP=1 で一時ディレクトリを残す
+  ```
+  開発ホスト（AlmaLinux 10）は Playwright の公式対応 OS ではないが、ubuntu24.04 向けのビルドが動く（システムライブラリは
+  `cups-libs` だけ足した）。CI では `e2e` ジョブが実行し、失敗時はレポートとトレースを artifact に残す
+
 ## 既知の制限
 
 - ログアウトは cookie を消すだけ。漏れた cookie は有効期限まで使える（キーの無効化かテナントの停止で即座に止められる。運用者用は管理トークンの変更で全セッションが無効になる）
 - ジョブの実行状態は各ノードのメモリにだけある。別ノードの管理 API からは見えず、再起動で消える
 - 顧客の「フォルダごとの削除」と複数削除は、バージョニングが有効なバケットでは削除マーカーを付けるだけ（以前の版は残る）
 - 運用者用コンソールから顧客のオブジェクトの中身は見られない（意図的。必要ならそのテナントのキーで顧客用コンソールにログインする）
-- ブラウザでの自動 E2E テストはない。Rust 側はプロキシ・セッション・CSRF・テナント間アクセス・ジョブ等を `crates/server/tests/console.rs` で、
-  フロントエンドは XML 生成などの純粋な関数を `web/src/lib/s3xml.test.js` で検査している
 - ビルド時の依存: Vite 8 が CSS の圧縮に使う `lightningcss` は MPL-2.0（ファイル単位の弱いコピーレフト）。ビルドツールとして使うだけで、
   バイナリにもコンソールの配信物にも含まれない。Svelte のランタイム（バンドルに入る）は MIT

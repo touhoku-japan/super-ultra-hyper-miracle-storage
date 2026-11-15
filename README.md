@@ -46,5 +46,6 @@ rclone mkdir s:backups && rclone copy ./data s:backups/
 CARGO_BUILD_JOBS=1 cargo test --workspace
 curl http://127.0.0.1:9000/super-ultra-hyper-miracle-storage/health
 (cd web && npm test)                       # コンソールの単体テスト
+(cd web && npm run e2e)                    # ブラウザ E2E（先に npm run build と cargo build。docs/webui.md）
 SUHMS_CONSOLE=http://127.0.0.1:9300 npm --prefix web run dev   # コンソールの開発サーバ（API は suhms へプロキシ）
 ```
