@@ -190,6 +190,9 @@ struct SessionInfo {
     access_key_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tenant: Option<TenantInfo>,
+    /// Why a still-signed session is not logged in (a suspended tenant), for the login screen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notice: Option<&'static str>,
     share_links: bool,
     storage_classes: Vec<StorageClass>,
     default_replicas: u8,
@@ -204,7 +207,11 @@ struct TenantInfo {
 }
 
 async fn session_info(State(st): State<Console>, headers: HeaderMap) -> Response {
-    let caller = st.caller(&headers).await.ok();
+    let (caller, notice) = match st.caller(&headers).await {
+        Ok(c) => (Some(c), None),
+        Err(ApiError(StatusCode::FORBIDDEN, msg)) => (None, Some(msg)),
+        Err(_) => (None, None),
+    };
     let info = SessionInfo {
         mode: "customer",
         logged_in: caller.is_some(),
@@ -214,6 +221,7 @@ async fn session_info(State(st): State<Console>, headers: HeaderMap) -> Response
             quota_bytes: t.quota_bytes,
             max_buckets: t.max_buckets,
         }),
+        notice,
         share_links: st.0.public_url.is_some(),
         storage_classes: st
             .0

@@ -1,7 +1,8 @@
 <script>
   import { session } from '../lib/api.js';
 
-  let { mode, onlogin } = $props();
+  // `notice`: why the session ended (e.g. a suspended account), shown until the next attempt.
+  let { mode, notice = null, onlogin } = $props();
   let accessKey = $state('');
   let secret = $state('');
   let token = $state('');
@@ -54,7 +55,7 @@
           <input type="password" bind:value={secret} autocomplete="current-password" required />
         </label>
       {/if}
-      {#if error}<p class="notice bad" role="alert">{error}</p>{/if}
+      {#if error}<p class="notice bad" role="alert">{error}</p>{:else if notice}<p class="notice bad" role="alert">{notice}</p>{/if}
       <button class="primary" type="submit" disabled={busy}>{busy ? 'ログイン中…' : 'ログイン'}</button>
     </form>
   </section>

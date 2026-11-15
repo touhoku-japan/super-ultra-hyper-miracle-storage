@@ -43,7 +43,7 @@
 {:else if !info}
   <main class="fatal"><p class="faint">読み込み中…</p></main>
 {:else if !info.logged_in}
-  <Login mode={info.mode} onlogin={load} />
+  <Login mode={info.mode} notice={info.notice} onlogin={load} />
 {:else if info.mode === 'operator'}
   <OperatorApp {info} onlogout={logout} />
 {:else}
