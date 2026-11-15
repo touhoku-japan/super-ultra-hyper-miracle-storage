@@ -9,6 +9,9 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
 - Lint: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings`
 - Web コンソール（`web/`）: `npm ci && npm test && npm run build`。出力 `web/dist/` は `crates/server/build.rs` がバイナリに埋め込む
   （無ければ案内ページ。`SUHMS_REQUIRE_WEB=1` で必須にできる）。詳細は `docs/webui.md`
+- ブラウザ E2E（`web/e2e/`、Playwright）: `npm run build` → `cargo build -p suhms-server` → `cd web && npm run e2e`。
+  本物の `suhms serve` を一時ディレクトリで起動して顧客用・運用者用コンソールを操作する。ブラウザは初回に
+  `npx playwright install chromium-headless-shell`（このホストは cups-libs を入れ済みで動く）
 - 起動: `cargo run -p suhms-server -- -c config.toml serve`（`GET /super-ultra-hyper-miracle-storage/health` で疎通確認。認証不要）
 - 管理: `suhms gen-master-key` / `suhms tenant create|list` / `suhms key create|list|disable|enable` /
   `suhms bucket set-replicas <bucket> <n|default>` / `suhms scrub` / `suhms repair [--quick]` / `suhms gc [--grace-secs N] [--force]` /

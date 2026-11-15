@@ -379,6 +379,10 @@ async fn disabled_keys_and_suspended_tenants_lose_their_sessions() {
             .status,
         403
     );
+    // The login screen can say why.
+    let r = call(&srv.console, req("GET", "/api/session", ck, Body::empty())).await;
+    assert_eq!(r.json()["logged_in"], false);
+    assert_eq!(r.json()["notice"], "このアカウントは停止されています");
     srv.admin(
         "PATCH",
         &format!("/admin/v1/tenants/{tenant}"),
@@ -408,6 +412,7 @@ async fn disabled_keys_and_suspended_tenants_lose_their_sessions() {
     );
     let r = call(&srv.console, req("GET", "/api/session", ck, Body::empty())).await;
     assert_eq!(r.json()["logged_in"], false);
+    assert!(r.json().get("notice").is_none());
 }
 
 #[tokio::test]

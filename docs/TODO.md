@@ -17,11 +17,11 @@
 
 - **ポータルからのワンタイムログイン** — SoraHost ポータルにログイン済みの顧客を、そのまま Web コンソールへ移す。
   管理 API で短命のトークンを発行し、コンソールの `api/login` で交換する形を想定（`docs/webui.md`）
-- **Web コンソールのブラウザ E2E テスト** — 開発ホストでは Playwright のブラウザが動かない（システムライブラリ不足）。CI で動かす案
 - **Web コンソールのジョブ状態の共有** — 今は各ノードのメモリだけ。他ノードで動いている repair 等は見えない
 
 ## 済
 
+- ~~Web コンソールのブラウザ E2E テスト~~（2026-11-15。`web/e2e/` の Playwright、CI の `e2e` ジョブ。開発ホストでも `cups-libs` を入れて実行可能）
 - ~~Web コンソール~~（2026-11-15。顧客用 `[console]` と運用者用 `/ui/`。`docs/webui.md`）
 - ~~11. チェックサムの保存と返却（COMPOSITE / FULL_OBJECT 含む）~~
 - ~~12. PUT の If-Match~~（CompleteMultipartUpload の If-Match / If-None-Match も）
