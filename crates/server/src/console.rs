@@ -246,24 +246,25 @@ struct Login {
 
 async fn login(State(st): State<Console>, req: Request) -> Response {
     match do_login(&st, req).await {
-        Ok(r) | Err(r) => r,
+        Ok(r) => r,
+        Err(e) => e.into_response(),
     }
 }
 
-async fn do_login(st: &Console, req: Request) -> Result<Response, Response> {
+async fn do_login(st: &Console, req: Request) -> Result<Response, ApiError> {
     let peer = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0);
     let headers = req.headers().clone();
     if !session::csrf_ok(req.method(), &headers) {
-        return Err(ApiError(StatusCode::FORBIDDEN, "不正なリクエストです").into_response());
+        return Err(ApiError(StatusCode::FORBIDDEN, "不正なリクエストです"));
     }
     let body = axum::body::to_bytes(req.into_body(), 16 * 1024)
         .await
-        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "不正なリクエストです").into_response())?;
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "不正なリクエストです"))?;
     let login: Login = serde_json::from_slice(&body)
-        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "不正なリクエストです").into_response())?;
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "不正なリクエストです"))?;
     let ip = session::client_ip(&headers, peer, st.0.trust_proxy);
     let ip_key = format!("ip:{ip}");
     let id_key = format!("key:{}", login.access_key_id);
@@ -273,8 +274,7 @@ async fn do_login(st: &Console, req: Request) -> Result<Response, Response> {
         return Err(ApiError(
             StatusCode::TOO_MANY_REQUESTS,
             "ログインの失敗が多すぎます。しばらくしてからやり直してください",
-        )
-        .into_response());
+        ));
     }
     let fail = |reason: &str| {
         st.0.logins.failed(&limiter_keys);
@@ -283,18 +283,17 @@ async fn do_login(st: &Console, req: Request) -> Result<Response, Response> {
             StatusCode::UNAUTHORIZED,
             "アクセスキーまたはシークレットキーが正しくありません",
         )
-        .into_response()
     };
     let key =
         st.0.tenancy
             .directory
             .key(&login.access_key_id)
             .await
-            .map_err(|e| ApiError::from(e).into_response())?;
+            .map_err(ApiError::from)?;
     let Some(key) = key.filter(|k| k.active) else {
         return Err(fail("unknown or disabled key"));
     };
-    let secret = st.secret(&key).map_err(IntoResponse::into_response)?;
+    let secret = st.secret(&key)?;
     if !constant_time_eq(secret.as_bytes(), login.secret_access_key.as_bytes()) {
         return Err(fail("wrong secret"));
     }
@@ -303,13 +302,14 @@ async fn do_login(st: &Console, req: Request) -> Result<Response, Response> {
             .directory
             .tenant(&key.tenant_id)
             .await
-            .map_err(|e| ApiError::from(e).into_response())?;
+            .map_err(ApiError::from)?;
     match tenant {
         Some(t) if !t.suspended => {}
         Some(_) => {
-            return Err(
-                ApiError(StatusCode::FORBIDDEN, "このアカウントは停止されています").into_response(),
-            );
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                "このアカウントは停止されています",
+            ));
         }
         None => return Err(fail("no tenant")),
     }
