@@ -166,7 +166,6 @@
         {#each Object.entries(head.checksums) as [algo, value] (algo)}
           <dt>{algo}</dt><dd class="mono">{value}{head.checksumType ? `（${head.checksumType}）` : ''}</dd>
         {/each}
-        {#if head.cacheControl}<dt>Cache-Control</dt><dd>{head.cacheControl}</dd>{/if}
       </dl>
     </section>
 

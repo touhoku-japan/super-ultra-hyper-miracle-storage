@@ -12,7 +12,9 @@ export function bytes(n) {
     i += 1;
   }
   const digits = i === 0 || v >= 100 ? 0 : v >= 10 ? 1 : 2;
-  return `${v.toFixed(digits)} ${UNITS[i]}`;
+  // "64.0 MiB" -> "64 MiB"
+  const text = v.toFixed(digits).replace(/\.0+$/, '');
+  return `${text} ${UNITS[i]}`;
 }
 
 const dtf = new Intl.DateTimeFormat('ja-JP', {

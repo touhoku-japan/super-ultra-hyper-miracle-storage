@@ -12,7 +12,7 @@
         <strong>SUHMS</strong>
         <span>{product}</span>
       </div>
-      <button class="quiet menu" aria-label="メニュー" aria-expanded={menuOpen} onclick={() => (menuOpen = !menuOpen)}>☰</button>
+      <button class="quiet menu" aria-label="メニュー" aria-expanded={menuOpen} onclick={() => (menuOpen = !menuOpen)}><span class="bars" aria-hidden="true"></span></button>
     </div>
     <nav>
       {#each nav as item (item.href)}
@@ -82,8 +82,35 @@
   .menu {
     display: none;
     margin-left: auto;
-    color: var(--side-ink);
-    font-size: 1.2rem;
+    padding: 0.6rem 0.5rem;
+  }
+  .brand .menu:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.1);
+  }
+  /* Three bars drawn in CSS (no icon font). */
+  .bars,
+  .bars::before,
+  .bars::after {
+    display: block;
+    width: 20px;
+    height: 2px;
+    background: var(--side-ink);
+    border-radius: 1px;
+  }
+  .bars {
+    position: relative;
+  }
+  .bars::before,
+  .bars::after {
+    content: '';
+    position: absolute;
+    left: 0;
+  }
+  .bars::before {
+    top: -6px;
+  }
+  .bars::after {
+    top: 6px;
   }
   nav {
     display: grid;
@@ -139,6 +166,7 @@
   @media (max-width: 820px) {
     .shell {
       grid-template-columns: 1fr;
+      grid-template-rows: auto 1fr;
     }
     aside {
       position: static;

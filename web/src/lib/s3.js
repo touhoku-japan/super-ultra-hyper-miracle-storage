@@ -241,8 +241,6 @@ export async function headObject(bucket, key, versionId) {
     legalHold: h.get('x-amz-object-lock-legal-hold') === 'ON',
     checksumType: h.get('x-amz-checksum-type'),
     checksums,
-    cacheControl: h.get('cache-control'),
-    contentDisposition: h.get('content-disposition'),
     meta,
   };
 }

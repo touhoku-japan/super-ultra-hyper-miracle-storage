@@ -86,7 +86,7 @@
     }
     return out;
   });
-  const title = $derived(prefix ? basename(prefix) : bucket);
+  const title = $derived(prefix ? basename(prefix).replace(/\/$/, '') : bucket);
 
   const f = $derived(filter.trim().toLowerCase());
   const shownFolders = $derived(folders.filter((p) => basename(p).toLowerCase().includes(f)));
@@ -334,7 +334,7 @@
         {#if versioning}
           <label class="check small"><input type="checkbox" checked={versions} onchange={(e) => setVersions(e.target.checked)} /> すべてのバージョンを表示</label>
         {/if}
-        <button class="quiet" onclick={() => load()} disabled={loading} aria-label="再読み込み">↻</button>
+        <button class="quiet" onclick={() => load()} disabled={loading}>再読み込み</button>
       </div>
     </header>
 
@@ -374,7 +374,7 @@
                 <td class="sel"></td>
                 <td colspan={versions ? 5 : 4}>
                   <a class="folder" href={link(['b', bucket], { prefix: p, versions: versions ? '1' : undefined })}>
-                    <span class="icon" aria-hidden="true">▸</span>{basename(p)}
+                    <span class="icon" aria-hidden="true"></span>{basename(p)}
                   </a>
                 </td>
                 <td class="actions">
@@ -398,7 +398,7 @@
                   <td class="small">
                     {#if o.deleteMarker}<span class="badge bad">削除マーカー</span>{/if}
                     {#if o.isLatest}<span class="badge info">最新</span>{/if}
-                    <span class="mono faint" title={o.versionId}>{o.versionId === 'null' ? 'null' : o.versionId.slice(0, 10)}</span>
+                    <span class="mono faint" title={o.versionId}>{o.versionId === 'null' ? 'null' : `…${o.versionId.slice(-8)}`}</span>
                   </td>
                 {/if}
                 <td class="num">{o.deleteMarker ? '—' : bytes(o.size)}</td>
@@ -536,8 +536,28 @@
   .folder:hover {
     color: var(--indigo);
   }
+  /* A folder tab drawn in CSS (no icon font). */
   .icon {
-    color: var(--kincha);
+    width: 14px;
+    height: 10px;
+    border: 1.5px solid var(--kincha);
+    border-radius: 1px 2px 2px 2px;
+    position: relative;
+    flex: none;
+  }
+  .icon::before {
+    content: '';
+    position: absolute;
+    left: -1.5px;
+    top: -4px;
+    width: 6px;
+    height: 3px;
+    border: 1.5px solid var(--kincha);
+    border-bottom: none;
+    border-radius: 1px 1px 0 0;
+  }
+  td.name {
+    min-width: 10rem;
   }
   button.link {
     border: none;

@@ -112,7 +112,7 @@
 </script>
 
 <PageHead title="ディスクとノード">
-  <button class="quiet" onclick={load} aria-label="再読み込み">↻</button>
+  <button onclick={load}>再読み込み</button>
 </PageHead>
 
 {#if error}

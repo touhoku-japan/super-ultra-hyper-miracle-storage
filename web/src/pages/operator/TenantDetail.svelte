@@ -298,7 +298,8 @@
     margin-bottom: 1.2rem;
     align-items: start;
   }
-  section.sheet + section.sheet {
+  /* Cards below the two-column row; the row itself spaces its cards with gap. */
+  .cols ~ section.sheet + section.sheet {
     margin-top: 1.2rem;
   }
 </style>

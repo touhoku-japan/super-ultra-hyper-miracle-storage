@@ -138,34 +138,34 @@ button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
-button.primary {
+:is(button, .button).primary {
   background: var(--indigo);
   border-color: var(--indigo);
   color: var(--panel);
 }
-button.primary:hover:not(:disabled) {
+:is(button, .button).primary:hover:not(:disabled) {
   filter: brightness(1.08);
   border-color: var(--indigo);
 }
-button.danger {
+:is(button, .button).danger {
   color: var(--shu);
   border-color: color-mix(in srgb, var(--shu) 45%, var(--lattice));
 }
-button.danger.solid {
+:is(button, .button).danger.solid {
   background: var(--shu);
   color: var(--panel);
   border-color: var(--shu);
 }
-button.quiet {
+:is(button, .button).quiet {
   border-color: transparent;
   background: transparent;
   padding-inline: 0.5em;
 }
-button.quiet:hover:not(:disabled) {
+:is(button, .button).quiet:hover:not(:disabled) {
   background: var(--indigo-soft);
   border-color: transparent;
 }
-button.small {
+:is(button, .button).small {
   font-size: 0.85rem;
   padding: 0.2em 0.6em;
 }
@@ -202,6 +202,7 @@ textarea {
 
 label.field {
   display: grid;
+  align-content: start;
   gap: 0.25rem;
   font-size: 0.9rem;
   color: var(--ink-soft);

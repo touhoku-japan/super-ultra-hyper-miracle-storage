@@ -11,10 +11,11 @@ use suhms_store::{GcOptions, RebalanceOptions, Store, StoreError};
 
 use crate::admin::now_millis;
 
+/// In the order the console lists them (most used first).
 pub const JOBS: &[&str] = &[
-    "scrub",
     "repair",
     "repair-full",
+    "scrub",
     "gc",
     "rebalance",
     "checksum-backfill",
@@ -85,12 +86,8 @@ impl Jobs {
     }
 
     pub fn list(&self) -> Vec<JobState> {
-        self.state
-            .lock()
-            .expect("jobs lock")
-            .values()
-            .cloned()
-            .collect()
+        let state = self.state.lock().expect("jobs lock");
+        JOBS.iter().filter_map(|n| state.get(n).cloned()).collect()
     }
 
     /// Starts `name` in the background.
