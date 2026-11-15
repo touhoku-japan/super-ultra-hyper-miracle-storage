@@ -5,6 +5,10 @@ on:
     branches: [main, develop]
   pull_request:
 
+# The jobs only build and test, so the GITHUB_TOKEN needs read access only.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
