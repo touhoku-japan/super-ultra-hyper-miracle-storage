@@ -7,11 +7,16 @@ pub mod backfill;
 pub mod checksum;
 pub mod cluster;
 pub mod config;
+pub mod console;
 pub mod cors;
 pub mod crypto;
+pub mod jobs;
 pub mod s3;
+pub mod session;
+pub mod sigv4;
 pub mod tenancy;
 pub mod tls;
+pub mod web;
 
 use std::{convert::Infallible, sync::Arc};
 

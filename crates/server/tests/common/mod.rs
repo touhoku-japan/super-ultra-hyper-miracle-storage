@@ -35,6 +35,7 @@ pub struct Server {
     pub dir: TempDir,
     pub app: Router,
     pub admin: Router,
+    pub console: Router,
     pub tenancy: Arc<suhms_server::tenancy::Tenancy>,
     pub store: Arc<Store>,
     pub cipher: Arc<SecretCipher>,
@@ -121,12 +122,20 @@ impl Server {
             Arc::clone(&tenancy),
             Arc::clone(&cipher),
             ADMIN_TOKEN,
-            config.s3.allow_public_buckets,
+            &config,
+        );
+        let console = suhms_server::console::router(
+            Arc::clone(&store),
+            Arc::clone(&tenancy),
+            Arc::clone(&cipher),
+            app.clone(),
+            &config,
         );
         Self {
             dir,
             app,
             admin,
+            console,
             tenancy,
             store,
             cipher,
