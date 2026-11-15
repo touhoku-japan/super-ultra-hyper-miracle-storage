@@ -20,14 +20,26 @@ async fn health_needs_no_auth() {
         .await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.text(), "ok");
+
+    // The old path is gone (it is now just an unauthenticated S3 request).
+    let resp = srv
+        .send(Request::get("/suhms/health").body(Body::empty()).unwrap())
+        .await;
+    assert_ne!(resp.status, 200);
 }
 
 #[tokio::test]
 async fn reserved_bucket_name_is_rejected() {
     let srv = Server::start(1).await;
     let (_, c) = srv.tenant("alice").await;
-    let resp = srv.s3(&c, "PUT", "/suhms", &[], &[], vec![]).await;
-    assert_eq!(resp.error_code().as_deref(), Some("InvalidBucketName"));
+    for name in ["/super-ultra-hyper-miracle-storage", "/suhms"] {
+        let resp = srv.s3(&c, "PUT", name, &[], &[], vec![]).await;
+        assert_eq!(
+            resp.error_code().as_deref(),
+            Some("InvalidBucketName"),
+            "{name}"
+        );
+    }
 }
 
 #[tokio::test]

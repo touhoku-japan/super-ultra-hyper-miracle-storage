@@ -7,7 +7,7 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
 
 - テスト: `CARGO_BUILD_JOBS=1 cargo test --workspace`
 - Lint: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings`
-- 起動: `cargo run -p suhms-server -- -c config.toml serve`（`GET /suhms/health` で疎通確認。認証不要）
+- 起動: `cargo run -p suhms-server -- -c config.toml serve`（`GET /super-ultra-hyper-miracle-storage/health` で疎通確認。認証不要）
 - 管理: `suhms gen-master-key` / `suhms tenant create|list` / `suhms key create|list|disable|enable` /
   `suhms bucket set-replicas <bucket> <n|default>` / `suhms scrub` / `suhms repair [--quick]` / `suhms gc [--grace-secs N] [--force]` /
   `suhms rebalance [--margin-gib N] [--max-moves N]` / `suhms checksum-backfill [--max-objects N] [--mib-per-sec N]` / `suhms disk list|drain|undrain|remove [--force]` / `suhms node drain|undrain|remove [--force]`
@@ -134,8 +134,10 @@ AWS CLI はホストにシステムインストールしていないので、公
 - ListObjectVersions / ListMultipartUploads の delimiter（CommonPrefixes）。store 側で `list.rs` と同じく
   共通プレフィックスの後ろ（`PREFIX_SKIP`）へカーソルを飛ばして読む。key-marker だけ指定した ListMultipartUploads は
   そのキーのアップロードを含めない（S3 と同じ）
-- 予約バケット名 `suhms`（`RESERVED_BUCKETS`）: ヘルスチェック `/suhms/health` 用。パス形式のときだけヘルスチェックとして扱い、
-  仮想ホスト形式（`<bucket>.<domain>/suhms/health`）はそのバケットのオブジェクトへのリクエストとして S3 に回す
+- 予約バケット名 `super-ultra-hyper-miracle-storage`（`RESERVED_BUCKETS`）: ヘルスチェック `/super-ultra-hyper-miracle-storage/health` 用。
+  パス形式のときだけヘルスチェックとして扱い、仮想ホスト形式（`<bucket>.<domain>/super-ultra-hyper-miracle-storage/health`）は
+  そのバケットのオブジェクトへのリクエストとして S3 に回す。旧パス `/suhms/health` は廃止（`suhms` は予約名として残し、
+  旧パスを叩く監視が顧客のバケットに当たらないようにしている）
 - CORS（`server/src/cors.rs`）: ルールはバケットに JSON で保存し、ミドルウェアがプリフライト（OPTIONS）と応答ヘッダを処理
 - SQLite のマイグレーションは外部キーを無効化して実行する（`objects` の再作成で replicas が CASCADE 削除されないように）
 - サーバ側暗号化（SSE）は実装しない: 「ファイルをそのまま置く」方針と矛盾するため。保存時暗号化はディスク側（LUKS 等）で行う

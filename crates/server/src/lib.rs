@@ -25,10 +25,12 @@ use tower_http::trace::TraceLayer;
 
 use crate::{config::Config, crypto::SecretCipher, tenancy::Tenancy};
 
-/// Health check path. `suhms` is a reserved bucket name ([`suhms_store::RESERVED_BUCKETS`]), so
-/// on path-style requests this never shadows a bucket; virtual-hosted requests for a bucket
-/// (`<bucket>.<domain>/suhms/health`) still reach the object of that key.
-pub const HEALTH_PATH: &str = "/suhms/health";
+/// Health check path. `super-ultra-hyper-miracle-storage` is a reserved bucket name
+/// ([`suhms_store::RESERVED_BUCKETS`]), so on path-style requests this never shadows a bucket;
+/// virtual-hosted requests for a bucket
+/// (`<bucket>.<domain>/super-ultra-hyper-miracle-storage/health`) still reach the object of that
+/// key.
+pub const HEALTH_PATH: &str = "/super-ultra-hyper-miracle-storage/health";
 
 /// Whether the request's Host names a bucket under one of the virtual-hosting `domains`.
 fn is_bucket_host(req: &Request<Body>, domains: &[String]) -> bool {
