@@ -1,0 +1,34 @@
+name: LGTM
+
+# PR のレビューが APPROVED（承認）で送信されたら「LGTM！ナマハゲの太鼓判」の画像をコメントする。
+# 画像は .github/assets/lgtm-namahage.png。PR の向き先ブランチにある画像を表示するので、
+# このファイルと画像が develop / main に入ってから有効になる。
+# フォークからの PR ではトークンが読み取り専用になるためコメントできない（失敗しても他のチェックには影響しない）。
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+# コメントを書く権限だけ。
+permissions:
+  pull-requests: write
+
+jobs:
+  stamp:
+    if: github.event.review.state == 'approved'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post the LGTM stamp
+        # イベントの値は環境変数で渡す（run に直接埋め込まない）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          REVIEWER: ${{ github.event.review.user.login }}
+        run: |
+          url="https://raw.githubusercontent.com/${REPO}/${BASE}/.github/assets/lgtm-namahage.png"
+          body="<img src=\"${url}\" width=\"300\" alt=\"LGTM！ナマハゲの太鼓判\">
+
+          \`${REVIEWER}\` さんが APPROVED しました。"
+          gh pr comment "$PR" --repo "$REPO" --body "$body"
