@@ -7,6 +7,8 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
 
 - テスト: `CARGO_BUILD_JOBS=1 cargo test --workspace`
 - Lint: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings`
+- Web コンソール（`web/`）: `npm ci && npm test && npm run build`。出力 `web/dist/` は `crates/server/build.rs` がバイナリに埋め込む
+  （無ければ案内ページ。`SUHMS_REQUIRE_WEB=1` で必須にできる）。詳細は `docs/webui.md`
 - 起動: `cargo run -p suhms-server -- -c config.toml serve`（`GET /super-ultra-hyper-miracle-storage/health` で疎通確認。認証不要）
 - 管理: `suhms gen-master-key` / `suhms tenant create|list` / `suhms key create|list|disable|enable` /
   `suhms bucket set-replicas <bucket> <n|default>` / `suhms scrub` / `suhms repair [--quick]` / `suhms gc [--grace-secs N] [--force]` /
@@ -48,7 +50,14 @@ AWS CLI はホストにシステムインストールしていないので、公
     - `tenancy.rs` — アクセスキー/テナントの 10 秒キャッシュ（`Directory`。管理 API での変更は同ノードで即時無効化）、
       アクセスキーごとのレート制限（トークンバケット）、課金用メーター（`Meter`、class A/B リクエスト数・ingress/egress を
       テナント×時間で集計し定期的に `usage_hourly` へ加算）、Prometheus メトリクス
-    - `admin_api.rs` — SoraHost ポータル用の管理 API（`[admin] listen`、Bearer トークン）。`/metrics` だけ認証なし
+    - `admin_api.rs` — SoraHost ポータル用の管理 API（`[admin] listen`、Bearer トークン）。`/metrics` だけ認証なし。
+      運用者用 Web コンソール（`/ui/`）も配信し、管理トークンで発行したセッション cookie も受け付ける（書き込みは CSRF ヘッダ必須）。
+      ディスク / ノードの drain・remove、概要、メンテナンスジョブ（`jobs.rs`、そのノードのプロセス内で実行）の API もここ
+    - `console.rs` — 顧客用 Web コンソール（`[console] listen`）。アクセスキーでログインし、`/s3/...` へのブラウザのリクエストを
+      セッションのキーで SigV4 署名（`sigv4.rs`）して S3 サービスをプロセス内で呼ぶプロキシ。応答は常に attachment + sandbox CSP。
+      **S3 と同じホスト名で公開しない**（公開バケットの HTML がセッションを使えてしまう）
+    - `session.rs` — コンソールのセッション（HMAC 署名の cookie、サーバ側に状態なし）、CSRF 判定、ログイン試行制限、セキュリティヘッダ
+    - `web.rs` — 埋め込んだ `web/dist` の配信（`build.rs` が生成）
     - `admin.rs` — 管理サブコマンド
     - `tests/` — `common/mod.rs` の自前 SigV4 署名器で、実ルータを in-process で叩く E2E テスト
   - `store/` — ストレージエンジン
@@ -153,6 +162,7 @@ AWS CLI はホストにシステムインストールしていないので、公
 ## ドキュメント・デプロイ
 
 - `docs/TODO.md` — やり残し（バックログ）。項目を片付けたらここと下の「未対応」を更新する
+- `docs/webui.md` — Web コンソール（顧客用・運用者用）の構成、セキュリティ上の判断、運用
 - `docs/sorahost-integration.md` — SoraHost ポータル（dev-sorahost）から管理 API を使う仕様（課金計算を含む）。
   `docs/examples/SuhmsAdminClient.php` は Laravel 用クライアント例。**dev-sorahost 側の実装はこのリポジトリでは行わない**
 - `deploy/suhms.service`（systemd）、`deploy/nginx.conf`（TLS 終端。管理 API とノード間 API は公開しない）
@@ -161,6 +171,8 @@ AWS CLI はホストにシステムインストールしていないので、公
 
 MIT ライセンス。依存クレートは `deny.toml` の許可リスト（MIT / Apache-2.0 / BSD / BSL-1.0 等の寛容なもの）に限る。
 コピーレフト（GPL / AGPL / LGPL）の依存は追加しないこと。CI の cargo-deny がこれを検査する。
+`web/` の npm 依存も同じ方針（バンドルに入るのは Svelte のランタイム（MIT）だけ。Vite が使う lightningcss（MPL-2.0）はビルド時のみ）。
+npm 側は cargo-deny の対象外なので、依存を足すときは手で確認すること。
 
 ## 決定済みの設計方針
 

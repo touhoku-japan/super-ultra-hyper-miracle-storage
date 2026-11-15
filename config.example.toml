@@ -71,6 +71,23 @@ master_key_file = "/etc/suhms/master.key"
 # listen = "10.0.0.1:9200"
 # Bearer トークン（32 文字以上）。環境変数 SUHMS_ADMIN_TOKEN が優先
 # token_file = "/etc/suhms/admin.token"
+# 運用コンソール（http://<listen>/ui/、管理トークンでログイン）
+# ui = true
+# ui_session_secs = 28800
+# HTTPS 経由でだけ開くなら true（平文 HTTP や SSH トンネルなら false のまま）
+# ui_secure_cookie = false
+
+# 顧客用 Web コンソール（ファイルブラウザ・バケット設定）。listen を設定したときだけ有効。
+# nginx で専用のホスト名（例: console.s3.sorahost.net）に公開する。S3 と同じホスト名には絶対に置かないこと
+# （公開バケットが顧客の HTML をそのホスト名で配信するため）。設定例は deploy/nginx.conf、詳細は docs/webui.md
+[console]
+# listen = "127.0.0.1:9300"
+# 共有リンク（署名付き URL）に使う S3 の公開 URL。未設定なら共有リンクは無効
+# s3_public_url = "https://s3.sorahost.net"
+# session_secs = 43200
+# secure_cookie = true
+# nginx 経由でしか届かないなら true（ログイン試行の制限に X-Forwarded-For の最後の値を使う）
+# trust_proxy = true
 
 # アクセスキーごとのレート制限（ノードごと）。超えると 503 SlowDown
 [limits]

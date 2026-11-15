@@ -13,8 +13,16 @@
 5. **RUSTSEC-2026-0459 の一時除外を外す** — sqlx が libsqlite3-sys >= 0.39 を許容したら更新して `deny.toml` から除外を削除
    （2026-11-13 確認: 最新の sqlx 0.9.0 / sqlx-sqlite 0.9.0 は `libsqlite3-sys >=0.30.1, <0.38.0` のままで未対応）
 
+## 任意（あると良い）
+
+- **ポータルからのワンタイムログイン** — SoraHost ポータルにログイン済みの顧客を、そのまま Web コンソールへ移す。
+  管理 API で短命のトークンを発行し、コンソールの `api/login` で交換する形を想定（`docs/webui.md`）
+- **Web コンソールのブラウザ E2E テスト** — 開発ホストでは Playwright のブラウザが動かない（システムライブラリ不足）。CI で動かす案
+- **Web コンソールのジョブ状態の共有** — 今は各ノードのメモリだけ。他ノードで動いている repair 等は見えない
+
 ## 済
 
+- ~~Web コンソール~~（2026-11-15。顧客用 `[console]` と運用者用 `/ui/`。`docs/webui.md`）
 - ~~11. チェックサムの保存と返却（COMPOSITE / FULL_OBJECT 含む）~~
 - ~~12. PUT の If-Match~~（CompleteMultipartUpload の If-Match / If-None-Match も）
 - ~~13. ListMultipartUploads / ListObjectVersions の delimiter~~
