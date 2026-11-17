@@ -431,3 +431,51 @@ async fn delete_objects_batch() {
         .await;
     assert_eq!(xml_values(&resp.text(), "Key"), vec!["c"]);
 }
+
+#[tokio::test]
+async fn get_of_a_corrupt_copy_is_cut_short() {
+    use tower::ServiceExt as _;
+    let srv = Server::start(1).await;
+    let (_, c) = srv.tenant("acme").await;
+    srv.s3(&c, "PUT", "/bk1", &[], &[], vec![]).await;
+    let body = data(300_000);
+    assert_eq!(
+        srv.s3(&c, "PUT", "/bk1/k", &[], &[], body.clone())
+            .await
+            .status,
+        200
+    );
+    let locs = srv.store.object_locations("bk1", "k").await.unwrap();
+    let mut bad = body.clone();
+    bad[1234] ^= 0xff;
+    std::fs::write(&locs[0], &bad).unwrap();
+
+    // A ranged GET is not checked (that would mean reading the whole object).
+    let resp = srv
+        .s3(&c, "GET", "/bk1/k", &[], &[("range", "bytes=0-9")], vec![])
+        .await;
+    assert_eq!(resp.status, 206);
+    assert_eq!(&resp.body[..], &bad[..10]);
+
+    // Headers are already out when the mismatch shows up, so the body fails before its last
+    // bytes: the client gets less than Content-Length (a broken transfer), never the corrupt
+    // bytes as a finished download. An HTTP server stops polling the body once Content-Length
+    // bytes are out, so only the bytes before the error count here.
+    let req = common::signed(&c, "GET", "/bk1/k", &[], &[], Default::default());
+    let resp = srv.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let mut stream = resp.into_body().into_data_stream();
+    let mut received = 0;
+    let mut failed = false;
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        match chunk {
+            Ok(bytes) => received += bytes.len(),
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+    }
+    assert!(failed);
+    assert!(received < body.len());
+}

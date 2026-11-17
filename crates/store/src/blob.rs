@@ -266,6 +266,97 @@ pub async fn read_local(
     Ok(Box::new(file.take(range.end - range.start)))
 }
 
+/// Hashes everything read through it and checks it against `expected` (hex BLAKE3) before
+/// handing out the last bytes of the object: on a mismatch those bytes are withheld and the
+/// read fails with [`io::ErrorKind::InvalidData`]. A consumer therefore never receives the
+/// whole `size` bytes of a corrupt copy: an HTTP response stays short of its Content-Length
+/// (an HTTP server stops reading the body once Content-Length bytes are out, so checking only
+/// at end of file would be too late), and a copy into a new object is discarded.
+/// `on_mismatch` runs once, when the mismatch is found.
+pub struct VerifyingReader {
+    inner: BoxReader,
+    hasher: blake3::Hasher,
+    size: u64,
+    read: u64,
+    expected: String,
+    on_mismatch: Option<Box<dyn FnOnce() + Send + Sync>>,
+    state: VerifyState,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VerifyState {
+    Reading,
+    Verified,
+    Corrupt,
+}
+
+impl VerifyingReader {
+    /// `inner` must yield the whole object, `size` bytes.
+    pub fn new(
+        inner: BoxReader,
+        size: u64,
+        expected: String,
+        on_mismatch: Box<dyn FnOnce() + Send + Sync>,
+    ) -> Self {
+        Self {
+            inner,
+            hasher: blake3::Hasher::new(),
+            size,
+            read: 0,
+            expected,
+            on_mismatch: Some(on_mismatch),
+            state: VerifyState::Reading,
+        }
+    }
+
+    fn corrupt() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "object copy does not match its BLAKE3 hash",
+        )
+    }
+
+    /// Checks the hash once all bytes went through it; false on a mismatch.
+    fn verify(&mut self) -> bool {
+        if self.read == self.size && self.hasher.finalize().to_hex().as_str() == self.expected {
+            self.state = VerifyState::Verified;
+            return true;
+        }
+        self.state = VerifyState::Corrupt;
+        if let Some(f) = self.on_mismatch.take() {
+            f();
+        }
+        false
+    }
+}
+
+impl AsyncRead for VerifyingReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        match this.state {
+            VerifyState::Verified => return Poll::Ready(Ok(())),
+            VerifyState::Corrupt => return Poll::Ready(Err(Self::corrupt())),
+            VerifyState::Reading => {}
+        }
+        let before = buf.filled().len();
+        std::task::ready!(std::pin::Pin::new(&mut this.inner).poll_read(cx, buf))?;
+        let chunk = &buf.filled()[before..];
+        this.hasher.update(chunk);
+        this.read += chunk.len() as u64;
+        // Decide at the last byte (or at a premature end of file) before returning anything.
+        if (this.read >= this.size || chunk.is_empty()) && !this.verify() {
+            buf.set_filled(before);
+            return Poll::Ready(Err(Self::corrupt()));
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
 /// Atomically moves a fully synced temp file to its final path and syncs the directory entry.
 async fn publish(tmp: &Path, final_path: &Path) -> io::Result<()> {
     let dir = final_path.parent().expect("object path has a parent");

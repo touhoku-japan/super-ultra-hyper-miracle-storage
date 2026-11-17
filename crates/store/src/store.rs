@@ -1514,7 +1514,73 @@ impl Store {
 
     /// Opens `range` of an object, from a copy on this node if there is one, otherwise from
     /// another node; unreadable copies are skipped.
+    ///
+    /// A read of the whole object is checked against its BLAKE3: if the copy turns out to be
+    /// corrupt, the reader fails before handing out the last bytes instead of finishing (and a corrupt copy on this
+    /// node is dropped, as [`Store::scrub`] would, so a retry reads a healthy one). Ranged reads
+    /// cannot be checked without reading the rest; scrub covers them.
     pub async fn read_object(&self, stored: &StoredObject, range: Range<u64>) -> Result<BoxReader> {
+        let whole = range.start == 0 && range.end == stored.object.size;
+        let (disk, reader) = self.open_copy(stored, range).await?;
+        let expected = stored.object.blake3.clone();
+        if !whole || expected.is_empty() {
+            return Ok(reader);
+        }
+        let on_mismatch = self.on_corrupt_read(stored.object.id, disk, expected.clone());
+        Ok(Box::new(blob::VerifyingReader::new(
+            reader,
+            stored.object.size,
+            expected,
+            on_mismatch,
+        )))
+    }
+
+    /// Called when a whole-object read did not match the object's hash. Logs it, and for a copy
+    /// on this node re-hashes the file in the background and drops the copy if it really is
+    /// corrupt (a one-off read error leaves it alone). Copies on other nodes are left to the
+    /// scrub of their own node.
+    fn on_corrupt_read(
+        &self,
+        object: Uuid,
+        disk: DiskRef,
+        expected: String,
+    ) -> Box<dyn FnOnce() + Send + Sync> {
+        let meta = Arc::clone(&self.meta);
+        Box::new(move || {
+            tracing::error!(%object, disk = %disk.label(), "read a copy that does not match its hash; response aborted");
+            let DiskRef::Local(disk) = disk else { return };
+            let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+                return;
+            };
+            runtime.spawn(async move {
+                let path = disk.object_path(object);
+                match blob::hash_file(&path).await {
+                    Ok((_, hash)) if hash != expected => {
+                        tracing::warn!(path = %path.display(), "dropping corrupt replica found by a read");
+                        // Also queues the object for repair.
+                        if let Err(error) = meta.remove_replica(object, disk.id).await {
+                            tracing::warn!(%object, %error, "failed to drop corrupt replica; scrub will retry");
+                            return;
+                        }
+                        blob::remove(&disk, object).await;
+                    }
+                    Ok(_) => {
+                        tracing::warn!(path = %path.display(), "replica matched its hash when read again; keeping it");
+                    }
+                    Err(error) => {
+                        tracing::warn!(path = %path.display(), %error, "cannot re-check replica; leaving it to scrub");
+                    }
+                }
+            });
+        })
+    }
+
+    /// Opens `range` from the first readable copy, without checking its hash.
+    async fn open_copy(
+        &self,
+        stored: &StoredObject,
+        range: Range<u64>,
+    ) -> Result<(DiskRef, BoxReader)> {
         if range.start > range.end || range.end > stored.object.size {
             return Err(StoreError::InvalidArgument("range is out of bounds".into()));
         }
@@ -1523,7 +1589,7 @@ impl Store {
                 .read(stored.object.id, stored.object.size, range.clone())
                 .await
             {
-                Ok(reader) => return Ok(reader),
+                Ok(reader) => return Ok((disk, reader)),
                 Err(error) => {
                     tracing::warn!(disk = %disk.label(), object = %stored.object.id, %error, "replica unreadable");
                 }
@@ -1541,7 +1607,7 @@ impl Store {
         sink: &mut (dyn FnMut(&[u8]) + Send),
     ) -> Result<bool> {
         use tokio::io::AsyncReadExt as _;
-        let mut reader = self.read_object(stored, 0..stored.object.size).await?;
+        let (_, mut reader) = self.open_copy(stored, 0..stored.object.size).await?;
         let mut hasher = blake3::Hasher::new();
         let mut buf = vec![0; 1 << 20];
         loop {
