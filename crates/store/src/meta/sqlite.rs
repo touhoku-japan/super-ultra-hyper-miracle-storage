@@ -952,14 +952,21 @@ impl MetadataStore for SqliteMetadata {
         Ok(())
     }
 
+    async fn ping(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
     async fn heartbeat_disk(&self, disk_id: DiskId, free_bytes: u64, now: i64) -> Result<()> {
         let _guard = self.write_lock.lock().await;
-        sqlx::query("UPDATE disks SET free_bytes = ?, heartbeat_at = ? WHERE id = ?")
-            .bind(i64_of(free_bytes)?)
-            .bind(now)
-            .bind(disk_id.to_string())
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE disks SET online = TRUE, free_bytes = ?, heartbeat_at = ? WHERE id = ?",
+        )
+        .bind(i64_of(free_bytes)?)
+        .bind(now)
+        .bind(disk_id.to_string())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

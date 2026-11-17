@@ -18,7 +18,11 @@ pub mod tenancy;
 pub mod tls;
 pub mod web;
 
-use std::{convert::Infallible, sync::Arc};
+use std::{
+    convert::Infallible,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use axum::{
     Router,
@@ -47,6 +51,40 @@ fn is_bucket_host(req: &Request<Body>, domains: &[String]) -> bool {
         host.strip_suffix(d.as_str())
             .is_some_and(|rest| rest.len() > 1 && rest.ends_with('.'))
     })
+}
+
+/// The health check: 200 when this node has a healthy disk and the metadata database answers,
+/// 503 otherwise (so a load balancer stops sending requests that would only hang and fail).
+/// The result is reused for a second so that frequent probes do not load the database.
+struct Health {
+    store: Arc<Store>,
+    last: Mutex<Option<(Instant, Result<(), &'static str>)>>,
+}
+
+impl Health {
+    const REUSE: Duration = Duration::from_secs(1);
+    const TIMEOUT: Duration = Duration::from_secs(2);
+
+    async fn respond(&self) -> Response<Body> {
+        let cached = (*self.last.lock().expect("lock poisoned"))
+            .filter(|(at, _)| at.elapsed() < Self::REUSE)
+            .map(|(_, r)| r);
+        let result = match cached {
+            Some(r) => r,
+            None => {
+                let r = self.store.check_health(Self::TIMEOUT).await;
+                *self.last.lock().expect("lock poisoned") = Some((Instant::now(), r));
+                r
+            }
+        };
+        match result {
+            Ok(()) => Response::new(Body::from("ok")),
+            Err(reason) => Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(Body::from(reason))
+                .expect("static response is valid"),
+        }
+    }
 }
 
 /// Builds the HTTP application: the health check plus the S3 API for every other path.
@@ -81,14 +119,19 @@ pub fn app(
     let s3_service = builder.build();
 
     let domains: Arc<[String]> = config.s3.domains.clone().into();
+    let health_check = Arc::new(Health {
+        store: Arc::clone(&store),
+        last: Mutex::new(None),
+    });
     let fallback = tower::service_fn(move |req: Request<Body>| {
         let mut svc = s3_service.clone();
+        let health_check = Arc::clone(&health_check);
         let health = req.uri().path() == HEALTH_PATH
             && matches!(*req.method(), Method::GET | Method::HEAD)
             && !is_bucket_host(&req, &domains);
         async move {
             if health {
-                return Ok::<_, Infallible>(Response::new(Body::from("ok")));
+                return Ok::<_, Infallible>(health_check.respond().await);
             }
             let response = match tower::Service::call(&mut svc, req).await {
                 Ok(resp) => resp.map(Body::new),

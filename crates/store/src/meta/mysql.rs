@@ -19,6 +19,9 @@ use crate::{
     error::{Result, StoreError},
 };
 
+/// How long a query waits for a pooled connection (including connecting) before failing.
+const ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Applied in order; each runs once, inside a transaction. Never edit a released migration.
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("migrations/mysql/0001_init.sql")),
@@ -98,8 +101,11 @@ impl MysqlMetadata {
     }
 
     pub async fn connect(url: &str) -> Result<Self> {
+        // Fail fast while the database is down instead of holding requests for sqlx's default
+        // 30 s per query (requests that touch the database several times took minutes).
         let pool = MySqlPoolOptions::new()
             .max_connections(16)
+            .acquire_timeout(ACQUIRE_TIMEOUT)
             .connect(url)
             .await?;
         migrate(&pool).await?;
@@ -1009,13 +1015,20 @@ impl MetadataStore for MysqlMetadata {
         Ok(())
     }
 
+    async fn ping(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
     async fn heartbeat_disk(&self, disk_id: DiskId, free_bytes: u64, now: i64) -> Result<()> {
-        sqlx::query("UPDATE disks SET free_bytes = ?, heartbeat_at = ? WHERE id = ?")
-            .bind(i64_of(free_bytes)?)
-            .bind(now)
-            .bind(disk_id.to_string())
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE disks SET online = TRUE, free_bytes = ?, heartbeat_at = ? WHERE id = ?",
+        )
+        .bind(i64_of(free_bytes)?)
+        .bind(now)
+        .bind(disk_id.to_string())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

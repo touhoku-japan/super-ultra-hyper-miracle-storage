@@ -187,6 +187,9 @@ pub struct ScrubReport {
     pub checked: u64,
     /// Copies that were missing or did not match their hash and were dropped.
     pub removed: u64,
+    /// This node's configured disks that could not be scrubbed: not opened at startup, or
+    /// failing their health check (unmounted, removed, I/O errors).
+    pub skipped_disks: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +223,12 @@ pub struct Store {
     instance: String,
     /// Live, non-draining disks as of the last repair pass (to notice new capacity).
     repair_capacity: std::sync::Mutex<Option<HashSet<DiskId>>>,
+    /// Configured disks that could not be opened at startup.
+    unopened: usize,
+    /// Nodes whose node API did not answer the last ping. Their disks may still heartbeat
+    /// (the metadata DB is reachable from both sides of a network partition), but this node
+    /// cannot use them.
+    unreachable: std::sync::RwLock<HashSet<String>>,
 }
 
 fn now_millis() -> i64 {
@@ -347,6 +356,7 @@ impl Store {
         meta.set_node_disks_offline(&config.node_id).await?;
         let mut disks = Vec::new();
         let mut seen = HashSet::new();
+        let mut unopened = 0;
         for path in &config.disks {
             match Disk::open(path, &config.node_id).await {
                 Ok(disk) => {
@@ -368,6 +378,7 @@ impl Store {
                 }
                 Err(error) => {
                     tracing::error!(path = %path.display(), %error, "disk unavailable; continuing without it");
+                    unopened += 1;
                 }
             }
         }
@@ -382,6 +393,8 @@ impl Store {
             usage: RwLock::new(HashMap::new()),
             instance: format!("{}/{}", config.node_id, Uuid::new_v4().simple()),
             repair_capacity: std::sync::Mutex::new(None),
+            unopened,
+            unreachable: std::sync::RwLock::new(HashSet::new()),
             config,
         })
     }
@@ -392,14 +405,92 @@ impl Store {
 
     /// Reports this node's disks as alive, with their current free space. Call every
     /// [`HEARTBEAT_INTERVAL`]; other nodes treat disks without a recent heartbeat as offline.
+    ///
+    /// Also probes this node's disks (one that fails, e.g. because it was unmounted, stops
+    /// heartbeating and is taken out of service) and pings the other nodes.
     pub async fn heartbeat(&self) -> Result<()> {
+        let changed = self.probe_disks().await;
         let now = now_millis();
-        for d in &self.disks {
+        for d in self.healthy_disks() {
             self.meta
                 .heartbeat_disk(d.id, d.available_space(), now)
                 .await?;
         }
+        if changed | self.check_peers().await? {
+            self.refresh_cluster().await;
+        }
         Ok(())
+    }
+
+    /// Whether this node can serve requests: it has a healthy disk and the metadata database
+    /// answers within `timeout`. For the health check endpoint.
+    pub async fn check_health(&self, timeout: Duration) -> std::result::Result<(), &'static str> {
+        if self.healthy_disks().next().is_none() {
+            return Err("no healthy disks");
+        }
+        match tokio::time::timeout(timeout, self.meta.ping()).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "health check: metadata database failed");
+                Err("metadata database unavailable")
+            }
+            Err(_) => Err("metadata database unavailable"),
+        }
+    }
+
+    /// Probes every local disk; returns whether any changed health.
+    async fn probe_disks(&self) -> bool {
+        let mut changed = false;
+        for d in &self.disks {
+            let was = d.is_healthy();
+            changed |= d.probe().await != was;
+        }
+        changed
+    }
+
+    /// Pings every other node that has disks; returns whether the set of unreachable nodes
+    /// changed. A node that does not answer is not used for reads, writes or repair until it
+    /// answers again (see [`Store::reach`]).
+    pub async fn check_peers(&self) -> Result<bool> {
+        let view = self.cluster_disks().await?;
+        let nodes: HashSet<&str> = view
+            .iter()
+            .map(|i| i.node_id.as_str())
+            .filter(|n| *n != self.config.node_id)
+            .collect();
+        let pings = nodes.into_iter().filter_map(|n| {
+            let peer = self.peers.get(n)?;
+            Some(async move { (n.to_owned(), peer.ping().await) })
+        });
+        let mut down = HashSet::new();
+        for (node, result) in futures::future::join_all(pings).await {
+            if let Err(error) = result {
+                if !self
+                    .unreachable
+                    .read()
+                    .expect("lock poisoned")
+                    .contains(&node)
+                {
+                    tracing::warn!(%node, %error, "node is unreachable; not using its disks");
+                }
+                down.insert(node);
+            }
+        }
+        let mut current = self.unreachable.write().expect("lock poisoned");
+        for node in current.difference(&down) {
+            tracing::info!(%node, "node is reachable again");
+        }
+        let changed = *current != down;
+        *current = down;
+        Ok(changed)
+    }
+
+    fn node_reachable(&self, node: &str) -> bool {
+        !self
+            .unreachable
+            .read()
+            .expect("lock poisoned")
+            .contains(node)
     }
 
     /// Every registered disk of the cluster, with liveness. Cached briefly.
@@ -425,6 +516,7 @@ impl Store {
                 },
                 None => DiskInfo {
                     id: r.id,
+                    // A local disk that is not open (or failed its probe) is down.
                     alive: r.online
                         && r.heartbeat_at >= alive_since
                         && r.node_id != self.config.node_id,
@@ -444,12 +536,12 @@ impl Store {
         *self.view.write().await = None;
     }
 
-    /// How a disk can be reached, if it is alive.
+    /// How a disk can be reached, if it is alive (and its node answers).
     fn reach(&self, info: &DiskInfo) -> Option<DiskRef> {
         if let Some(d) = self.local_disk(info.id) {
             return Some(DiskRef::Local(Arc::clone(d)));
         }
-        if !info.alive {
+        if !info.alive || !self.node_reachable(&info.node_id) {
             return None;
         }
         self.peers.get(&info.node_id).map(|peer| DiskRef::Remote {
@@ -481,9 +573,14 @@ impl Store {
         }
     }
 
-    /// One of this node's own (opened) disks.
+    /// One of this node's own disks, if it is open and passed its last health probe.
     pub fn local_disk(&self, id: DiskId) -> Option<&Arc<Disk>> {
-        self.disks.iter().find(|d| d.id == id)
+        self.disks.iter().find(|d| d.id == id && d.is_healthy())
+    }
+
+    /// This node's disks that passed their last health probe.
+    fn healthy_disks(&self) -> impl Iterator<Item = &Arc<Disk>> {
+        self.disks.iter().filter(|d| d.is_healthy())
     }
 
     fn disk(&self, id: DiskId) -> Option<&Arc<Disk>> {

@@ -104,6 +104,10 @@ impl TlsListener {
                 if tx.is_closed() {
                     return;
                 }
+                // See `nodelay` in main.rs: avoids a delayed-ACK stall on small responses.
+                if let Err(error) = stream.set_nodelay(true) {
+                    tracing::warn!(%peer, %error, "cannot set TCP_NODELAY");
+                }
                 let (acceptor, conn_tx) = (acceptor.clone(), tx.clone());
                 tokio::spawn(async move {
                     match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {

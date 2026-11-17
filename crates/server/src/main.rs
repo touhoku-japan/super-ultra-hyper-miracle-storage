@@ -138,7 +138,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         tracing::info!(%addr, ui = config.admin.ui, "admin API up");
         tokio::spawn(async move {
             if let Err(error) = axum::serve(
-                listener,
+                nodelay(listener),
                 admin.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .with_graceful_shutdown(shutdown_signal())
@@ -174,7 +174,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             None => {
                 tracing::warn!(%addr, "cluster listener up WITHOUT TLS; protect node-to-node traffic with a private network");
                 tokio::spawn(async move {
-                    if let Err(error) = axum::serve(listener, internal)
+                    if let Err(error) = axum::serve(nodelay(listener), internal)
                         .with_graceful_shutdown(shutdown_signal())
                         .await
                     {
@@ -209,7 +209,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         tracing::info!(%addr, "customer console up");
         tokio::spawn(async move {
             if let Err(error) = axum::serve(
-                listener,
+                nodelay(listener),
                 console.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .with_graceful_shutdown(shutdown_signal())
@@ -222,7 +222,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 
     let listener = TcpListener::bind(config.server.listen).await?;
     tracing::info!(addr = %listener.local_addr()?, "listening");
-    axum::serve(listener, app)
+    axum::serve(nodelay(listener), app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     if let Err(error) = tenancy.meter.flush(&store).await {
@@ -230,6 +230,19 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     }
     tracing::info!("shut down cleanly");
     Ok(())
+}
+
+/// Accepted connections get `TCP_NODELAY`: without it, a small response written in two pieces
+/// (headers, then body) on a keep-alive connection waits for the client's delayed ACK (~40 ms).
+fn nodelay(
+    listener: TcpListener,
+) -> axum::serve::TapIo<TcpListener, fn(&mut tokio::net::TcpStream)> {
+    use axum::serve::ListenerExt;
+    listener.tap_io(|tcp| {
+        if let Err(error) = tcp.set_nodelay(true) {
+            tracing::warn!(%error, "cannot set TCP_NODELAY");
+        }
+    })
 }
 
 /// Runs `job` every `period` (first run after one period) in the background.

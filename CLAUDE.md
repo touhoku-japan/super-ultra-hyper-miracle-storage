@@ -12,7 +12,7 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
 - ブラウザ E2E（`web/e2e/`、Playwright）: `npm run build` → `cargo build -p suhms-server` → `cd web && npm run e2e`。
   本物の `suhms serve` を一時ディレクトリで起動して顧客用・運用者用コンソールを操作する。ブラウザは初回に
   `npx playwright install chromium-headless-shell`（このホストは cups-libs を入れ済みで動く）
-- 起動: `cargo run -p suhms-server -- -c config.toml serve`（`GET /super-ultra-hyper-miracle-storage/health` で疎通確認。認証不要）
+- 起動: `cargo run -p suhms-server -- -c config.toml serve`（`GET /super-ultra-hyper-miracle-storage/health` で疎通確認。認証不要。健全なディスクが無いかメタデータ DB が 2 秒以内に応答しなければ 503。結果は 1 秒再利用）
 - 管理: `suhms gen-master-key` / `suhms tenant create|list` / `suhms key create|list|disable|enable` /
   `suhms bucket set-replicas <bucket> <n|default>` / `suhms scrub` / `suhms repair [--quick]` / `suhms gc [--grace-secs N] [--force]` /
   `suhms rebalance [--margin-gib N] [--max-moves N]` / `suhms checksum-backfill [--max-objects N] [--mib-per-sec N]` / `suhms disk list|drain|undrain|remove [--force]` / `suhms node drain|undrain|remove [--force]`
@@ -47,6 +47,7 @@ AWS CLI はホストにシステムインストールしていないので、公
       無ければコピー元のアルゴリズムで計算し直す
     - `cluster.rs` — ノード間 API（`[cluster] listen` の別リスナー、`x-suhms-node-auth` の HMAC 認証）と
       `HttpPeer`（`reqwest`）。`open_store` がクラスタ構成ならピア付きで Store を開く
+    - `main.rs` — 全リスナーで受け付けた接続に TCP_NODELAY を設定（`nodelay`。無いとキープアライブ接続の小さい応答が遅延 ACK で約 40ms 待つ）
     - `tls.rs` — ノード間の相互 TLS（`[cluster.tls]`）。rustls（暗号プロバイダは `ring`。aws-lc はビルドが重いので使わない）。
       クラスタ CA が署名したクライアント証明書を必須にし、サーバ証明書も同じ CA でだけ検証する。HMAC 認証は残す。
       `TlsListener` はハンドシェイクを別タスクで行う `axum::serve` 用リスナー。手順は `docs/cluster-tls.md`
@@ -75,7 +76,8 @@ AWS CLI はホストにシステムインストールしていないので、公
     - `meta/` — `MetadataStore` trait と SQLite / PostgreSQL / MariaDB(MySQL) 実装。スキーマは `meta/migrations/<backend>/NNNN_*.sql`
       （リリース済みのマイグレーションは編集しない。バックエンドごとに番号は独立）。
       `postgres.rs` / `mysql.rs` は `sqlite.rs` と同じ構造（SQL の差分: プレースホルダ `$n`、`ON DUPLICATE KEY UPDATE`、
-      MySQL の object_key は `VARBINARY(1024)`、PG は `COLLATE "C"`）。SQLite 以外は書き込み競合を `is_retryable` で再試行
+      MySQL の object_key は `VARBINARY(1024)`、PG は `COLLATE "C"`）。SQLite 以外は書き込み競合を `is_retryable` で再試行。
+      PG / MariaDB はプールの接続待ちを 5 秒（`ACQUIRE_TIMEOUT`）で打ち切り、DB に届かないエラー（`StoreError::is_metadata_unavailable`）は S3 では 503
     - 監査用タイムスタンプ: 全テーブル（schema_migrations 含む）に `created_at`（行の挿入日時）/ `updated_at`（最終更新日時）があり、
       DB 側で自動設定する（アプリは読み書きしない）。PG は `TIMESTAMPTZ` + `DEFAULT now()` + BEFORE UPDATE トリガー
       （`suhms_set_updated_at()`）、MariaDB は `DATETIME(6)`（TIMESTAMP は 2038 年問題があるため。sqlx がセッションを
@@ -85,6 +87,12 @@ AWS CLI はホストにシステムインストールしていないので、公
       Rust の構造体のフィールド名は従来どおり `created_at: i64`（管理 API の JSON を変えないため）。新しいテーブルを足すときも
       この 2 列とトリガーを付けること
     - クラスタ: 各ノードが自ディスクの空き容量と heartbeat を `disks` に書く（`HEARTBEAT_INTERVAL`）。30 秒更新がないディスクは offline 扱い。
+      heartbeat のたびに自ディスクを `Disk::probe`（`.suhms/format.json` を読んで ID を照合）し、失敗したディスク（アンマウント・
+      消失・I/O エラー）は heartbeat を止めて読み書き・scrub・gc の対象から外す（`local_disk` は健全なものだけ返す）。
+      heartbeat は `online` も TRUE に戻す（ディスクが欠けた状態で管理コマンドを実行すると offline にされるため）。
+      同時に他ノードを ping（`Peer::ping`、3 秒）し、応答しないノードのディスクは heartbeat があっても使わない
+      （DB は分断の両側から見えるため）。repair は冒頭でも ping し、到達できるディスクが増えたら待ち（backoff）を解除する。
+      ファイルの書き込みは `objects/` 等の基底ディレクトリを作らない（アンマウント後にルート FS へ書かないため）
       `Store::cluster_disks()` が全ノードのディスク一覧（2 秒キャッシュ）。レプリカ上限は「登録済み」ディスク/ノード数で判定するので、
       ノード障害中も書き込みは過半数で成功し、復旧後に repair で補う。複数ノード構成では同一ノードに 2 コピー置かない
     - `list.rs` — S3 の ListObjects 意味論（prefix / delimiter / marker / continuation）。キー順は UTF-8 バイト順
@@ -107,6 +115,9 @@ AWS CLI はホストにシステムインストールしていないので、公
   - ディスクの撤去: `disk drain`（`disks.draining`）で新規配置から外し、repair が他へコピーしてから draining 側を消す。
     draining のコピーはノード重複判定に数えないので、同じノードの別ディスクにも移せる。空になったら `disk remove`
     （コピーが残っていれば拒否。`--force` は壊れたディスク用で、replicas 行を消して再複製キューに積む）。
+    ノードが生きていてディスクだけが落ちている場合、そのディスクのコピーはノード重複判定に数えないので、同じノードの別ディスクへ
+    再複製する（`disk remove` を待たない）。ディスクが戻って余ったコピーは、同じノードに 2 つあるものから削る。
+    ノードごと落ちている（到達できない）場合は従来どおり数える
     `node drain/remove` はそのノードの全ディスクに同じことをする。撤去するディスクは先にノードの設定から外すこと（起動時に再登録される）
   - `gc`: 各ノードが自分のディスクを走査し、replicas 行のないオブジェクトファイル（猶予 `gc_grace_secs` より古いもの）を
     `.suhms/gc/<unix秒>/` へ移し、次回以降に猶予を過ぎたゴミ箱を消す。存在しないアップロードの `.suhms/multipart/` と古い tmp も消す。

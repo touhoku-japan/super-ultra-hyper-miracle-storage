@@ -353,6 +353,10 @@ pub trait MetadataStore: Send + Sync {
         now: i64,
     ) -> Result<()>;
     /// Refreshes a disk's free space and liveness.
+    /// Runs a trivial query, to check that the database answers.
+    async fn ping(&self) -> Result<()>;
+    /// Records a heartbeat; also marks the disk online again (an admin command started while
+    /// the disk was missing marks it offline when it opens the store).
     async fn heartbeat_disk(&self, disk_id: DiskId, free_bytes: u64, now: i64) -> Result<()>;
     /// Every disk of every node.
     async fn list_disks(&self) -> Result<Vec<DiskRecord>>;

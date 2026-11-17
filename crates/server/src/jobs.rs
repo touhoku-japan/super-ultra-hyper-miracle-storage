@@ -383,7 +383,7 @@ impl Jobs {
         Ok(match name {
             "scrub" => {
                 let r = s.scrub().await?;
-                json!({ "checked": r.checked, "removed": r.removed })
+                json!({ "checked": r.checked, "removed": r.removed, "skipped_disks": r.skipped_disks })
             }
             "repair" | "repair-full" => {
                 let r = if name == "repair" {

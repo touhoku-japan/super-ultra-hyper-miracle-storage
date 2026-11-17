@@ -29,6 +29,30 @@ async fn health_needs_no_auth() {
 }
 
 #[tokio::test]
+async fn health_fails_while_no_disk_is_usable() {
+    let srv = Server::start(1).await;
+    let health = || {
+        Request::get(suhms_server::HEALTH_PATH)
+            .body(Body::empty())
+            .unwrap()
+    };
+    // The only disk is unmounted: the next heartbeat's probe takes it out of service.
+    let away = srv.disks[0].with_extension("away");
+    std::fs::rename(&srv.disks[0], &away).unwrap();
+    srv.store.heartbeat().await.unwrap();
+    let resp = srv.send(health()).await;
+    assert_eq!(resp.status, 503);
+    assert_eq!(resp.text(), "no healthy disks");
+
+    std::fs::rename(&away, &srv.disks[0]).unwrap();
+    srv.store.heartbeat().await.unwrap();
+    // The result is reused for a second.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let resp = srv.send(health()).await;
+    assert_eq!(resp.status, 200);
+}
+
+#[tokio::test]
 async fn reserved_bucket_name_is_rejected() {
     let srv = Server::start(1).await;
     let (_, c) = srv.tenant("alice").await;
