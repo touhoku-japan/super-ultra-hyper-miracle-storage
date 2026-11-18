@@ -28,6 +28,11 @@ pub enum StoreError {
     #[error("invalid object key")]
     InvalidObjectKey,
 
+    /// The key contains a character that XML 1.0 cannot carry (a control character other than
+    /// tab / LF / CR), so it could never be returned by a listing without `encoding-type=url`.
+    #[error("object key contains a control character")]
+    InvalidKeyCharacter,
+
     #[error("bucket {0} does not exist")]
     NoSuchBucket(String),
 

@@ -629,3 +629,30 @@ async fn a_heartbeat_brings_a_disk_marked_offline_back() {
     c.refresh().await;
     assert_eq!(down(&c.nodes[0].cluster_disks().await.unwrap()), 0);
 }
+
+/// A node that died since the last ping is still in the cluster view and gets picked for new
+/// copies. Opening the copy there fails before any data is read, and another node takes it, so
+/// even a 2-of-2 write (STANDARD_IA) succeeds.
+#[tokio::test]
+async fn a_peer_that_died_since_the_last_ping_is_replaced_for_new_copies() {
+    let c = Cluster::start().await;
+    c.nodes[0]
+        .create_bucket(OWNER, "data", Some(2))
+        .await
+        .unwrap();
+    c.nodes[0].heartbeat().await.unwrap();
+    // No heartbeat after this: node1 still believes node3 is reachable.
+    c.registry
+        .partitioned
+        .write()
+        .unwrap()
+        .insert("node3".into());
+    for i in 0..12 {
+        let key = format!("k{i}");
+        c.nodes[0]
+            .put_object(OWNER, put("data", &key), &b"x"[..])
+            .await
+            .unwrap();
+        assert_eq!(c.nodes_holding("data", &key).await, vec!["node1", "node2"]);
+    }
+}

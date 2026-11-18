@@ -28,6 +28,6 @@ pub use crate::{
         DiskInfo, GcOptions, GcReport, HEARTBEAT_INTERVAL, Lease, LifecycleReport, MAX_PART_NUMBER,
         MIN_PART_SIZE, PartsPage, PutObjectRequest, RESERVED_BUCKETS, RebalanceOptions,
         RebalanceReport, RepairReport, ScrubReport, Store, UploadsPage, VersionsPage, hour_of,
-        validate_tags,
+        is_xml_control_byte, validate_tags,
     },
 };

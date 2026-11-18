@@ -234,6 +234,10 @@ fn s3_err(e: StoreError) -> S3Error {
         StoreError::BucketNotEmpty(_) => s3_error!(BucketNotEmpty),
         StoreError::InvalidBucketName(_) => s3_error!(InvalidBucketName),
         StoreError::InvalidObjectKey => s3_error!(KeyTooLongError),
+        StoreError::InvalidKeyCharacter => s3_error!(
+            InvalidArgument,
+            "Object keys must not contain control characters other than tab, LF and CR"
+        ),
         StoreError::AccessDenied => s3_error!(AccessDenied),
         StoreError::UnknownStorageClass(_) => s3_error!(InvalidStorageClass),
         StoreError::BadDigest => s3_error!(BadDigest),
@@ -379,6 +383,26 @@ fn encoder(encoding_type: Option<&s3s::dto::EncodingType>) -> S3Result<fn(&str) 
     }
 }
 
+/// Listings without `encoding-type=url` echo keys verbatim in XML, which cannot carry control
+/// characters; `s3s` would then fail the whole response with 500, which clients retry forever.
+/// New keys with such characters are rejected on write, but keys stored before that could
+/// still exist: answer 400 and point at `encoding-type=url`, which can list them.
+fn require_xml_safe<'a>(url: bool, keys: impl IntoIterator<Item = &'a str>) -> S3Result<()> {
+    if url {
+        return Ok(());
+    }
+    if keys
+        .into_iter()
+        .any(|k| k.bytes().any(suhms_store::is_xml_control_byte))
+    {
+        return Err(s3_error!(
+            InvalidArgument,
+            "The listing contains object keys with control characters; retry with encoding-type=url"
+        ));
+    }
+    Ok(())
+}
+
 fn max_keys(v: Option<i32>) -> S3Result<usize> {
     match v {
         None => Ok(1000),
@@ -398,6 +422,13 @@ fn object_entries(page: &ListPage, enc: fn(&str) -> String) -> Vec<Object> {
             ..Default::default()
         })
         .collect()
+}
+
+fn page_keys(page: &ListPage) -> impl Iterator<Item = &str> {
+    page.objects
+        .iter()
+        .map(|o| o.key.as_str())
+        .chain(page.common_prefixes.iter().map(String::as_str))
 }
 
 fn prefix_entries(page: &ListPage, enc: fn(&str) -> String) -> Vec<CommonPrefix> {
@@ -1001,6 +1032,14 @@ impl S3 for S3Service {
             )
             .await
             .map_err(s3_err)?;
+        require_xml_safe(
+            input.encoding_type.is_some(),
+            page.versions
+                .iter()
+                .map(|o| o.key.as_str())
+                .chain(page.common_prefixes.iter().map(String::as_str))
+                .chain(page.next_key_marker.as_deref()),
+        )?;
         let owner = Owner {
             id: Some(tenant.clone()),
             display_name: None,
@@ -1945,6 +1984,14 @@ impl S3 for S3Service {
             )
             .await
             .map_err(s3_err)?;
+        require_xml_safe(
+            input.encoding_type.is_some(),
+            page.uploads
+                .iter()
+                .map(|u| u.key.as_str())
+                .chain(page.common_prefixes.iter().map(String::as_str))
+                .chain(page.next_key_marker.as_deref()),
+        )?;
         Ok(S3Response::new(ListMultipartUploadsOutput {
             bucket: Some(input.bucket),
             prefix: input.prefix.as_deref().map(enc),
@@ -2258,6 +2305,14 @@ impl S3 for S3Service {
             )
             .await
             .map_err(s3_err)?;
+        require_xml_safe(
+            input.encoding_type.is_some(),
+            page_keys(&page).chain(
+                [&input.prefix, &input.delimiter, &input.start_after]
+                    .into_iter()
+                    .filter_map(|v| v.as_deref()),
+            ),
+        )?;
         let key_count = page.objects.len() + page.common_prefixes.len();
         Ok(S3Response::new(ListObjectsV2Output {
             name: Some(input.bucket),
@@ -2301,6 +2356,14 @@ impl S3 for S3Service {
             )
             .await
             .map_err(s3_err)?;
+        require_xml_safe(
+            input.encoding_type.is_some(),
+            page_keys(&page).chain(
+                [&input.prefix, &input.delimiter, &input.marker]
+                    .into_iter()
+                    .filter_map(|v| v.as_deref()),
+            ),
+        )?;
         Ok(S3Response::new(ListObjectsOutput {
             name: Some(input.bucket),
             prefix: Some(enc(input.prefix.as_deref().unwrap_or_default())),
@@ -2323,7 +2386,15 @@ impl S3 for S3Service {
 
 #[cfg(test)]
 mod tests {
-    use super::url_encode;
+    use super::{require_xml_safe, url_encode};
+
+    #[test]
+    fn listing_keys_with_control_characters_needs_url_encoding() {
+        assert!(require_xml_safe(false, ["a\tb", "c\nd\r", "日"]).is_ok());
+        let err = require_xml_safe(false, ["ok", "a\u{1}b"]).unwrap_err();
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
+        assert!(require_xml_safe(true, ["a\u{1}b"]).is_ok());
+    }
 
     #[test]
     fn url_encoding_keeps_slashes_and_unreserved() {

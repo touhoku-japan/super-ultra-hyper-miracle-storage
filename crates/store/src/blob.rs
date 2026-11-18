@@ -6,12 +6,12 @@ use std::{
 };
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::future::join_all;
 use md5::{Digest, Md5};
 use tokio::{
     fs::{self, File},
-    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt},
 };
 use uuid::Uuid;
 
@@ -51,8 +51,11 @@ pub struct WriteOutcome {
 }
 
 /// A write to a temp file on a local disk, published under its final name on commit.
+///
+/// Writes go through a blocking task with a std file rather than `tokio::fs::File`, which
+/// copies every buffer into one of its own first.
 pub struct LocalSink {
-    file: File,
+    file: Option<std::fs::File>,
     tmp: PathBuf,
     final_path: PathBuf,
 }
@@ -60,42 +63,56 @@ pub struct LocalSink {
 impl LocalSink {
     pub async fn create(disk: &Disk, dest: Dest) -> io::Result<Self> {
         let tmp = disk.tmp_path();
-        let file = File::create_new(&tmp).await?;
+        let file = File::create_new(&tmp).await?.into_std().await;
         Ok(Self {
-            file,
+            file: Some(file),
             tmp,
             final_path: dest.path(disk),
         })
+    }
+
+    /// Runs `f` on the file in a blocking task.
+    async fn with_file<T: Send + 'static>(
+        &mut self,
+        f: impl FnOnce(&mut std::fs::File) -> io::Result<T> + Send + 'static,
+    ) -> io::Result<T> {
+        let mut file = self
+            .file
+            .take()
+            .ok_or_else(|| io::Error::other("an earlier write to this file was interrupted"))?;
+        let (file, result) = tokio::task::spawn_blocking(move || {
+            let r = f(&mut file);
+            (file, r)
+        })
+        .await
+        .map_err(io::Error::other)?;
+        self.file = Some(file);
+        result
     }
 }
 
 #[async_trait]
 impl ReplicaSink for LocalSink {
     async fn write(&mut self, chunk: Bytes) -> io::Result<()> {
-        self.file.write_all(&chunk).await
+        self.with_file(move |f| std::io::Write::write_all(f, &chunk))
+            .await
     }
 
-    async fn commit(self: Box<Self>) -> io::Result<()> {
-        let Self {
-            mut file,
-            tmp,
-            final_path,
-        } = *self;
+    async fn commit(mut self: Box<Self>) -> io::Result<()> {
         let result = async {
-            file.flush().await?;
-            file.sync_all().await?;
-            drop(file);
-            publish(&tmp, &final_path).await
+            self.with_file(|f| f.sync_all()).await?;
+            drop(self.file.take());
+            publish(&self.tmp, &self.final_path).await
         }
         .await;
         if result.is_err() {
-            let _ = fs::remove_file(&tmp).await;
+            let _ = fs::remove_file(&self.tmp).await;
         }
         result
     }
 
-    async fn abort(self: Box<Self>) {
-        drop(self.file);
+    async fn abort(mut self: Box<Self>) {
+        drop(self.file.take());
         let _ = fs::remove_file(&self.tmp).await;
     }
 }
@@ -123,69 +140,127 @@ pub async fn write_replicas<R: AsyncRead + Unpin>(
     targets: &[DiskRef],
     dest: Dest,
     required: usize,
-    mut body: R,
+    body: R,
 ) -> Result<WriteOutcome> {
-    let opened = join_all(targets.iter().map(|d| d.open_sink(dest))).await;
-    let mut slots: Vec<Slot> = targets
-        .iter()
-        .zip(opened)
-        .map(|(disk, sink)| Slot {
-            disk: disk.clone(),
-            sink: match sink {
-                Ok(s) => Some(s),
+    Replicas::open(targets, dest)
+        .await
+        .write(required, body)
+        .await
+}
+
+/// Copies being written, opened before any of the body is read so that a disk that cannot take
+/// a copy (a node that died since the last ping, a full or failed disk) can still be replaced.
+pub struct Replicas {
+    dest: Dest,
+    slots: Vec<Slot>,
+    tried: Vec<DiskId>,
+}
+
+impl Replicas {
+    pub async fn open(targets: &[DiskRef], dest: Dest) -> Self {
+        let mut r = Self {
+            dest,
+            slots: Vec::new(),
+            tried: Vec::new(),
+        };
+        r.add(targets).await;
+        r
+    }
+
+    /// Opens copies on more disks; those that fail to open are only remembered in [`Self::tried`].
+    pub async fn add(&mut self, targets: &[DiskRef]) {
+        let dest = self.dest;
+        let opened = join_all(targets.iter().map(|d| d.open_sink(dest))).await;
+        for (disk, sink) in targets.iter().zip(opened) {
+            self.tried.push(disk.id());
+            match sink {
+                Ok(sink) => self.slots.push(Slot {
+                    disk: disk.clone(),
+                    sink: Some(sink),
+                }),
                 Err(error) => {
                     tracing::warn!(disk = %disk.label(), %error, "cannot open replica for writing");
-                    None
-                }
-            },
-        })
-        .collect();
-
-    let (size, md5, blake3) = match stream_into(&mut slots, required, &mut body).await {
-        Ok(v) => v,
-        Err(e) => {
-            for slot in &mut slots {
-                if let Some(sink) = slot.sink.take() {
-                    sink.abort().await;
                 }
             }
-            return Err(e);
-        }
-    };
-
-    let committing: Vec<(DiskRef, Box<dyn ReplicaSink>)> = slots
-        .into_iter()
-        .filter_map(|s| s.sink.map(|sink| (s.disk, sink)))
-        .collect();
-    let results = join_all(committing.into_iter().map(|(disk, sink)| async move {
-        let r = sink.commit().await;
-        (disk, r)
-    }))
-    .await;
-    let mut written = Vec::new();
-    for (disk, r) in results {
-        match r {
-            Ok(()) => written.push(disk),
-            Err(error) => tracing::warn!(disk = %disk.label(), %error, "replica commit failed"),
         }
     }
 
-    if written.len() < required {
-        for disk in &written {
-            disk.remove(dest).await;
-        }
-        return Err(StoreError::WriteQuorum {
-            required,
-            written: written.len(),
-        });
+    /// Disks with an open copy.
+    pub fn open_disks(&self) -> Vec<DiskId> {
+        self.slots.iter().map(|s| s.disk.id()).collect()
     }
 
-    Ok(WriteOutcome {
-        size,
-        md5,
-        blake3,
-        written: written.iter().map(DiskRef::id).collect(),
-    })
+    /// Every disk tried so far, opened or not.
+    pub fn tried(&self) -> &[DiskId] {
+        &self.tried
+    }
+
+    /// Discards the open copies.
+    pub async fn abort(self) {
+        join_all(
+            self.slots
+                .into_iter()
+                .filter_map(|s| s.sink)
+                .map(|sink| sink.abort()),
+        )
+        .await;
+    }
+
+    /// Streams `body` into the open copies and commits them.
+    pub async fn write<R: AsyncRead + Unpin>(
+        self,
+        required: usize,
+        mut body: R,
+    ) -> Result<WriteOutcome> {
+        let Self {
+            dest, mut slots, ..
+        } = self;
+        let (size, md5, blake3) = match stream_into(&mut slots, required, &mut body).await {
+            Ok(v) => v,
+            Err(e) => {
+                for slot in &mut slots {
+                    if let Some(sink) = slot.sink.take() {
+                        sink.abort().await;
+                    }
+                }
+                return Err(e);
+            }
+        };
+
+        let committing: Vec<(DiskRef, Box<dyn ReplicaSink>)> = slots
+            .into_iter()
+            .filter_map(|s| s.sink.map(|sink| (s.disk, sink)))
+            .collect();
+        let results = join_all(committing.into_iter().map(|(disk, sink)| async move {
+            let r = sink.commit().await;
+            (disk, r)
+        }))
+        .await;
+        let mut written = Vec::new();
+        for (disk, r) in results {
+            match r {
+                Ok(()) => written.push(disk),
+                Err(error) => tracing::warn!(disk = %disk.label(), %error, "replica commit failed"),
+            }
+        }
+
+        if written.len() < required {
+            for disk in &written {
+                disk.remove(dest).await;
+            }
+            return Err(StoreError::WriteQuorum {
+                required,
+                written: written.len(),
+            });
+        }
+
+        Ok(WriteOutcome {
+            size,
+            md5,
+            blake3,
+            written: written.iter().map(DiskRef::id).collect(),
+        })
+    }
 }
 
 async fn stream_into<R: AsyncRead + Unpin>(
@@ -203,19 +278,28 @@ async fn stream_into<R: AsyncRead + Unpin>(
     };
     check(slots)?;
 
-    let mut buf = vec![0u8; CHUNK];
     let mut md5 = Md5::new();
     let mut b3 = blake3::Hasher::new();
     let mut size = 0u64;
-    loop {
-        let n = body.read(&mut buf).await?;
-        if n == 0 {
+    let mut eof = false;
+    while !eof {
+        // Gather a full chunk before passing it on: request bodies arrive in pieces of a few
+        // KiB, and each chunk costs a write per copy (a channel send and an HTTP frame for a
+        // remote one). The chunk is read straight into the buffer it is sent in, not copied.
+        let mut buf = BytesMut::with_capacity(CHUNK);
+        while buf.len() < CHUNK {
+            if body.read_buf(&mut buf).await? == 0 {
+                eof = true;
+                break;
+            }
+        }
+        if buf.is_empty() {
             break;
         }
-        let chunk = Bytes::copy_from_slice(&buf[..n]);
+        let chunk = buf.freeze();
         md5.update(&chunk);
         b3.update(&chunk);
-        size += n as u64;
+        size += chunk.len() as u64;
 
         let results = join_all(slots.iter_mut().map(|s| {
             let chunk = chunk.clone();
@@ -469,34 +553,44 @@ pub async fn concat_parts(
     object: Uuid,
 ) -> io::Result<String> {
     let tmp = disk.tmp_path();
+    let inputs: Vec<(Uuid, PathBuf, String)> = parts
+        .iter()
+        .map(|(blob, expected)| (*blob, disk.part_path(upload, *blob), expected.clone()))
+        .collect();
     let result = async {
-        let mut output = File::create_new(&tmp).await?;
-        let mut whole = blake3::Hasher::new();
-        let mut buf = vec![0u8; CHUNK];
-        for (blob, expected) in parts {
-            let mut input = File::open(disk.part_path(upload, *blob)).await?;
-            let mut part = blake3::Hasher::new();
-            loop {
-                let n = input.read(&mut buf).await?;
-                if n == 0 {
-                    break;
+        // One blocking task with std files: no copies through tokio's file buffers.
+        let out = tmp.clone();
+        let whole = tokio::task::spawn_blocking(move || -> io::Result<String> {
+            use std::io::{Read, Write};
+            let mut output = std::fs::File::create_new(&out)?;
+            let mut whole = blake3::Hasher::new();
+            let mut buf = vec![0u8; CHUNK];
+            for (blob, path, expected) in inputs {
+                let mut input = std::fs::File::open(path)?;
+                let mut part = blake3::Hasher::new();
+                loop {
+                    let n = input.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    part.update(&buf[..n]);
+                    whole.update(&buf[..n]);
+                    output.write_all(&buf[..n])?;
                 }
-                part.update(&buf[..n]);
-                whole.update(&buf[..n]);
-                output.write_all(&buf[..n]).await?;
+                if part.finalize().to_hex().as_str() != expected {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("part {blob} on this disk is corrupt"),
+                    ));
+                }
             }
-            if part.finalize().to_hex().as_str() != expected {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("part {blob} on this disk is corrupt"),
-                ));
-            }
-        }
-        output.flush().await?;
-        output.sync_all().await?;
-        drop(output);
+            output.sync_all()?;
+            Ok(whole.finalize().to_hex().to_string())
+        })
+        .await
+        .map_err(io::Error::other)??;
         publish(&tmp, &disk.object_path(object)).await?;
-        Ok(whole.finalize().to_hex().to_string())
+        Ok(whole)
     }
     .await;
     if result.is_err() {

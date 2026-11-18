@@ -290,19 +290,14 @@ async fn reading_a_corrupt_copy_fails_and_drops_it() {
     std::fs::write(&locs[0], &bad).unwrap();
     std::fs::write(&locs[1], &bad).unwrap();
 
-    // Ranged reads are not checked (that would mean reading the whole object).
+    // A ranged read cannot be checked up front (that would mean reading the whole object): it
+    // returns what the copy holds, and the copy is then checked in full in the background and
+    // dropped.
     let stored = store.get_object(OWNER, "bk1", "k").await.unwrap();
     let mut r = store.read_object(&stored, 12340..12350).await.unwrap();
     let mut out = Vec::new();
     r.read_to_end(&mut out).await.unwrap();
     assert_eq!(out, bad[12340..12350]);
-
-    // Copying from a corrupt copy fails instead of spreading it, and drops that copy.
-    store
-        .copy_object(OWNER, "bk1", "k", put("bk1", "copy", None), false)
-        .await
-        .unwrap_err();
-    assert!(store.get_object(OWNER, "bk1", "copy").await.is_err());
     wait_for_copies(&store, "bk1", "k", 2).await;
 
     // A whole read of the next corrupt copy fails before its last bytes rather than finishing
@@ -321,9 +316,43 @@ async fn reading_a_corrupt_copy_fails_and_drops_it() {
     // The retry reads the healthy copy, and repair restores the dropped ones.
     assert_eq!(read_object(&store, "bk1", "k").await, data);
     assert_eq!(store.repair().await.unwrap().copied, 2);
-    for p in store.object_locations("bk1", "k").await.unwrap() {
+    let locs = store.object_locations("bk1", "k").await.unwrap();
+    for p in &locs {
         assert_eq!(std::fs::read(p).unwrap(), data);
     }
+
+    // Copying from a corrupt copy fails instead of spreading it, and drops that copy.
+    std::fs::write(&locs[0], &bad).unwrap();
+    store
+        .copy_object(OWNER, "bk1", "k", put("bk1", "copy", None), false)
+        .await
+        .unwrap_err();
+    assert!(store.get_object(OWNER, "bk1", "copy").await.is_err());
+    wait_for_copies(&store, "bk1", "k", 2).await;
+    assert_eq!(store.repair().await.unwrap().copied, 1);
+}
+
+/// A healthy copy that served a ranged read is checked once and kept; another ranged read soon
+/// after does not check it again.
+#[tokio::test]
+async fn ranged_reads_of_a_healthy_copy_keep_it() {
+    let env = Env::new(3).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "bk1", None).await.unwrap();
+    let data = payload();
+    store
+        .put_object(OWNER, put("bk1", "k", None), &data[..])
+        .await
+        .unwrap();
+    let stored = store.get_object(OWNER, "bk1", "k").await.unwrap();
+    for _ in 0..3 {
+        let mut r = store.read_object(&stored, 100..200).await.unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, data[100..200]);
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(store.object_locations("bk1", "k").await.unwrap().len(), 3);
 }
 
 #[tokio::test]

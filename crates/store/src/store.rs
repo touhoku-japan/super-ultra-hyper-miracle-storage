@@ -229,6 +229,81 @@ pub struct Store {
     /// (the metadata DB is reachable from both sides of a network partition), but this node
     /// cannot use them.
     unreachable: std::sync::RwLock<HashSet<String>>,
+    /// Background checks of copies that served ranged reads.
+    range_checks: Arc<RangeChecks>,
+}
+
+/// How long a copy that was checked after a ranged read is not checked again.
+const RANGE_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
+/// Copies hashed at the same time by [`RangeChecks`].
+const RANGE_CHECK_CONCURRENCY: usize = 2;
+/// Checks waiting for their turn; ranged reads beyond this are left to scrub.
+const RANGE_CHECK_MAX_PENDING: usize = 256;
+
+/// Ranged reads cannot be checked against the object's BLAKE3 without reading the whole copy,
+/// so a copy that served one is hashed in full afterwards, in the background. The bytes already
+/// sent cannot be taken back, but a corrupt copy is found (and dropped, which queues it for
+/// repair) right away instead of at the next scrub, and the following reads use a healthy
+/// copy. Each copy is checked at most once per [`RANGE_CHECK_INTERVAL`] (a client downloading
+/// a large object in parallel ranges triggers one check), with bounded concurrency.
+struct RangeChecks {
+    recent: std::sync::Mutex<HashMap<(Uuid, DiskId), Instant>>,
+    pending: std::sync::atomic::AtomicUsize,
+    running: tokio::sync::Semaphore,
+}
+
+impl RangeChecks {
+    fn new() -> Self {
+        Self {
+            recent: std::sync::Mutex::new(HashMap::new()),
+            pending: std::sync::atomic::AtomicUsize::new(0),
+            running: tokio::sync::Semaphore::new(RANGE_CHECK_CONCURRENCY),
+        }
+    }
+
+    /// Claims a check of `object` on `disk`; false if it was checked recently or too many
+    /// checks are waiting.
+    fn claim(&self, object: Uuid, disk: DiskId) -> bool {
+        use std::sync::atomic::Ordering;
+        let now = Instant::now();
+        let mut recent = self.recent.lock().expect("range check map poisoned");
+        if recent
+            .get(&(object, disk))
+            .is_some_and(|at| now.duration_since(*at) < RANGE_CHECK_INTERVAL)
+        {
+            return false;
+        }
+        if self.pending.load(Ordering::Relaxed) >= RANGE_CHECK_MAX_PENDING {
+            return false;
+        }
+        if recent.len() >= 4096 {
+            recent.retain(|_, at| now.duration_since(*at) < RANGE_CHECK_INTERVAL);
+        }
+        recent.insert((object, disk), now);
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    fn done(&self) {
+        self.pending
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Reads a whole copy and returns its hex BLAKE3.
+async fn hash_copy(disk: &DiskRef, object: Uuid, size: u64) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt as _;
+    let mut reader = disk.read(object, size, 0..size).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0; 1 << 20];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn now_millis() -> i64 {
@@ -308,7 +383,17 @@ fn validate_key(key: &str) -> Result<()> {
     if key.is_empty() || key.len() > MAX_KEY_LEN {
         return Err(StoreError::InvalidObjectKey);
     }
+    if key.bytes().any(is_xml_control_byte) {
+        return Err(StoreError::InvalidKeyCharacter);
+    }
     Ok(())
+}
+
+/// Bytes XML 1.0 cannot carry: control characters other than tab, LF and CR. S3 listings echo
+/// keys in XML, and `s3s` refuses to serialize these (the whole listing would fail with 500), so
+/// such keys are rejected when written.
+pub fn is_xml_control_byte(b: u8) -> bool {
+    b < b' ' && !matches!(b, b'\t' | b'\n' | b'\r')
 }
 
 /// Bucket names the server keeps for itself: the health check at
@@ -401,6 +486,7 @@ impl Store {
             repair_capacity: std::sync::Mutex::new(None),
             unopened,
             unreachable: std::sync::RwLock::new(HashSet::new()),
+            range_checks: Arc::new(RangeChecks::new()),
             config,
         })
     }
@@ -683,6 +769,42 @@ impl Store {
             .collect())
     }
 
+    /// Opens `count` new copies of an object before its body is read. A disk that cannot be
+    /// opened (most often on a node that died since the last ping, which can take up to
+    /// [`HEARTBEAT_INTERVAL`] to notice) is replaced by another disk chosen the same way, so a
+    /// write is refused only when there are really fewer than `required` usable disks.
+    async fn open_replicas(
+        &self,
+        dest: Dest,
+        count: usize,
+        required: usize,
+    ) -> Result<blob::Replicas> {
+        let targets = self.place(count, &[], &[]).await?;
+        let mut copies = blob::Replicas::open(&targets, dest).await;
+        loop {
+            let open = copies.open_disks();
+            if open.len() >= count {
+                break;
+            }
+            let more = self
+                .place(count - open.len(), &open, copies.tried())
+                .await?;
+            if more.is_empty() {
+                break;
+            }
+            copies.add(&more).await;
+        }
+        let open = copies.open_disks().len();
+        if open < required {
+            copies.abort().await;
+            return Err(StoreError::WriteQuorum {
+                required,
+                written: open,
+            });
+        }
+        Ok(copies)
+    }
+
     async fn require_bucket(&self, name: &str) -> Result<BucketRecord> {
         self.meta
             .get_bucket(name)
@@ -909,13 +1031,6 @@ impl Store {
             .resolve_replicas(bucket, req.storage_class.as_deref())
             .await?;
         let required = placement::ack_threshold(replicas);
-        let targets = self.place(usize::from(replicas), &[], &[]).await?;
-        if targets.len() < required {
-            return Err(StoreError::WriteQuorum {
-                required,
-                written: targets.len(),
-            });
-        }
 
         let mode = VersioningMode::of(bucket);
         let (lock_mode, lock_until) =
@@ -926,7 +1041,10 @@ impl Store {
             ));
         }
         let id = Uuid::new_v4();
-        let outcome = blob::write_replicas(&targets, Dest::Object(id), required, body).await?;
+        let copies = self
+            .open_replicas(Dest::Object(id), usize::from(replicas), required)
+            .await?;
+        let outcome = copies.write(required, body).await?;
         let written = StoredObject {
             object: ObjectRecord {
                 id,
@@ -1621,12 +1739,17 @@ impl Store {
     /// A read of the whole object is checked against its BLAKE3: if the copy turns out to be
     /// corrupt, the reader fails before handing out the last bytes instead of finishing (and a corrupt copy on this
     /// node is dropped, as [`Store::scrub`] would, so a retry reads a healthy one). Ranged reads
-    /// cannot be checked without reading the rest; scrub covers them.
+    /// cannot be checked without reading the rest: the copy is checked in full afterwards
+    /// ([`RangeChecks`]).
     pub async fn read_object(&self, stored: &StoredObject, range: Range<u64>) -> Result<BoxReader> {
         let whole = range.start == 0 && range.end == stored.object.size;
         let (disk, reader) = self.open_copy(stored, range).await?;
         let expected = stored.object.blake3.clone();
-        if !whole || expected.is_empty() {
+        if expected.is_empty() {
+            return Ok(reader);
+        }
+        if !whole {
+            self.check_after_ranged_read(stored, disk);
             return Ok(reader);
         }
         let on_mismatch = self.on_corrupt_read(stored.object.id, disk, expected.clone());
@@ -1636,6 +1759,53 @@ impl Store {
             expected,
             on_mismatch,
         )))
+    }
+
+    /// Schedules a background check of the copy that served a ranged read (see [`RangeChecks`]).
+    /// A copy that does not match twice is dropped, wherever it is, and the object is queued for
+    /// repair.
+    fn check_after_ranged_read(&self, stored: &StoredObject, disk: DiskRef) {
+        let object = stored.object.id;
+        if !self.range_checks.claim(object, disk.id()) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.range_checks.done();
+            return;
+        };
+        let checks = Arc::clone(&self.range_checks);
+        let meta = Arc::clone(&self.meta);
+        let size = stored.object.size;
+        let expected = stored.object.blake3.clone();
+        runtime.spawn(async move {
+            let _permit = checks.running.acquire().await;
+            let corrupt = async {
+                for _ in 0..2 {
+                    match hash_copy(&disk, object, size).await {
+                        Ok(hash) if hash != expected => {}
+                        Ok(_) => return false,
+                        Err(error) => {
+                            // Deleted meanwhile, or unreadable: the next read or scrub tells.
+                            tracing::debug!(%object, disk = %disk.label(), %error, "cannot check copy after a ranged read");
+                            return false;
+                        }
+                    }
+                }
+                true
+            }
+            .await;
+            if corrupt {
+                tracing::error!(%object, disk = %disk.label(), "copy that served a ranged read does not match its hash; dropping it");
+                // Also queues the object for repair.
+                match meta.remove_replica(object, disk.id()).await {
+                    Ok(()) => disk.remove(Dest::Object(object)).await,
+                    Err(error) => {
+                        tracing::warn!(%object, %error, "failed to drop corrupt replica; scrub will retry");
+                    }
+                }
+            }
+            checks.done();
+        });
     }
 
     /// Called when a whole-object read did not match the object's hash. Logs it, and for a copy
