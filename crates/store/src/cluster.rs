@@ -39,6 +39,21 @@ pub trait Peer: Send + Sync {
         size: u64,
         range: Range<u64>,
     ) -> io::Result<BoxReader>;
+    /// Reads a whole part file of a multipart upload, whose size must be `size`. Used to copy a
+    /// part to a disk that missed it, so that the upload can still be completed there.
+    async fn read_part(
+        &self,
+        disk: DiskId,
+        upload: Uuid,
+        blob: Uuid,
+        size: u64,
+    ) -> io::Result<BoxReader> {
+        let _ = (disk, upload, blob, size);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "reading parts from this node is not supported",
+        ))
+    }
     async fn remove(&self, disk: DiskId, dest: Dest) -> io::Result<()>;
     async fn remove_upload(&self, disk: DiskId, upload: Uuid) -> io::Result<()>;
     /// Concatenates parts into an object file on that disk; returns the object's BLAKE3.
@@ -46,7 +61,7 @@ pub trait Peer: Send + Sync {
         &self,
         disk: DiskId,
         upload: Uuid,
-        parts: Vec<(Uuid, String)>,
+        parts: Vec<blob::JoinPart>,
         object: Uuid,
     ) -> io::Result<String>;
     /// Checks that the node answers (with a short timeout).
@@ -127,6 +142,15 @@ impl DiskRef {
         }
     }
 
+    pub async fn read_part(&self, upload: Uuid, blob: Uuid, size: u64) -> io::Result<BoxReader> {
+        match self {
+            Self::Local(d) => {
+                blob::read_local_path(&d.part_path(upload, blob), size, 0..size).await
+            }
+            Self::Remote { id, peer, .. } => peer.read_part(*id, upload, blob, size).await,
+        }
+    }
+
     /// Best effort: failures are logged (an orphaned file only wastes space).
     pub async fn remove(&self, dest: Dest) {
         match self {
@@ -154,7 +178,7 @@ impl DiskRef {
     pub async fn concat(
         &self,
         upload: Uuid,
-        parts: Vec<(Uuid, String)>,
+        parts: Vec<blob::JoinPart>,
         object: Uuid,
     ) -> io::Result<String> {
         match self {

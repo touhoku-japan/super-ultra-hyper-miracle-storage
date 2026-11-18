@@ -332,7 +332,16 @@ pub async fn read_local(
     size: u64,
     range: std::ops::Range<u64>,
 ) -> io::Result<BoxReader> {
-    let mut file = File::open(disk.object_path(blob)).await?;
+    read_local_path(&disk.object_path(blob), size, range).await
+}
+
+/// Opens `range` of a local file (an object or a part), checking that it has the expected size.
+pub async fn read_local_path(
+    path: &Path,
+    size: u64,
+    range: std::ops::Range<u64>,
+) -> io::Result<BoxReader> {
+    let mut file = File::open(path).await?;
     let len = file.metadata().await?.len();
     if len != size {
         return Err(io::Error::new(
@@ -544,18 +553,84 @@ pub async fn copy_replica(
     Ok(CopyOutcome::Copied)
 }
 
+/// A part to concatenate: its file, its BLAKE3 and, when the upload recorded one, a CRC of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinPart {
+    pub blob: Uuid,
+    pub blake3: String,
+    pub crc: Option<PartCrc>,
+}
+
+/// A CRC of a part, as recorded when it was uploaded (its S3 checksum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PartCrc {
+    pub algorithm: CrcKind,
+    pub value: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CrcKind {
+    Crc32,
+    Crc32c,
+    Crc64Nvme,
+}
+
+impl CrcKind {
+    fn algorithm(self) -> crc_fast::CrcAlgorithm {
+        match self {
+            Self::Crc32 => crc_fast::CrcAlgorithm::Crc32IsoHdlc,
+            Self::Crc32c => crc_fast::CrcAlgorithm::Crc32Iscsi,
+            Self::Crc64Nvme => crc_fast::CrcAlgorithm::Crc64Nvme,
+        }
+    }
+}
+
+/// Checks one part while it is copied into the object.
+enum PartCheck {
+    Blake3(Box<blake3::Hasher>, String),
+    Crc(Box<crc_fast::Digest>, u64),
+}
+
+impl PartCheck {
+    fn new(part: &JoinPart) -> Self {
+        match part.crc {
+            Some(c) => Self::Crc(
+                Box::new(crc_fast::Digest::new(c.algorithm.algorithm())),
+                c.value,
+            ),
+            None => Self::Blake3(Box::new(blake3::Hasher::new()), part.blake3.clone()),
+        }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        match self {
+            Self::Blake3(h, _) => {
+                h.update(data);
+            }
+            Self::Crc(d, _) => d.update(data),
+        }
+    }
+
+    fn matches(&self) -> bool {
+        match self {
+            Self::Blake3(h, expected) => h.finalize().to_hex().as_str() == expected,
+            Self::Crc(d, expected) => d.finalize() == *expected,
+        }
+    }
+}
+
 /// Concatenates parts stored on `disk` into a new object file, verifying each part against its
 /// recorded BLAKE3. Returns the BLAKE3 of the whole object.
 pub async fn concat_parts(
     disk: &Disk,
     upload: Uuid,
-    parts: &[(Uuid, String)],
+    parts: &[JoinPart],
     object: Uuid,
 ) -> io::Result<String> {
     let tmp = disk.tmp_path();
-    let inputs: Vec<(Uuid, PathBuf, String)> = parts
+    let inputs: Vec<(PathBuf, JoinPart)> = parts
         .iter()
-        .map(|(blob, expected)| (*blob, disk.part_path(upload, *blob), expected.clone()))
+        .map(|p| (disk.part_path(upload, p.blob), p.clone()))
         .collect();
     let result = async {
         // One blocking task with std files: no copies through tokio's file buffers.
@@ -565,22 +640,24 @@ pub async fn concat_parts(
             let mut output = std::fs::File::create_new(&out)?;
             let mut whole = blake3::Hasher::new();
             let mut buf = vec![0u8; CHUNK];
-            for (blob, path, expected) in inputs {
+            for (path, part) in inputs {
                 let mut input = std::fs::File::open(path)?;
-                let mut part = blake3::Hasher::new();
+                // A part's CRC, when there is one, is far cheaper to check than its BLAKE3 and
+                // as good at catching a damaged file; the object's BLAKE3 is computed anyway.
+                let mut check = PartCheck::new(&part);
                 loop {
                     let n = input.read(&mut buf)?;
                     if n == 0 {
                         break;
                     }
-                    part.update(&buf[..n]);
+                    check.update(&buf[..n]);
                     whole.update(&buf[..n]);
                     output.write_all(&buf[..n])?;
                 }
-                if part.finalize().to_hex().as_str() != expected {
+                if !check.matches() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("part {blob} on this disk is corrupt"),
+                        format!("part {} on this disk is corrupt", part.blob),
                     ));
                 }
             }
@@ -629,6 +706,94 @@ pub async fn remove(disk: &Disk, blob: Uuid) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
             tracing::warn!(disk = %disk.root.display(), %blob, %error, "failed to remove replica file");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    async fn disk_with_parts(parts: &[&[u8]]) -> (tempfile::TempDir, Disk, Uuid, Vec<Uuid>) {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Disk::open(dir.path(), "node1").await.unwrap();
+        let upload = Uuid::new_v4();
+        let mut blobs = Vec::new();
+        for data in parts {
+            let blob = Uuid::new_v4();
+            write_replicas(
+                &[DiskRef::Local(Arc::new(
+                    Disk::open(dir.path(), "node1").await.unwrap(),
+                ))],
+                Dest::Part { upload, blob },
+                1,
+                *data,
+            )
+            .await
+            .unwrap();
+            blobs.push(blob);
+        }
+        (dir, disk, upload, blobs)
+    }
+
+    fn crc64(data: &[u8]) -> PartCrc {
+        let mut d = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc64Nvme);
+        d.update(data);
+        PartCrc {
+            algorithm: CrcKind::Crc64Nvme,
+            value: d.finalize(),
+        }
+    }
+
+    fn b3(data: &[u8]) -> String {
+        blake3::hash(data).to_hex().to_string()
+    }
+
+    #[tokio::test]
+    async fn parts_are_checked_by_crc_when_there_is_one_and_by_blake3_otherwise() {
+        let (a, b): (&[u8], &[u8]) = (b"first part", b"second part");
+        let (_dir, disk, upload, blobs) = disk_with_parts(&[a, b]).await;
+        let parts = vec![
+            // With a CRC, the BLAKE3 is not what is checked.
+            JoinPart {
+                blob: blobs[0],
+                blake3: "not checked".into(),
+                crc: Some(crc64(a)),
+            },
+            JoinPart {
+                blob: blobs[1],
+                blake3: b3(b),
+                crc: None,
+            },
+        ];
+        let object = Uuid::new_v4();
+        let hash = concat_parts(&disk, upload, &parts, object).await.unwrap();
+        assert_eq!(hash, b3(b"first partsecond part"));
+        assert_eq!(
+            std::fs::read(disk.object_path(object)).unwrap(),
+            b"first partsecond part"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_part_that_fails_its_check_fails_the_assembly() {
+        let data: &[u8] = b"some part";
+        let (_dir, disk, upload, blobs) = disk_with_parts(&[data]).await;
+        std::fs::write(disk.part_path(upload, blobs[0]), b"some pXrt").unwrap();
+        for crc in [Some(crc64(data)), None] {
+            let parts = [JoinPart {
+                blob: blobs[0],
+                blake3: b3(data),
+                crc,
+            }];
+            let object = Uuid::new_v4();
+            let err = concat_parts(&disk, upload, &parts, object)
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{crc:?}");
+            assert!(!disk.object_path(object).exists());
         }
     }
 }

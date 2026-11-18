@@ -734,3 +734,69 @@ async fn object_tagging_over_http() {
         .await;
     assert_eq!(resp.status, 404);
 }
+
+/// Part files are checked when an upload is assembled (by the CRC the server recorded for each
+/// part, or its BLAKE3): a damaged part fails the completion instead of ending up in the object.
+#[tokio::test]
+async fn a_damaged_part_fails_completion() {
+    for algo in [
+        None,
+        Some(("CRC32", "COMPOSITE")),
+        Some(("SHA256", "COMPOSITE")),
+    ] {
+        let srv = Server::start(1).await;
+        let (_, c) = srv.tenant("alice").await;
+        srv.s3(&c, "PUT", "/mpu", &[], &[], vec![]).await;
+        let id = match algo {
+            Some((a, k)) => multipart(&srv, &c, "big", a, k).await,
+            None => upload_id(
+                &srv.s3(&c, "POST", "/mpu/big", &[("uploads", "")], &[], vec![])
+                    .await
+                    .text(),
+            ),
+        };
+        let p1 = vec![7u8; 5 * MIB];
+        let resp = srv
+            .s3(
+                &c,
+                "PUT",
+                "/mpu/big",
+                &[("partNumber", "1"), ("uploadId", &id)],
+                &[],
+                p1,
+            )
+            .await;
+        assert_eq!(resp.status, 200, "{}", resp.text());
+        let etag = resp.header("etag").unwrap().to_owned();
+
+        // Damage the part file in place (same size).
+        let dir = srv.disks[0].join(".suhms/multipart");
+        let upload_dir = std::fs::read_dir(&dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let part = std::fs::read_dir(upload_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut data = std::fs::read(&part).unwrap();
+        data[12345] ^= 0xff;
+        std::fs::write(&part, data).unwrap();
+
+        let done = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>\
+             </CompleteMultipartUpload>"
+        );
+        let resp = srv
+            .s3(&c, "POST", "/mpu/big", &[("uploadId", &id)], &[], done)
+            .await;
+        let failed = resp.status != 200 || resp.text().contains("<Error>");
+        assert!(failed, "{algo:?}: {}", resp.text());
+        let resp = srv.s3(&c, "HEAD", "/mpu/big", &[], &[], vec![]).await;
+        assert_eq!(resp.status, 404, "{algo:?}");
+    }
+}

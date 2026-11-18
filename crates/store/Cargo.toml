@@ -9,7 +9,9 @@ repository.workspace = true
 
 [dependencies]
 async-trait = "0.1.92"
+base64 = "0.23.1"
 blake3 = "1.8.7"
+crc-fast = { version = "1.10.0", default-features = false, features = ["std"] }
 bytes = "1.12.1"
 fs4 = "1.1.0"
 futures = "0.3.34"

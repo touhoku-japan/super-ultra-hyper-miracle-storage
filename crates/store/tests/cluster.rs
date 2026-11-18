@@ -7,7 +7,10 @@ use std::{
     io,
     ops::Range,
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -42,6 +45,9 @@ impl Peer for InProcPeer {
     async fn read(&self, disk: DiskId, b: Uuid, size: u64, r: Range<u64>) -> io::Result<BoxReader> {
         blob::read_local(self.disk(disk)?, b, size, r).await
     }
+    async fn read_part(&self, disk: DiskId, up: Uuid, b: Uuid, size: u64) -> io::Result<BoxReader> {
+        blob::read_local_path(&self.disk(disk)?.part_path(up, b), size, 0..size).await
+    }
     async fn remove(&self, disk: DiskId, dest: Dest) -> io::Result<()> {
         blob::remove_path(&dest.path(self.disk(disk)?)).await;
         Ok(())
@@ -54,7 +60,7 @@ impl Peer for InProcPeer {
         &self,
         disk: DiskId,
         upload: Uuid,
-        parts: Vec<(Uuid, String)>,
+        parts: Vec<blob::JoinPart>,
         object: Uuid,
     ) -> io::Result<String> {
         blob::concat_parts(self.disk(disk)?, upload, &parts, object).await
@@ -63,7 +69,7 @@ impl Peer for InProcPeer {
 
 /// A node behind a network partition: every call fails, but it keeps heartbeating to the
 /// metadata database.
-struct CutPeer;
+struct CutPeer(Arc<AtomicUsize>);
 
 fn cut() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "network partition")
@@ -72,9 +78,13 @@ fn cut() -> io::Error {
 #[async_trait]
 impl Peer for CutPeer {
     async fn open_sink(&self, _: DiskId, _: Dest) -> io::Result<Box<dyn ReplicaSink>> {
+        self.0.fetch_add(1, Ordering::Relaxed);
         Err(cut())
     }
     async fn read(&self, _: DiskId, _: Uuid, _: u64, _: Range<u64>) -> io::Result<BoxReader> {
+        Err(cut())
+    }
+    async fn read_part(&self, _: DiskId, _: Uuid, _: Uuid, _: u64) -> io::Result<BoxReader> {
         Err(cut())
     }
     async fn remove(&self, _: DiskId, _: Dest) -> io::Result<()> {
@@ -87,7 +97,7 @@ impl Peer for CutPeer {
         &self,
         _: DiskId,
         _: Uuid,
-        _: Vec<(Uuid, String)>,
+        _: Vec<blob::JoinPart>,
         _: Uuid,
     ) -> io::Result<String> {
         Err(cut())
@@ -102,6 +112,8 @@ struct Registry {
     nodes: RwLock<HashMap<String, Arc<Store>>>,
     down: RwLock<HashSet<String>>,
     partitioned: RwLock<HashSet<String>>,
+    /// Writes attempted to partitioned nodes.
+    cut_opens: Arc<AtomicUsize>,
 }
 
 impl Peers for Registry {
@@ -110,7 +122,7 @@ impl Peers for Registry {
             return None;
         }
         if self.partitioned.read().unwrap().contains(node_id) {
-            return Some(Arc::new(CutPeer));
+            return Some(Arc::new(CutPeer(Arc::clone(&self.cut_opens))));
         }
         let store = self.nodes.read().unwrap().get(node_id).cloned()?;
         Some(Arc::new(InProcPeer(store)))
@@ -655,4 +667,176 @@ async fn a_peer_that_died_since_the_last_ping_is_replaced_for_new_copies() {
             .unwrap();
         assert_eq!(c.nodes_holding("data", &key).await, vec!["node1", "node2"]);
     }
+}
+
+/// Runs a 2-copy (2-of-2) multipart upload in which one of the nodes chosen at the start fails
+/// after the first part. `partition` cuts it off without anyone noticing yet (the write itself
+/// finds out); otherwise it crashes and is known to be down.
+async fn multipart_survives_losing_a_chosen_node(partition: bool) {
+    let c = Cluster::start().await;
+    c.nodes[0]
+        .create_bucket(OWNER, "mpu", Some(2))
+        .await
+        .unwrap();
+    let upload = c.nodes[0]
+        .create_multipart_upload(OWNER, put("mpu", "big"))
+        .await
+        .unwrap();
+    let mut chosen: Vec<String> = upload
+        .disks
+        .iter()
+        .map(|d| c.disk_node[d].clone())
+        .collect();
+    chosen.sort();
+    assert_eq!(chosen.len(), 2);
+    // Lose a chosen node other than node1 (which serves the requests).
+    let lost = chosen.iter().find(|n| *n != "node1").unwrap().clone();
+    let p1: Vec<u8> = vec![1; MIN_PART_SIZE as usize];
+    let p2: Vec<u8> = vec![2; 1000];
+    let r1 = c.nodes[0]
+        .upload_part(OWNER, "mpu", "big", upload.id, 1, None, &p1[..])
+        .await
+        .unwrap();
+    if partition {
+        c.registry.partitioned.write().unwrap().insert(lost.clone());
+    } else {
+        let i = c.nodes.iter().position(|n| n.node_id() == lost).unwrap();
+        c.crash(i).await;
+    }
+    let r2 = c.nodes[0]
+        .upload_part(OWNER, "mpu", "big", upload.id, 2, None, &p2[..])
+        .await
+        .unwrap();
+    let parts = [
+        CompletedPart {
+            part_number: 1,
+            etag: r1.etag,
+        },
+        CompletedPart {
+            part_number: 2,
+            etag: r2.etag,
+        },
+    ];
+    c.nodes[0]
+        .complete_multipart_upload(OWNER, "mpu", "big", upload.id, &parts)
+        .await
+        .unwrap();
+    let holding = c.nodes_holding("mpu", "big").await;
+    assert_eq!(holding.len(), 2, "{holding:?}");
+    assert!(
+        !holding.contains(&lost),
+        "{holding:?} must not include {lost}"
+    );
+    let mut expected = p1;
+    expected.extend_from_slice(&p2);
+    assert_eq!(read(&c.nodes[0], "mpu", "big").await, expected);
+    // The part files are gone from every live disk.
+    for node in ["node1", "node2", "node3"].iter().filter(|n| **n != lost) {
+        for d in &c.node_disks[*node] {
+            let dir = d
+                .join(".suhms/multipart")
+                .join(upload.id.simple().to_string());
+            assert!(!dir.exists(), "{}", dir.display());
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_two_copy_multipart_upload_survives_a_node_crash() {
+    multipart_survives_losing_a_chosen_node(false).await;
+}
+
+#[tokio::test]
+async fn a_two_copy_multipart_upload_survives_a_node_lost_since_the_last_ping() {
+    multipart_survives_losing_a_chosen_node(true).await;
+}
+
+/// A whole read served from another node's copy that turns out corrupt drops that copy too
+/// (after checking it again), instead of leaving it to that node's scrub.
+#[tokio::test]
+async fn a_corrupt_copy_on_another_node_found_by_a_read_is_dropped() {
+    let c = Cluster::start().await;
+    c.nodes[0]
+        .create_bucket(OWNER, "data", Some(2))
+        .await
+        .unwrap();
+    let body: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    c.nodes[0]
+        .put_object(OWNER, put("data", "obj"), &body[..])
+        .await
+        .unwrap();
+    let holding = c.nodes_holding("data", "obj").await;
+    let reader = c
+        .nodes
+        .iter()
+        .find(|n| !holding.contains(&n.node_id().to_owned()))
+        .unwrap();
+    // Corrupt both copies, so the reader (which has none) reads a corrupt remote one.
+    let mut bad = body.clone();
+    bad[1000] ^= 0xff;
+    for n in &c.nodes {
+        for p in n.object_locations("data", "obj").await.unwrap() {
+            std::fs::write(p, &bad).unwrap();
+        }
+    }
+    let stored = reader.get_object(OWNER, "data", "obj").await.unwrap();
+    let mut r = reader
+        .read_object(&stored, 0..stored.object.size)
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    let err = r.read_to_end(&mut out).await.unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    for _ in 0..100 {
+        if c.nodes[0]
+            .object_replicas("data", "obj")
+            .await
+            .unwrap()
+            .len()
+            == 1
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the corrupt remote copy was not dropped");
+}
+
+/// After a write fails to open a copy on a node, that node is pinged right away and, if it does
+/// not answer, left out of the following writes instead of being tried until the next heartbeat.
+#[tokio::test]
+async fn a_node_that_fails_a_write_is_pinged_and_skipped() {
+    let c = Cluster::start().await;
+    c.nodes[0].create_bucket(OWNER, "data", None).await.unwrap();
+    c.nodes[0].heartbeat().await.unwrap();
+    c.registry
+        .partitioned
+        .write()
+        .unwrap()
+        .insert("node3".into());
+    c.nodes[0]
+        .put_object(OWNER, put("data", "first"), &b"x"[..])
+        .await
+        .unwrap();
+    assert_eq!(c.registry.cut_opens.load(Ordering::Relaxed), 1);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    for i in 0..5 {
+        c.nodes[0]
+            .put_object(OWNER, put("data", &format!("k{i}")), &b"x"[..])
+            .await
+            .unwrap();
+    }
+    assert_eq!(c.registry.cut_opens.load(Ordering::Relaxed), 1);
+
+    // Once it answers again, the next heartbeat brings it back.
+    c.registry.partitioned.write().unwrap().remove("node3");
+    c.nodes[0].heartbeat().await.unwrap();
+    c.nodes[0]
+        .put_object(OWNER, put("data", "after"), &b"x"[..])
+        .await
+        .unwrap();
+    assert_eq!(
+        c.nodes_holding("data", "after").await,
+        vec!["node1", "node2", "node3"]
+    );
 }

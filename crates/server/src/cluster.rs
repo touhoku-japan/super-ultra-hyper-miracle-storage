@@ -178,6 +178,29 @@ async fn get_object(
     }
 }
 
+#[derive(Deserialize)]
+struct PartQuery {
+    size: u64,
+}
+
+async fn get_part(
+    State(st): State<Internal>,
+    Path((disk, upload, blob)): Path<(DiskId, Uuid, Uuid)>,
+    Query(q): Query<PartQuery>,
+) -> Response {
+    let disk = match st.disk(disk) {
+        Ok(d) => d,
+        Err(r) => return r.into_response(),
+    };
+    match blob::read_local_path(&disk.part_path(upload, blob), q.size, 0..q.size).await {
+        Ok(reader) => {
+            Body::from_stream(ReaderStream::with_capacity(reader, READ_CHUNK)).into_response()
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => err(StatusCode::NOT_FOUND, e),
+        Err(e) => err(StatusCode::CONFLICT, e),
+    }
+}
+
 async fn delete_object(
     State(st): State<Internal>,
     Path((disk, blob)): Path<(DiskId, Uuid)>,
@@ -219,8 +242,36 @@ async fn delete_upload(
 
 #[derive(Serialize, Deserialize)]
 struct ConcatRequest {
+    /// Part blob and BLAKE3.
     parts: Vec<(Uuid, String)>,
     object: Uuid,
+    /// The parts' CRCs, in the same order (missing or `null`: check the BLAKE3). A separate
+    /// field so that nodes of the previous version, which ignore it, still assemble.
+    #[serde(default)]
+    crcs: Vec<Option<blob::PartCrc>>,
+}
+
+impl ConcatRequest {
+    fn new(parts: Vec<blob::JoinPart>, object: Uuid) -> Self {
+        let crcs = parts.iter().map(|p| p.crc).collect();
+        Self {
+            parts: parts.into_iter().map(|p| (p.blob, p.blake3)).collect(),
+            object,
+            crcs,
+        }
+    }
+
+    fn into_parts(self) -> Vec<blob::JoinPart> {
+        let mut crcs = self.crcs.into_iter();
+        self.parts
+            .into_iter()
+            .map(|(blob, blake3)| blob::JoinPart {
+                blob,
+                blake3,
+                crc: crcs.next().flatten(),
+            })
+            .collect()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -237,7 +288,8 @@ async fn concat(
         Ok(d) => d,
         Err(r) => return r.into_response(),
     };
-    match blob::concat_parts(disk, upload, &req.parts, req.object).await {
+    let object = req.object;
+    match blob::concat_parts(disk, upload, &req.into_parts(), object).await {
         Ok(blake3) => Json(ConcatResponse { blake3 }).into_response(),
         Err(e) => err(StatusCode::CONFLICT, e),
     }
@@ -256,7 +308,7 @@ pub fn internal_router(store: Arc<Store>, secret: &str) -> Router {
         )
         .route(
             "/internal/v1/disks/{disk}/uploads/{upload}/parts/{blob}",
-            put(put_part).delete(delete_part),
+            put(put_part).get(get_part).delete(delete_part),
         )
         .route(
             "/internal/v1/disks/{disk}/uploads/{upload}",
@@ -284,6 +336,27 @@ fn io_err(e: impl std::fmt::Display) -> io::Error {
 }
 
 impl HttpPeer {
+    /// GETs a file from the peer as a reader.
+    async fn get_stream(&self, path_and_query: &str) -> io::Result<BoxReader> {
+        let resp = self
+            .request(Method::GET, path_and_query)
+            .send()
+            .await
+            .map_err(io_err)?;
+        let resp = Self::check(resp).await?;
+        // Pump through a channel so the reader is Sync (required by the S3 response body).
+        let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(4);
+        let mut stream = resp.bytes_stream().map_err(io_err);
+        tokio::spawn(async move {
+            while let Some(item) = stream.next().await {
+                if tx.send(item).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Box::new(StreamReader::new(ReceiverStream::new(rx))))
+    }
+
     fn path(disk: DiskId, dest: Dest) -> String {
         match dest {
             Dest::Object(blob) => format!("/internal/v1/disks/{disk}/objects/{blob}"),
@@ -410,23 +483,21 @@ impl Peer for HttpPeer {
             range.start,
             range.end
         );
-        let resp = self
-            .request(Method::GET, &pq)
-            .send()
-            .await
-            .map_err(io_err)?;
-        let resp = Self::check(resp).await?;
-        // Pump through a channel so the reader is Sync (required by the S3 response body).
-        let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(4);
-        let mut stream = resp.bytes_stream().map_err(io_err);
-        tokio::spawn(async move {
-            while let Some(item) = stream.next().await {
-                if tx.send(item).await.is_err() {
-                    break;
-                }
-            }
-        });
-        Ok(Box::new(StreamReader::new(ReceiverStream::new(rx))))
+        self.get_stream(&pq).await
+    }
+
+    async fn read_part(
+        &self,
+        disk: DiskId,
+        upload: Uuid,
+        blob: Uuid,
+        size: u64,
+    ) -> io::Result<BoxReader> {
+        let pq = format!(
+            "{}?size={size}",
+            Self::path(disk, Dest::Part { upload, blob })
+        );
+        self.get_stream(&pq).await
     }
 
     async fn remove(&self, disk: DiskId, dest: Dest) -> io::Result<()> {
@@ -462,13 +533,13 @@ impl Peer for HttpPeer {
         &self,
         disk: DiskId,
         upload: Uuid,
-        parts: Vec<(Uuid, String)>,
+        parts: Vec<blob::JoinPart>,
         object: Uuid,
     ) -> io::Result<String> {
         let pq = format!("/internal/v1/disks/{disk}/uploads/{upload}/concat");
         let resp = self
             .request(Method::POST, &pq)
-            .json(&ConcatRequest { parts, object })
+            .json(&ConcatRequest::new(parts, object))
             .send()
             .await
             .map_err(io_err)?;
