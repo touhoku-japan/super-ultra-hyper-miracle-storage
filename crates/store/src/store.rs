@@ -228,7 +228,10 @@ pub struct Store {
     /// Nodes whose node API did not answer the last ping. Their disks may still heartbeat
     /// (the metadata DB is reachable from both sides of a network partition), but this node
     /// cannot use them.
-    unreachable: std::sync::RwLock<HashSet<String>>,
+    /// Also updated between pings when talking to a node fails ([`Store::suspect_node`]).
+    unreachable: Arc<std::sync::RwLock<HashSet<String>>>,
+    /// Nodes being pinged by [`Store::suspect_node`].
+    probing: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Background checks of copies that served ranged reads.
     range_checks: Arc<RangeChecks>,
 }
@@ -288,6 +291,95 @@ impl RangeChecks {
         self.pending
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// Re-hashes one copy of an object in the background, at most [`RANGE_CHECK_CONCURRENCY`] at a
+/// time; a copy that mismatches every time is dropped (its replicas row first, which queues the
+/// object for repair, then the file), on this node or another. The caller has counted the check
+/// in [`RangeChecks::pending`].
+struct CopyChecker {
+    checks: Arc<RangeChecks>,
+    meta: Arc<dyn MetadataStore>,
+    object: Uuid,
+    size: u64,
+    expected: String,
+}
+
+impl CopyChecker {
+    fn spawn(self, disk: DiskRef, times: usize, suspect: bool) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.checks.done();
+            return;
+        };
+        runtime.spawn(async move {
+            let _permit = self.checks.running.acquire().await;
+            if self.is_corrupt(&disk, times, suspect).await {
+                tracing::warn!(object = %self.object, disk = %disk.label(), "dropping a copy that does not match its hash");
+                // Also queues the object for repair.
+                match self.meta.remove_replica(self.object, disk.id()).await {
+                    Ok(()) => disk.remove(Dest::Object(self.object)).await,
+                    Err(error) => {
+                        tracing::warn!(object = %self.object, %error, "failed to drop corrupt replica; scrub will retry");
+                    }
+                }
+            }
+            self.checks.done();
+        });
+    }
+
+    /// Hashes the copy `times` times. `suspect`: a read already found it corrupt (log what the
+    /// check finds even when the copy turns out fine).
+    async fn is_corrupt(&self, disk: &DiskRef, times: usize, suspect: bool) -> bool {
+        for _ in 0..times {
+            match hash_copy(disk, self.object, self.size).await {
+                Ok(hash) if hash != self.expected => {}
+                Ok(_) => {
+                    if suspect {
+                        tracing::warn!(object = %self.object, disk = %disk.label(), "copy matched its hash when read again; keeping it");
+                    }
+                    return false;
+                }
+                Err(error) => {
+                    // Deleted meanwhile, or unreadable: the next read or scrub tells.
+                    if suspect {
+                        tracing::warn!(object = %self.object, disk = %disk.label(), %error, "cannot re-check copy; leaving it to scrub");
+                    } else {
+                        tracing::debug!(object = %self.object, disk = %disk.label(), %error, "cannot check copy");
+                    }
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+/// The CRC a part was uploaded with, from its stored checksum (JSON `{"algorithm", "type",
+/// "value"}` with the value in base64, as the server writes it), if it is a CRC.
+fn part_crc(checksum: Option<&str>) -> Option<blob::PartCrc> {
+    #[derive(serde::Deserialize)]
+    struct Stored {
+        algorithm: String,
+        value: String,
+    }
+    let stored: Stored = serde_json::from_str(checksum?).ok()?;
+    let (algorithm, width) = match stored.algorithm.to_ascii_uppercase().as_str() {
+        "CRC32" => (blob::CrcKind::Crc32, 4),
+        "CRC32C" => (blob::CrcKind::Crc32c, 4),
+        "CRC64NVME" => (blob::CrcKind::Crc64Nvme, 8),
+        _ => return None,
+    };
+    let raw = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(stored.value.trim())
+            .ok()?
+    };
+    if raw.len() != width {
+        return None;
+    }
+    let value = raw.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
+    Some(blob::PartCrc { algorithm, value })
 }
 
 /// Reads a whole copy and returns its hex BLAKE3.
@@ -485,7 +577,8 @@ impl Store {
             instance: format!("{}/{}", config.node_id, Uuid::new_v4().simple()),
             repair_capacity: std::sync::Mutex::new(None),
             unopened,
-            unreachable: std::sync::RwLock::new(HashSet::new()),
+            unreachable: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            probing: Arc::new(std::sync::Mutex::new(HashSet::new())),
             range_checks: Arc::new(RangeChecks::new()),
             config,
         })
@@ -575,6 +668,45 @@ impl Store {
         let changed = *current != down;
         *current = down;
         Ok(changed)
+    }
+
+    /// Talking to `node` just failed: ping it now in the background instead of waiting for the
+    /// next heartbeat, and stop using its disks if it does not answer. Otherwise, after a node
+    /// dies, every write for up to [`HEARTBEAT_INTERVAL`] would first try it (and fall back to
+    /// another disk). The next [`Store::check_peers`] brings it back once it answers.
+    fn suspect_node(&self, node: &str) {
+        if node == self.config.node_id || !self.node_reachable(node) {
+            return;
+        }
+        if !self
+            .probing
+            .lock()
+            .expect("lock poisoned")
+            .insert(node.to_owned())
+        {
+            return;
+        }
+        let Some(peer) = self.peers.get(node) else {
+            self.probing.lock().expect("lock poisoned").remove(node);
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.probing.lock().expect("lock poisoned").remove(node);
+            return;
+        };
+        let unreachable = Arc::clone(&self.unreachable);
+        let probing = Arc::clone(&self.probing);
+        let node = node.to_owned();
+        runtime.spawn(async move {
+            if let Err(error) = peer.ping().await {
+                tracing::warn!(%node, %error, "node is unreachable; not using its disks");
+                unreachable
+                    .write()
+                    .expect("lock poisoned")
+                    .insert(node.clone());
+            }
+            probing.lock().expect("lock poisoned").remove(&node);
+        });
     }
 
     fn node_reachable(&self, node: &str) -> bool {
@@ -780,19 +912,56 @@ impl Store {
         required: usize,
     ) -> Result<blob::Replicas> {
         let targets = self.place(count, &[], &[]).await?;
-        let mut copies = blob::Replicas::open(&targets, dest).await;
+        self.open_replicas_on(dest, &targets, count, required).await
+    }
+
+    /// Pings the nodes of the remote disks among `tried` that could not be opened; returns
+    /// those nodes.
+    fn suspect_failed(&self, copies: &blob::Replicas, tried: &[DiskRef]) -> HashSet<String> {
+        let open = copies.open_disks();
+        let mut nodes = HashSet::new();
+        for d in tried {
+            if !d.is_local() && !open.contains(&d.id()) {
+                self.suspect_node(d.node_id());
+                nodes.insert(d.node_id().to_owned());
+            }
+        }
+        nodes
+    }
+
+    /// Like [`Store::open_replicas`], starting from `targets` (the disks of a multipart upload).
+    async fn open_replicas_on(
+        &self,
+        dest: Dest,
+        targets: &[DiskRef],
+        count: usize,
+        required: usize,
+    ) -> Result<blob::Replicas> {
+        let mut copies = blob::Replicas::open(targets, dest).await;
+        // Nodes where opening a copy failed: most likely down, so their other disks are not
+        // tried for this write either (each try can take up to the connect timeout).
+        let mut failed_nodes = self.suspect_failed(&copies, targets);
         loop {
             let open = copies.open_disks();
             if open.len() >= count {
                 break;
             }
-            let more = self
-                .place(count - open.len(), &open, copies.tried())
-                .await?;
+            let mut exclude = copies.tried().to_vec();
+            if !failed_nodes.is_empty() {
+                exclude.extend(
+                    self.cluster_disks()
+                        .await?
+                        .iter()
+                        .filter(|i| failed_nodes.contains(&i.node_id))
+                        .map(|i| i.id),
+                );
+            }
+            let more = self.place(count - open.len(), &open, &exclude).await?;
             if more.is_empty() {
                 break;
             }
             copies.add(&more).await;
+            failed_nodes.extend(self.suspect_failed(&copies, &more));
         }
         let open = copies.open_disks().len();
         if open < required {
@@ -1290,20 +1459,24 @@ impl Store {
             )));
         }
         let upload = self.owned_upload(owner, bucket, key, upload_id).await?;
+        // The upload's disks first; one that is down is replaced like for a plain PUT. The
+        // replacement lacks the earlier parts, which completion copies over if it needs to.
         let targets = self.reachable(&upload.disks).await?;
         let required = placement::ack_threshold(upload.desired_replicas);
-        if targets.len() < required {
-            return Err(StoreError::WriteQuorum {
-                required,
-                written: targets.len(),
-            });
-        }
         let blob_id = Uuid::new_v4();
         let dest = Dest::Part {
             upload: upload_id,
             blob: blob_id,
         };
-        let outcome = blob::write_replicas(&targets, dest, required, body).await?;
+        let copies = self
+            .open_replicas_on(
+                dest,
+                &targets,
+                usize::from(upload.desired_replicas),
+                required,
+            )
+            .await?;
+        let outcome = copies.write(required, body).await?;
         let remove = |disks: Vec<DiskId>, dest: Dest| async move {
             if let Ok(refs) = self.reachable(&disks).await {
                 for d in refs {
@@ -1493,6 +1666,93 @@ impl Store {
         }
     }
 
+    /// Reachable disks to assemble an upload on: those holding every chosen part. When a disk
+    /// failed during the upload (its parts went to a replacement), fewer than `required` may hold
+    /// them all; the missing parts are then copied from another disk to the reachable disks
+    /// holding the most parts (on distinct nodes in a cluster) until `required` disks can
+    /// assemble. Assembly checks every part's BLAKE3, so a bad copy fails there.
+    async fn assembly_disks(
+        &self,
+        upload: &UploadRecord,
+        chosen: &[&PartRecord],
+        required: usize,
+    ) -> Result<Vec<DiskRef>> {
+        // Every disk holding any chosen part, the upload's own disks first.
+        let mut all: Vec<DiskId> = upload.disks.clone();
+        for p in chosen {
+            for d in &p.disks {
+                if !all.contains(d) {
+                    all.push(*d);
+                }
+            }
+        }
+        let reachable = self.reachable(&all).await?;
+        let holds = |d: &DiskRef, p: &PartRecord| p.disks.contains(&d.id());
+        let (mut holders, mut others): (Vec<DiskRef>, Vec<DiskRef>) = reachable
+            .into_iter()
+            .partition(|d| chosen.iter().all(|p| holds(d, p)));
+        if holders.len() >= required {
+            return Ok(holders);
+        }
+        let single_node = self
+            .cluster_disks()
+            .await?
+            .iter()
+            .map(|i| i.node_id.as_str())
+            .collect::<HashSet<_>>()
+            .len()
+            <= 1;
+        others.sort_by_key(|d| std::cmp::Reverse(chosen.iter().filter(|p| holds(d, p)).count()));
+        for disk in others {
+            if holders.len() >= required {
+                break;
+            }
+            if !single_node && holders.iter().any(|h| h.node_id() == disk.node_id()) {
+                continue;
+            }
+            match self.fill_parts(upload.id, chosen, &disk).await {
+                Ok(()) => holders.push(disk),
+                Err(error) => {
+                    tracing::warn!(disk = %disk.label(), upload = %upload.id, %error, "cannot copy missing parts to disk");
+                }
+            }
+        }
+        Ok(holders)
+    }
+
+    /// Copies the parts `disk` lacks from a reachable disk that has them.
+    async fn fill_parts(&self, upload: Uuid, chosen: &[&PartRecord], disk: &DiskRef) -> Result<()> {
+        for part in chosen.iter().filter(|p| !p.disks.contains(&disk.id())) {
+            let dest = Dest::Part {
+                upload,
+                blob: part.blob_id,
+            };
+            let mut copied = false;
+            for src in self.reachable(&part.disks).await? {
+                let reader = match src.read_part(upload, part.blob_id, part.size).await {
+                    Ok(r) => r,
+                    Err(error) => {
+                        tracing::warn!(disk = %src.label(), part = part.part_number, %error, "cannot read part");
+                        continue;
+                    }
+                };
+                match blob::write_replicas(std::slice::from_ref(disk), dest, 1, reader).await {
+                    Ok(_) => {
+                        copied = true;
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(from = %src.label(), to = %disk.label(), part = part.part_number, %error, "cannot copy part");
+                    }
+                }
+            }
+            if !copied {
+                return Err(StoreError::NoHealthyReplica(part.blob_id));
+            }
+        }
+        Ok(())
+    }
+
     pub async fn abort_multipart_upload(
         &self,
         owner: &str,
@@ -1608,19 +1868,18 @@ impl Store {
         };
         let size: u64 = chosen.iter().map(|p| p.size).sum();
         self.check_quota(owner, size).await?;
-        let blobs: Vec<(Uuid, String)> = chosen
+        let blobs: Vec<blob::JoinPart> = chosen
             .iter()
-            .map(|p| (p.blob_id, p.blake3.clone()))
+            .map(|p| blob::JoinPart {
+                blob: p.blob_id,
+                blake3: p.blake3.clone(),
+                crc: part_crc(p.checksum.as_deref()),
+            })
             .collect();
 
         let object_id = Uuid::new_v4();
-        let holders: Vec<DiskId> = upload
-            .disks
-            .iter()
-            .filter(|d| chosen.iter().all(|p| p.disks.contains(d)))
-            .copied()
-            .collect();
-        let candidates = self.reachable(&holders).await?;
+        let required = placement::ack_threshold(upload.desired_replicas);
+        let candidates = self.assembly_disks(&upload, &chosen, required).await?;
         let results = futures::future::join_all(candidates.iter().map(|disk| {
             let blobs = blobs.clone();
             async move {
@@ -1671,7 +1930,6 @@ impl Store {
             },
             replicas: written.iter().map(|(d, _)| *d).collect(),
         };
-        let required = placement::ack_threshold(upload.desired_replicas);
         if replicas.len() < required || replicas.len() != new_object.replicas.len() {
             self.remove_files(&new_object).await;
             return Err(StoreError::WriteQuorum {
@@ -1752,7 +2010,7 @@ impl Store {
             self.check_after_ranged_read(stored, disk);
             return Ok(reader);
         }
-        let on_mismatch = self.on_corrupt_read(stored.object.id, disk, expected.clone());
+        let on_mismatch = self.on_corrupt_read(stored, disk);
         Ok(Box::new(blob::VerifyingReader::new(
             reader,
             stored.object.size,
@@ -1765,87 +2023,47 @@ impl Store {
     /// A copy that does not match twice is dropped, wherever it is, and the object is queued for
     /// repair.
     fn check_after_ranged_read(&self, stored: &StoredObject, disk: DiskRef) {
-        let object = stored.object.id;
-        if !self.range_checks.claim(object, disk.id()) {
-            return;
+        if self.range_checks.claim(stored.object.id, disk.id()) {
+            self.spawn_copy_check(stored, disk, 2);
         }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            self.range_checks.done();
-            return;
-        };
-        let checks = Arc::clone(&self.range_checks);
-        let meta = Arc::clone(&self.meta);
-        let size = stored.object.size;
-        let expected = stored.object.blake3.clone();
-        runtime.spawn(async move {
-            let _permit = checks.running.acquire().await;
-            let corrupt = async {
-                for _ in 0..2 {
-                    match hash_copy(&disk, object, size).await {
-                        Ok(hash) if hash != expected => {}
-                        Ok(_) => return false,
-                        Err(error) => {
-                            // Deleted meanwhile, or unreadable: the next read or scrub tells.
-                            tracing::debug!(%object, disk = %disk.label(), %error, "cannot check copy after a ranged read");
-                            return false;
-                        }
-                    }
-                }
-                true
-            }
-            .await;
-            if corrupt {
-                tracing::error!(%object, disk = %disk.label(), "copy that served a ranged read does not match its hash; dropping it");
-                // Also queues the object for repair.
-                match meta.remove_replica(object, disk.id()).await {
-                    Ok(()) => disk.remove(Dest::Object(object)).await,
-                    Err(error) => {
-                        tracing::warn!(%object, %error, "failed to drop corrupt replica; scrub will retry");
-                    }
-                }
-            }
-            checks.done();
-        });
     }
 
-    /// Called when a whole-object read did not match the object's hash. Logs it, and for a copy
-    /// on this node re-hashes the file in the background and drops the copy if it really is
-    /// corrupt (a one-off read error leaves it alone). Copies on other nodes are left to the
-    /// scrub of their own node.
+    /// Called when a whole-object read did not match the object's hash. Logs it, then re-hashes
+    /// the copy in the background and drops it if it really is corrupt (a one-off read or
+    /// network error leaves it alone), whether the copy is on this node or another.
     fn on_corrupt_read(
         &self,
-        object: Uuid,
+        stored: &StoredObject,
         disk: DiskRef,
-        expected: String,
     ) -> Box<dyn FnOnce() + Send + Sync> {
-        let meta = Arc::clone(&self.meta);
+        let checker = CopyChecker {
+            checks: Arc::clone(&self.range_checks),
+            meta: Arc::clone(&self.meta),
+            object: stored.object.id,
+            size: stored.object.size,
+            expected: stored.object.blake3.clone(),
+        };
         Box::new(move || {
-            tracing::error!(%object, disk = %disk.label(), "read a copy that does not match its hash; response aborted");
-            let DiskRef::Local(disk) = disk else { return };
-            let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-                return;
-            };
-            runtime.spawn(async move {
-                let path = disk.object_path(object);
-                match blob::hash_file(&path).await {
-                    Ok((_, hash)) if hash != expected => {
-                        tracing::warn!(path = %path.display(), "dropping corrupt replica found by a read");
-                        // Also queues the object for repair.
-                        if let Err(error) = meta.remove_replica(object, disk.id).await {
-                            tracing::warn!(%object, %error, "failed to drop corrupt replica; scrub will retry");
-                            return;
-                        }
-                        blob::remove(&disk, object).await;
-                    }
-                    Ok(_) => {
-                        tracing::warn!(path = %path.display(), "replica matched its hash when read again; keeping it");
-                    }
-                    Err(error) => {
-                        tracing::warn!(path = %path.display(), %error, "cannot re-check replica; leaving it to scrub");
-                    }
-                }
-            });
+            tracing::error!(object = %checker.object, disk = %disk.label(), "read a copy that does not match its hash; response aborted");
+            checker
+                .checks
+                .pending
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            checker.spawn(disk, 1, true);
         })
+    }
+
+    /// Hashes `disk`'s copy in the background `times` times (see [`CopyChecker`]), quietly
+    /// unless it turns out corrupt.
+    fn spawn_copy_check(&self, stored: &StoredObject, disk: DiskRef, times: usize) {
+        CopyChecker {
+            checks: Arc::clone(&self.range_checks),
+            meta: Arc::clone(&self.meta),
+            object: stored.object.id,
+            size: stored.object.size,
+            expected: stored.object.blake3.clone(),
+        }
+        .spawn(disk, times, false);
     }
 
     /// Opens `range` from the first readable copy, without checking its hash.
@@ -1865,6 +2083,9 @@ impl Store {
                 Ok(reader) => return Ok((disk, reader)),
                 Err(error) => {
                     tracing::warn!(disk = %disk.label(), object = %stored.object.id, %error, "replica unreadable");
+                    if !disk.is_local() {
+                        self.suspect_node(disk.node_id());
+                    }
                 }
             }
         }
@@ -2646,5 +2867,46 @@ impl Store {
             .filter_map(|id| self.disk(*id))
             .map(|d| d.object_path(stored.object.id))
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{blob, part_crc};
+
+    #[test]
+    fn part_crcs_are_read_from_stored_checksums() {
+        let crc64 = part_crc(Some(
+            r#"{"algorithm":"CRC64NVME","type":"FULL_OBJECT","value":"AAAAAAAAAQI="}"#,
+        ));
+        assert_eq!(
+            crc64,
+            Some(blob::PartCrc {
+                algorithm: blob::CrcKind::Crc64Nvme,
+                value: 0x0102
+            })
+        );
+        let crc32c = part_crc(Some(
+            r#"{"algorithm":"CRC32C","type":"COMPOSITE","value":"AAABAg=="}"#,
+        ));
+        assert_eq!(
+            crc32c.map(|c| (c.algorithm, c.value)),
+            Some((blob::CrcKind::Crc32c, 0x0102))
+        );
+        // Not a CRC, malformed, or absent: the BLAKE3 is checked instead.
+        assert_eq!(
+            part_crc(Some(
+                r#"{"algorithm":"SHA256","type":"COMPOSITE","value":"AAAA"}"#
+            )),
+            None
+        );
+        assert_eq!(
+            part_crc(Some(
+                r#"{"algorithm":"CRC32","type":"COMPOSITE","value":"AAAAAAAAAQI="}"#
+            )),
+            None
+        );
+        assert_eq!(part_crc(Some("not json")), None);
+        assert_eq!(part_crc(None), None);
     }
 }

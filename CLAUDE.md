@@ -46,7 +46,7 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
   `RCLONE_CONFIG_S_*` で設定し `force_path_style=true`
 - CPU は Xeon E5-2697 v2（SHA-NI・AVX2 なし）。負荷試験の数値は本番機より悪く出る。PUT の CPU の内訳（2026-11-19、平文 HTTP の
   AWS CLI、3 ノード・mTLS）は SigV4 の本文 SHA-256（s3s。クライアントが署名付きペイロードを送るときだけ。HTTPS では AWS CLI は
-  UNSIGNED-PAYLOAD）約 2 割、BLAKE3 約 2 割（マルチパートは完了時の連結でもパート照合とオブジェクトのハッシュで 2 回）、
+  UNSIGNED-PAYLOAD）約 2.5 割、BLAKE3 約 1.3 割（受信時と、マルチパート完了時の連結でオブジェクトのハッシュ）、
   ノード間 TLS の AES-GCM 約 2 割、MD5 約 1 割
 - 192.168.10.220（vm-gate01）/ 192.168.10.221（vm-gate02）は managed-hapgsql の検証用環境の PgBouncer（2026-11-19 追加）。suhms とは無関係
 
@@ -102,7 +102,8 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
     - `blob.rs` — 全レプリカへの同時ストリーミング書き込み（MD5=ETag と BLAKE3 を同時計算）、検証付きコピー。
       書き込みは本文を読む前に全コピーを開き（`Replicas`）、開けなかったディスクは `Store::open_replicas` が別のディスクに差し替える
       （前回の ping 以降に落ちたノードを選んでも、2/2 の STANDARD_IA 等が 503 にならない）。リモートのコピーは `HttpPeer::open_sink` が
-      接続できて本文の送信が始まるまで待つ（最大 3 秒）。本文は 1 MiB ずつまとめてから各コピーへ渡し、ローカルの書き込みは
+      接続できて本文の送信が始まるまで待つ（最大 3 秒）。開けなかったリモートのノードは、その書き込みでは他のディスクも使わず、
+      すぐに ping して応答しなければ次の heartbeat まで使わない（`Store::suspect_node`。読み出しの失敗でも同じ）。本文は 1 MiB ずつまとめてから各コピーへ渡し、ローカルの書き込みは
       `tokio::fs::File` ではなく blocking タスクの std の File で行う（tokio の File はバッファを毎回コピーするため）
     - `cluster.rs` — `Peer`（他ノードのディスク操作）/ `Peers` / `ReplicaSink` / `DiskRef`（ローカルかリモートかを隠す）
     - `meta/` — `MetadataStore` trait と SQLite / PostgreSQL / MariaDB(MySQL) 実装。スキーマは `meta/migrations/<backend>/NNNN_*.sql`
@@ -131,7 +132,12 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
     - `store.rs` — `Store`: テナント・バケット・オブジェクト操作（すべて owner = テナント ID でスコープ。他テナントのバケットは AccessDenied）、
       コピー、マルチパート、`scrub()`（ファイルが無い・不一致のときは replicas 行がまだあるか確かめ直す。並行する削除・上書きを欠損と誤認しないため）、`repair()`
     - マルチパート: アップロード開始時にディスクを決め、パートは各ディスクの `.suhms/multipart/<upload>/<blob>` に置く。
-      完了時は各ディスク上でローカルにパートを連結して普通のオブジェクトファイルにする（パートごとに BLAKE3 を検証）。
+      落ちているディスクは PUT と同じく別のディスクに差し替える（そのパートだけがそこに載る）。
+      完了時は各ディスク上でローカルにパートを連結して普通のオブジェクトファイルにする。パートの照合は、アップロード時に記録した
+      パートのチェックサムが CRC（既定の CRC64NVME / CRC32 / CRC32C）ならそれで、無ければ BLAKE3 で行う（`blob::JoinPart`。
+      BLAKE3 より桁違いに軽く、ディスク上の破損の検出には十分。ノード間 API では `crcs` を別フィールドにしたので旧版のノードは
+      無視して BLAKE3 で照合する）。全パートを持つディスクが過半数に足りないときは、欠けたパートを他のディスクから
+      コピーしてから連結する（`Store::assembly_disks`。ノード間 API の `GET .../parts/<blob>`）。
       ETag は S3 と同じ `md5(パートMD5の連結)-N`。完了処理中は s3s がキープアライブの空白を送る
 - S3 プロトコル層は `s3s` クレート（Apache-2.0。`openssl` feature は使わない）
 - 運用（`store/src/store/maintenance.rs`）:
@@ -261,7 +267,7 @@ npm 側は cargo-deny の対象外なので、依存を足すときは手で確�
   （完了後のオブジェクトには後付けされる）
 - 読み出し時の BLAKE3 照合は全体読み（範囲なしの GET、CopyObject、範囲なしの UploadPartCopy）だけ（`blob::VerifyingReader`）。
   最後の塊を渡す前に照合し、不一致ならそれを渡さずにエラーにする（hyper は Content-Length 分を送ると本文を読まないので、
-  EOF での照合では間に合わない）。不一致のコピーが自ノードなら読み直して確認してから捨てて repair に積むが、他ノードのコピーはログだけで、そのノードの scrub 任せ。
+  EOF での照合では間に合わない）。不一致のコピーは、自ノード・他ノードを問わずバックグラウンドで読み直して確認してから捨てて repair に積む（`CopyChecker`）。
   範囲指定 GET（AWS CLI の `s3 cp` は大きいファイルを範囲指定で分割取得する）は返す前には照合できないので、壊れたコピーの中身を
   そのまま返しうる。代わりに読んだコピーを後からバックグラウンドで全体照合し（`RangeChecks`。コピーごとに 1 時間に 1 回、同時 2 件、
   待ち 256 件まで）、2 回続けて不一致なら自ノード・他ノードを問わず捨てて repair に積む。次の読み出しからは健全なコピーになる
