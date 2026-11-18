@@ -96,7 +96,7 @@ impl Server {
         let mut config = Config {
             storage: StoreConfig {
                 disks: disk_paths.clone(),
-                metadata_url: format!("sqlite://{}", dir.path().join("meta.db").display()),
+                metadata_url: metadata_url(dir.path()).await,
                 default_replicas: u8::try_from(disks.min(3)).unwrap(),
                 ..StoreConfig::default()
             },
@@ -349,4 +349,29 @@ pub fn signed_with_payload_hash(
         builder = builder.header(*k, *v);
     }
     builder.body(Body::from(body)).unwrap()
+}
+
+/// The metadata database for a test: a fresh database on the server named by
+/// `SUHMS_TEST_POSTGRES` (e.g. `postgres://postgres:pw@127.0.0.1:5432`) or `SUHMS_TEST_MYSQL`
+/// (e.g. `mysql://root:pw@127.0.0.1:3306`), otherwise a SQLite file in `dir` (as in the store
+/// crate's tests).
+pub async fn metadata_url(dir: &std::path::Path) -> String {
+    use sqlx::{AssertSqlSafe, Connection};
+    let db = format!("t{}", uuid::Uuid::new_v4().simple());
+    let create = AssertSqlSafe(format!("CREATE DATABASE {db}"));
+    if let Ok(base) = std::env::var("SUHMS_TEST_POSTGRES") {
+        let mut c = sqlx::PgConnection::connect(&format!("{base}/postgres"))
+            .await
+            .expect("connect to SUHMS_TEST_POSTGRES");
+        sqlx::raw_sql(create).execute(&mut c).await.unwrap();
+        return format!("{base}/{db}");
+    }
+    if let Ok(base) = std::env::var("SUHMS_TEST_MYSQL") {
+        let mut c = sqlx::MySqlConnection::connect(&base)
+            .await
+            .expect("connect to SUHMS_TEST_MYSQL");
+        sqlx::raw_sql(create).execute(&mut c).await.unwrap();
+        return format!("{base}/{db}");
+    }
+    format!("sqlite://{}", dir.join("meta.db").display())
 }

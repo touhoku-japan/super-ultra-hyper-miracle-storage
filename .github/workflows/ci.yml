@@ -79,8 +79,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
 
-  # The storage engine's tests (single node and in-process cluster) against the shared
-  # metadata backends used in multi-node deployments.
+  # The storage engine's tests (single node and in-process cluster) and the server's HTTP tests
+  # (S3 API, consoles, admin API, three-node cluster over HTTP) against the shared metadata
+  # backends used in multi-node deployments. The Web console bundle is not needed here (the
+  # `check` job tests it); without it the server embeds its placeholder page.
   metadata-backends:
     runs-on: ubuntu-latest
     services:
@@ -104,10 +106,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: PostgreSQL
-        run: cargo test -p suhms-store
+        run: cargo test -p suhms-store -p suhms-server
         env:
           SUHMS_TEST_POSTGRES: postgres://postgres:pw@127.0.0.1:5432
       - name: MariaDB
-        run: cargo test -p suhms-store
+        run: cargo test -p suhms-store -p suhms-server
         env:
           SUHMS_TEST_MYSQL: mysql://root:pw@127.0.0.1:3306

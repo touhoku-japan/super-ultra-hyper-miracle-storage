@@ -5,7 +5,8 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
 
 ## コマンド
 
-- テスト: `cargo test --workspace`（SQLite。PG / MariaDB は下の「開発ホスト」を参照）
+- テスト: `cargo test --workspace`（SQLite）。`SUHMS_TEST_POSTGRES` / `SUHMS_TEST_MYSQL` を設定すると store と server のテストを
+  PostgreSQL / MariaDB で実行する（テストごとに DB を作る。手順は下の「開発ホスト」、CI では `metadata-backends` ジョブ）
 - Lint: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings`
 - Web コンソール（`web/`）: `npm ci && npm test && npm run build`。出力 `web/dist/` は `crates/server/build.rs` がバイナリに埋め込む
   （無ければ案内ページ。`SUHMS_REQUIRE_WEB=1` で必須にできる）。詳細は `docs/webui.md`
@@ -30,10 +31,10 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
   `initdb` は root で動かないので `sudo -u postgres` で実行し、データディレクトリは `postgres` が書ける場所に置く。
   Unix ソケットはパス長制限（107 バイト）に当たりやすいので `unix_socket_directories=''` で TCP のみにする。
   例: `initdb -D <dir> -U suhms --auth=trust` → `pg_ctl -D <dir> -o "-p 55432 -c listen_addresses=127.0.0.1 -c unix_socket_directories='' -c fsync=off" -w start`
-  → `SUHMS_TEST_POSTGRES=postgres://suhms@127.0.0.1:55432 cargo test -p suhms-store` → `pg_ctl -D <dir> stop`
+  → `SUHMS_TEST_POSTGRES=postgres://suhms@127.0.0.1:55432 cargo test -p suhms-store -p suhms-server` → `pg_ctl -D <dir> stop`
 - MariaDB のテスト: podman（インストール済み）で CI と同じ `mariadb:11` を動かす。
   `podman run -d --name suhms-test-mariadb -p 127.0.0.1:33306:3306 -e MARIADB_ROOT_PASSWORD=pw docker.io/library/mariadb:11`
-  →（ログに `ready for connections` が 2 回出るまで待つ）→ `SUHMS_TEST_MYSQL=mysql://root:pw@127.0.0.1:33306 cargo test -p suhms-store`
+  →（ログに `ready for connections` が 2 回出るまで待つ）→ `SUHMS_TEST_MYSQL=mysql://root:pw@127.0.0.1:33306 cargo test -p suhms-store -p suhms-server`
   → `podman rm -f suhms-test-mariadb`
 - Node / npm・AWS CLI・rclone はシステムに入っていない。Node は nodejs.org の LTS の tarball（`linux-x64.tar.xz`。
   `SHASUMS256.txt` で検証）を任意のディレクトリに展開して `PATH` に足す。AWS CLI v2 は公式インストーラで
@@ -94,7 +95,8 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
     - `session.rs` — コンソールのセッション（HMAC 署名の cookie、サーバ側に状態なし）、CSRF 判定、ログイン試行制限、セキュリティヘッダ
     - `web.rs` — 埋め込んだ `web/dist` の配信（`build.rs` が生成）
     - `admin.rs` — 管理サブコマンド
-    - `tests/` — `common/mod.rs` の自前 SigV4 署名器で、実ルータを in-process で叩く E2E テスト
+    - `tests/` — `common/mod.rs` の自前 SigV4 署名器で、実ルータを in-process で叩く E2E テスト。メタデータ DB は `common::metadata_url`
+      （store のテストと同じく `SUHMS_TEST_POSTGRES` / `SUHMS_TEST_MYSQL` で切り替え）
   - `store/` — ストレージエンジン
     - `disk.rs` — ディスク = 既存ディレクトリ。`.suhms/format.json` の UUID で識別（マウント順が変わっても同一視）。
       ルートが無ければ作らない（未マウント時にルート FS へ書くのを防ぐ）。中身のある未フォーマットのディレクトリは使わない
@@ -260,8 +262,6 @@ npm 側は cargo-deny の対象外なので、依存を足すときは手で確�
 ## 未対応（既知の穴）
 
 - `deny.toml` で RUSTSEC-2026-0543（chrono の保守終了。脆弱性ではない）を一時除外中。s3s 0.17 経由でだけ入り、suhms は直接使っていない。chrono を使わない s3s がリリースされたら更新して除外を外す
-- PostgreSQL / MariaDB のテストは store クレートだけ（`SUHMS_TEST_POSTGRES` / `SUHMS_TEST_MYSQL`。テストごとに DB を作る）。
-  server クレートの E2E は SQLite でしか回していない。CI の `metadata-backends` ジョブと開発ホスト（上の手順）で実行できる
 - `[cluster.tls]` を設定しないとノード間通信は平文 HTTP（HMAC 認証のみ）。その場合はプライベートネットワークか WireGuard 等で保護すること
 - チェックサムの後付けはオブジェクトのみ。既定チェックサム導入前に始まった未完了マルチパートのパートには付かない
   （完了後のオブジェクトには後付けされる）
