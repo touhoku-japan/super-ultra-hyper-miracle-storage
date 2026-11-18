@@ -261,6 +261,71 @@ async fn scrub_and_repair_restore_corrupt_and_missing_copies() {
     );
 }
 
+/// Waits for a corrupt copy found by a read to be dropped in the background.
+async fn wait_for_copies(store: &Store, bucket: &str, key: &str, n: usize) {
+    for _ in 0..200 {
+        if store.object_locations(bucket, key).await.unwrap().len() == n {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("{bucket}/{key} did not get down to {n} copies");
+}
+
+#[tokio::test]
+async fn reading_a_corrupt_copy_fails_and_drops_it() {
+    let env = Env::new(3).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "bk1", None).await.unwrap();
+    let data = payload();
+    store
+        .put_object(OWNER, put("bk1", "k", None), &data[..])
+        .await
+        .unwrap();
+    // Reads try copies in this order: corrupt the first two, keep the last one healthy.
+    let locs = store.object_locations("bk1", "k").await.unwrap();
+    assert_eq!(locs.len(), 3);
+    let mut bad = data.clone();
+    bad[12345] ^= 0xff;
+    std::fs::write(&locs[0], &bad).unwrap();
+    std::fs::write(&locs[1], &bad).unwrap();
+
+    // Ranged reads are not checked (that would mean reading the whole object).
+    let stored = store.get_object(OWNER, "bk1", "k").await.unwrap();
+    let mut r = store.read_object(&stored, 12340..12350).await.unwrap();
+    let mut out = Vec::new();
+    r.read_to_end(&mut out).await.unwrap();
+    assert_eq!(out, bad[12340..12350]);
+
+    // Copying from a corrupt copy fails instead of spreading it, and drops that copy.
+    store
+        .copy_object(OWNER, "bk1", "k", put("bk1", "copy", None), false)
+        .await
+        .unwrap_err();
+    assert!(store.get_object(OWNER, "bk1", "copy").await.is_err());
+    wait_for_copies(&store, "bk1", "k", 2).await;
+
+    // A whole read of the next corrupt copy fails before its last bytes rather than finishing
+    // (an HTTP server stops polling the body once Content-Length bytes are out).
+    let stored = store.get_object(OWNER, "bk1", "k").await.unwrap();
+    let mut r = store
+        .read_object(&stored, 0..stored.object.size)
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    let err = r.read_to_end(&mut out).await.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(out.len() < data.len(), "the last bytes must be withheld");
+    wait_for_copies(&store, "bk1", "k", 1).await;
+
+    // The retry reads the healthy copy, and repair restores the dropped ones.
+    assert_eq!(read_object(&store, "bk1", "k").await, data);
+    assert_eq!(store.repair().await.unwrap().copied, 2);
+    for p in store.object_locations("bk1", "k").await.unwrap() {
+        assert_eq!(std::fs::read(p).unwrap(), data);
+    }
+}
+
 #[tokio::test]
 async fn changing_bucket_replicas_adds_or_trims_copies() {
     let env = Env::new(3).await;
