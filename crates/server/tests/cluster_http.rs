@@ -91,7 +91,7 @@ impl Cluster {
         let dir = tempfile::tempdir().unwrap();
         let pki = tls.then(|| Pki::new(dir.path(), "cluster"));
         let scheme = if tls { "https" } else { "http" };
-        let meta = format!("sqlite://{}", dir.path().join("meta.db").display());
+        let meta = common::metadata_url(dir.path()).await;
         let mut listeners = Vec::new();
         let mut nodes_cfg = Vec::new();
         for i in 1..=3 {

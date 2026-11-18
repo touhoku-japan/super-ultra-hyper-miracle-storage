@@ -128,8 +128,9 @@ MinIO Console のように、ブラウザで操作・設定できる画面。202
   cd web && npx playwright install chromium-headless-shell          # 初回のみ（CI は --with-deps も付ける）
   npm run e2e                                                        # SUHMS_BIN で別のバイナリ、SUHMS_E2E_KEEP=1 で一時ディレクトリを残す
   ```
-  開発ホスト（AlmaLinux 10）は Playwright の公式対応 OS ではないが、ubuntu24.04 向けのビルドが動く（システムライブラリは
-  `cups-libs` だけ足した）。CI では `e2e` ジョブが実行し、失敗時はレポートとトレースを artifact に残す
+  AlmaLinux 10 は Playwright の公式対応 OS ではないが、ubuntu24.04 向けのビルドが動く。必要なシステムライブラリはホストの
+  構成で変わるので、`ldd <chrome-headless-shell> | grep 'not found'` で足りないものを確かめて入れる（開発ホストで入れたものは
+  `CLAUDE.md` の「開発ホスト」）。CI では `e2e` ジョブが実行し、失敗時はレポートとトレースを artifact に残す
 
 ## 既知の制限
 
