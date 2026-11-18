@@ -244,8 +244,12 @@ impl Store {
 
     /// Re-hashes every copy on this node's disks and drops copies that are missing or corrupt,
     /// so that [`Store::repair`] replaces them.
+    ///
+    /// Disks that are not open or fail their health probe are skipped (and counted in
+    /// `skipped_disks`): an unmounted disk would otherwise look like one with every file missing.
     pub async fn scrub(&self) -> Result<ScrubReport> {
         let mut report = ScrubReport::default();
+        self.probe_disks().await;
         let mut after = None;
         loop {
             let page = self.meta.list_replicas(after, PAGE).await?;
@@ -259,13 +263,26 @@ impl Store {
                 let path = disk.object_path(entry.object_id);
                 let bad = match blob::hash_file(&path).await {
                     Ok((_, hash)) => hash != entry.blake3,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+                    // A missing file counts only if the disk itself is still there.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => disk.probe().await,
                     Err(error) => {
                         // Possibly a failing disk rather than a bad file; leave it for now.
                         tracing::warn!(path = %path.display(), %error, "cannot read replica during scrub");
                         false
                     }
                 };
+                // The object may have been deleted or overwritten since this page was listed
+                // (its file is then legitimately gone); only a copy still on record is bad.
+                let gone = bad
+                    && !self
+                        .meta
+                        .get_object_by_id(entry.object_id)
+                        .await?
+                        .is_some_and(|o| o.replicas.contains(&entry.disk_id));
+                if gone {
+                    report.checked -= 1;
+                    continue;
+                }
                 if bad {
                     tracing::warn!(path = %path.display(), "dropping missing or corrupt replica");
                     // Also queues the object for repair.
@@ -276,6 +293,14 @@ impl Store {
                     report.removed += 1;
                 }
             }
+        }
+        let unhealthy = self.disks.iter().filter(|d| !d.is_healthy()).count();
+        report.skipped_disks = (self.unopened + unhealthy) as u64;
+        if report.skipped_disks > 0 {
+            tracing::error!(
+                skipped = report.skipped_disks,
+                "scrub skipped disks that are not open or failed their health check"
+            );
         }
         Ok(report)
     }
@@ -361,10 +386,14 @@ impl Store {
     /// Queues the objects of disks that went down or came back since the last pass, and
     /// ends the backoff of postponed objects when usable disks were added (or came back).
     async fn queue_disk_changes(&self, report: &mut RepairReport) -> Result<()> {
+        // A node that was unreachable (network partition) counts as capacity coming back.
+        if self.check_peers().await? {
+            self.refresh_cluster().await;
+        }
         let view = self.cluster_disks().await?;
         let usable: HashSet<DiskId> = view
             .iter()
-            .filter(|i| i.alive && !i.draining)
+            .filter(|i| !i.draining && self.reach(i).is_some())
             .map(|i| i.id)
             .collect();
         let grew = {
@@ -433,21 +462,43 @@ impl Store {
         draining.sort_by_key(|d| !d.is_local());
 
         if healthy.len() > desired {
-            // Remove surplus copies from the fullest disks first.
-            let free = |d: &DiskRef| view.iter().find(|i| i.id == d.id()).map_or(0, |i| i.free);
-            healthy.sort_by_key(free);
-            let surplus = healthy.len() - desired;
-            for disk in healthy.drain(..surplus) {
+            // Remove surplus copies from nodes holding more than one copy first (left when a
+            // disk that was replaced on the same node comes back), then from the fullest disks.
+            let info = |d: &DiskRef| view.iter().find(|i| i.id == d.id());
+            let free = |d: &DiskRef| info(d).map_or(0, |i| i.free);
+            let node = |d: &DiskRef| info(d).map(|i| i.node_id.as_str());
+            for _ in desired..healthy.len() {
+                let on_node = |n| healthy.iter().filter(|d| node(d) == n).count();
+                let victim = healthy
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, d)| (std::cmp::Reverse(on_node(node(d))), free(d)))
+                    .map(|(i, _)| i)
+                    .expect("there is a surplus copy");
+                let disk = healthy.remove(victim);
                 self.meta.remove_replica(id, disk.id()).await?;
                 disk.remove(Dest::Object(id)).await;
                 report.trimmed += 1;
             }
         } else if healthy.len() < desired {
             // Copies on draining disks do not count, so their node may take the new copy.
+            // Neither do copies on a disk that is down while its node is up (a failed or
+            // unmounted disk): the node's other disks may take the replacement. When the whole
+            // node is down (or unreachable) its copies still count, so that a returning node
+            // does not end up with two copies.
+            let usable_node = |n: &str| {
+                view.iter()
+                    .any(|i| i.node_id == n && self.reach(i).is_some())
+            };
             let keep: Vec<DiskId> = stored
                 .replicas
                 .iter()
                 .filter(|d| !draining_disk(d))
+                .filter(|d| {
+                    view.iter()
+                        .find(|i| i.id == **d)
+                        .is_none_or(|i| self.reach(i).is_some() || !usable_node(&i.node_id))
+                })
                 .copied()
                 .collect();
             let targets = self
@@ -549,7 +600,7 @@ impl Store {
         let mut report = GcReport::default();
         let now = SystemTime::now();
         let cutoff = now.checked_sub(options.grace).unwrap_or(UNIX_EPOCH);
-        for disk in &self.disks {
+        for disk in self.healthy_disks() {
             if let Err(error) = self.gc_disk(disk, options, now, cutoff, &mut report).await {
                 tracing::warn!(disk = %disk.root.display(), %error, "garbage collection failed");
             }

@@ -19,6 +19,9 @@ use crate::{
     error::{Result, StoreError},
 };
 
+/// How long a query waits for a pooled connection (including connecting) before failing.
+const ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Applied in order; each runs once, inside a transaction. Never edit a released migration.
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("migrations/mysql/0001_init.sql")),
@@ -33,6 +36,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("migrations/mysql/0008_backoff_backfill.sql"),
     ),
     (9, include_str!("migrations/mysql/0009_job_runs.sql")),
+    (10, include_str!("migrations/mysql/0010_removed_disks.sql")),
 ];
 
 macro_rules! object_select {
@@ -98,8 +102,11 @@ impl MysqlMetadata {
     }
 
     pub async fn connect(url: &str) -> Result<Self> {
+        // Fail fast while the database is down instead of holding requests for sqlx's default
+        // 30 s per query (requests that touch the database several times took minutes).
         let pool = MySqlPoolOptions::new()
             .max_connections(16)
+            .acquire_timeout(ACQUIRE_TIMEOUT)
             .connect(url)
             .await?;
         migrate(&pool).await?;
@@ -1009,13 +1016,28 @@ impl MetadataStore for MysqlMetadata {
         Ok(())
     }
 
-    async fn heartbeat_disk(&self, disk_id: DiskId, free_bytes: u64, now: i64) -> Result<()> {
-        sqlx::query("UPDATE disks SET free_bytes = ?, heartbeat_at = ? WHERE id = ?")
-            .bind(i64_of(free_bytes)?)
-            .bind(now)
+    async fn is_disk_removed(&self, disk_id: DiskId) -> Result<bool> {
+        Ok(sqlx::query("SELECT 1 FROM removed_disks WHERE id = ?")
             .bind(disk_id.to_string())
-            .execute(&self.pool)
-            .await?;
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some())
+    }
+
+    async fn ping(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn heartbeat_disk(&self, disk_id: DiskId, free_bytes: u64, now: i64) -> Result<()> {
+        sqlx::query(
+            "UPDATE disks SET online = TRUE, free_bytes = ?, heartbeat_at = ? WHERE id = ?",
+        )
+        .bind(i64_of(free_bytes)?)
+        .bind(now)
+        .bind(disk_id.to_string())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -1075,6 +1097,19 @@ impl MetadataStore for MysqlMetadata {
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM replicas WHERE disk_id = ?")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        // Remembered so that the disk is not registered again if it stays in a config.
+        let removed_at = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
+        sqlx::query("INSERT INTO removed_disks (id, node_id, removed_at) SELECT id, node_id, ? FROM disks WHERE id = ? ON DUPLICATE KEY UPDATE removed_at = removed_at")
+            .bind(removed_at)
             .bind(&id)
             .execute(&mut *tx)
             .await?;

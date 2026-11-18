@@ -353,6 +353,10 @@ pub trait MetadataStore: Send + Sync {
         now: i64,
     ) -> Result<()>;
     /// Refreshes a disk's free space and liveness.
+    /// Runs a trivial query, to check that the database answers.
+    async fn ping(&self) -> Result<()>;
+    /// Records a heartbeat; also marks the disk online again (an admin command started while
+    /// the disk was missing marks it offline when it opens the store).
     async fn heartbeat_disk(&self, disk_id: DiskId, free_bytes: u64, now: i64) -> Result<()>;
     /// Every disk of every node.
     async fn list_disks(&self) -> Result<Vec<DiskRecord>>;
@@ -360,7 +364,11 @@ pub trait MetadataStore: Send + Sync {
     async fn set_disk_draining(&self, disk_id: DiskId, draining: bool) -> Result<bool>;
     /// Forgets a disk. Refuses while replica records point at it, unless `force`: then those
     /// records are dropped and their objects queued for repair (for a disk that is gone).
+    /// The id is also remembered: [`MetadataStore::is_disk_removed`].
     async fn remove_disk(&self, disk_id: DiskId, force: bool) -> Result<RemoveDiskOutcome>;
+    /// Whether the disk was removed with [`MetadataStore::remove_disk`] (it must not be
+    /// registered again under the same identity).
+    async fn is_disk_removed(&self, disk_id: DiskId) -> Result<bool>;
     /// Records when repair noticed a disk down (`None` once it is back).
     async fn set_disk_down_since(&self, disk_id: DiskId, since: Option<i64>) -> Result<()>;
     /// Queues every object with a copy on the disk for repair; returns how many were queued.
