@@ -213,13 +213,17 @@ async fn gc_skips_a_disk_the_metadata_knows_nothing_about() {
 async fn draining_a_disk_moves_its_copies_then_it_can_be_removed() {
     let env = Env::new(4).await;
     env.store.create_bucket(OWNER, "drain", None).await.unwrap();
-    let keys = ["a", "b", "c", "d", "e"];
-    for k in keys {
-        env.put("drain", k, None).await;
-    }
+    // Placement is random among equally empty disks (and the test's disks share one file
+    // system, so their free space moves with other tests): write until disk 0 holds copies.
     let d0 = env.disk_id(0).await;
+    let mut keys = Vec::new();
+    while keys.len() < 5 || env.copies_on(d0).await == 0 {
+        assert!(keys.len() < 40, "disk 0 never got a copy");
+        let k = format!("k{}", keys.len());
+        env.put("drain", &k, None).await;
+        keys.push(k);
+    }
     let on_d0 = env.copies_on(d0).await;
-    assert!(on_d0 > 0);
 
     assert!(env.store.set_disk_draining(d0, true).await.unwrap());
     assert_eq!(
@@ -240,7 +244,7 @@ async fn draining_a_disk_moves_its_copies_then_it_can_be_removed() {
     assert_eq!((r.copied, r.drained), (on_d0, on_d0), "{r:?}");
     assert_eq!(env.copies_on(d0).await, 0);
     assert_eq!(count_files(&env.disks[0].join("objects")), 0);
-    for k in keys {
+    for k in &keys {
         let replicas = env.store.object_replicas("drain", k).await.unwrap();
         assert_eq!(replicas.len(), 3);
         assert!(!replicas.contains(&d0));
