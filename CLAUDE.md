@@ -220,6 +220,7 @@ npm 側は cargo-deny の対象外なので、依存を足すときは手で確�
 ## 未対応（既知の穴）
 
 - `deny.toml` で RUSTSEC-2026-0459（同梱 SQLite の脆弱性）を一時除外中。sqlx が libsqlite3-sys >= 0.39 を許容したら更新して除外を外す
+- `deny.toml` で RUSTSEC-2026-0543（chrono の保守終了。脆弱性ではない）を一時除外中。s3s 0.17 経由でだけ入り、suhms は直接使っていない。chrono を使わない s3s がリリースされたら更新して除外を外す
 - PostgreSQL / MariaDB はこのホストでは未検証（CI の `metadata-backends` ジョブでサービスコンテナに対して store のテストを実行）。
   ローカルで試すなら `SUHMS_TEST_POSTGRES=postgres://... cargo test -p suhms-store`（テストごとに DB を作る）
 - `[cluster.tls]` を設定しないとノード間通信は平文 HTTP（HMAC 認証のみ）。その場合はプライベートネットワークか WireGuard 等で保護すること
