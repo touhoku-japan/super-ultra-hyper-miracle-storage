@@ -114,8 +114,42 @@ pub enum StoreError {
     Io(#[from] io::Error),
 }
 
+impl StoreError {
+    /// Whether the metadata database could not be reached (connection refused or lost, or no
+    /// pooled connection became free in time), as opposed to a query that failed.
+    pub fn is_metadata_unavailable(&self) -> bool {
+        let Self::Metadata(inner) = self else {
+            return false;
+        };
+        matches!(
+            inner.downcast_ref::<sqlx::Error>(),
+            Some(
+                sqlx::Error::PoolTimedOut
+                    | sqlx::Error::PoolClosed
+                    | sqlx::Error::Io(_)
+                    | sqlx::Error::Tls(_)
+                    | sqlx::Error::Protocol(_)
+            )
+        )
+    }
+}
+
 impl From<sqlx::Error> for StoreError {
     fn from(e: sqlx::Error) -> Self {
         Self::Metadata(Box::new(e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_failures_count_as_metadata_unavailable() {
+        assert!(StoreError::from(sqlx::Error::PoolTimedOut).is_metadata_unavailable());
+        let refused = io::Error::new(io::ErrorKind::ConnectionRefused, "refused");
+        assert!(StoreError::from(sqlx::Error::Io(refused)).is_metadata_unavailable());
+        assert!(!StoreError::from(sqlx::Error::RowNotFound).is_metadata_unavailable());
+        assert!(!StoreError::NoDisks.is_metadata_unavailable());
     }
 }

@@ -407,6 +407,16 @@ impl Peer for HttpPeer {
         Self::check(resp).await.map(drop)
     }
 
+    async fn ping(&self) -> io::Result<()> {
+        let resp = self
+            .request(Method::GET, "/internal/v1/ping")
+            .timeout(PING_TIMEOUT)
+            .send()
+            .await
+            .map_err(io_err)?;
+        Self::check(resp).await.map(drop)
+    }
+
     async fn remove_upload(&self, disk: DiskId, upload: Uuid) -> io::Result<()> {
         let pq = format!("/internal/v1/disks/{disk}/uploads/{upload}");
         let resp = self
@@ -437,6 +447,9 @@ impl Peer for HttpPeer {
 }
 
 /// The other nodes of the cluster, by node id.
+/// How long a peer may take to answer a ping before it counts as unreachable.
+const PING_TIMEOUT: Duration = Duration::from_secs(3);
+
 pub struct HttpPeers {
     peers: HashMap<String, Arc<dyn Peer>>,
 }

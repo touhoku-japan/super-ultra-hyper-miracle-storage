@@ -198,6 +198,12 @@ pub async fn scrub(config: Config) -> anyhow::Result<()> {
         "checked {} copies, removed {} bad copies",
         r.checked, r.removed
     );
+    if r.skipped_disks > 0 {
+        anyhow::bail!(
+            "{} configured disk(s) could not be scrubbed (not mounted, missing or failing; see the log above)",
+            r.skipped_disks
+        );
+    }
     Ok(())
 }
 

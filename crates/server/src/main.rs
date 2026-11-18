@@ -110,6 +110,11 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn serve(config: Config) -> anyhow::Result<()> {
+    // Before anything starts: with an expired certificate the node would be cut off.
+    let cert_not_after = match &config.cluster.tls {
+        Some(tls) if config.cluster.is_enabled() => Some(suhms_server::tls::check_node_cert(tls)?),
+        _ => None,
+    };
     let cipher = Arc::new(SecretCipher::load(&config.auth)?);
     let store = Arc::new(suhms_server::cluster::open_store(&config).await?);
     store.clear_tmp().await;
@@ -123,6 +128,23 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         tracing::warn!(%error, "cannot mark interrupted maintenance jobs");
     }
     spawn_maintenance(&config, &store, &tenancy, &jobs);
+    if let Some(not_after) = cert_not_after {
+        tenancy
+            .cluster_cert_not_after
+            .store(not_after, std::sync::atomic::Ordering::Relaxed);
+        // A renewed certificate is picked up on restart; meanwhile keep reminding.
+        every(
+            std::time::Duration::from_secs(6 * 3600),
+            "certificate check",
+            move || async move {
+                suhms_server::tls::warn_if_expiring(
+                    not_after,
+                    time::OffsetDateTime::now_utc().unix_timestamp(),
+                );
+                Ok(())
+            },
+        );
+    }
 
     if let Some(addr) = config.admin.listen {
         let token = config.admin.load_token()?;
@@ -138,7 +160,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         tracing::info!(%addr, ui = config.admin.ui, "admin API up");
         tokio::spawn(async move {
             if let Err(error) = axum::serve(
-                listener,
+                nodelay(listener),
                 admin.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .with_graceful_shutdown(shutdown_signal())
@@ -174,7 +196,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             None => {
                 tracing::warn!(%addr, "cluster listener up WITHOUT TLS; protect node-to-node traffic with a private network");
                 tokio::spawn(async move {
-                    if let Err(error) = axum::serve(listener, internal)
+                    if let Err(error) = axum::serve(nodelay(listener), internal)
                         .with_graceful_shutdown(shutdown_signal())
                         .await
                     {
@@ -209,7 +231,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         tracing::info!(%addr, "customer console up");
         tokio::spawn(async move {
             if let Err(error) = axum::serve(
-                listener,
+                nodelay(listener),
                 console.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .with_graceful_shutdown(shutdown_signal())
@@ -222,7 +244,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 
     let listener = TcpListener::bind(config.server.listen).await?;
     tracing::info!(addr = %listener.local_addr()?, "listening");
-    axum::serve(listener, app)
+    axum::serve(nodelay(listener), app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     if let Err(error) = tenancy.meter.flush(&store).await {
@@ -230,6 +252,19 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     }
     tracing::info!("shut down cleanly");
     Ok(())
+}
+
+/// Accepted connections get `TCP_NODELAY`: without it, a small response written in two pieces
+/// (headers, then body) on a keep-alive connection waits for the client's delayed ACK (~40 ms).
+fn nodelay(
+    listener: TcpListener,
+) -> axum::serve::TapIo<TcpListener, fn(&mut tokio::net::TcpStream)> {
+    use axum::serve::ListenerExt;
+    listener.tap_io(|tcp| {
+        if let Err(error) = tcp.set_nodelay(true) {
+            tracing::warn!(%error, "cannot set TCP_NODELAY");
+        }
+    })
 }
 
 /// Runs `job` every `period` (first run after one period) in the background.

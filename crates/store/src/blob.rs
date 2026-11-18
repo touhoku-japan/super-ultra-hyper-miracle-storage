@@ -358,11 +358,32 @@ impl AsyncRead for VerifyingReader {
 }
 
 /// Atomically moves a fully synced temp file to its final path and syncs the directory entry.
+///
+/// Creates at most the two fan-out levels below the destination's base directory (`objects/`,
+/// or the upload's directory), never the base itself: if the disk was unmounted or removed,
+/// recreating its root would put the file on the wrong filesystem.
 async fn publish(tmp: &Path, final_path: &Path) -> io::Result<()> {
     let dir = final_path.parent().expect("object path has a parent");
-    fs::create_dir_all(dir).await?;
+    create_below_existing(dir, 2).await?;
     fs::rename(tmp, final_path).await?;
     sync_dir(dir).await
+}
+
+/// Creates `dir` and up to `levels - 1` missing parents; fails when more would be needed.
+async fn create_below_existing(dir: &Path, levels: usize) -> io::Result<()> {
+    match fs::metadata(dir).await {
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        Err(e) if levels == 0 => return Err(e),
+        Err(_) => {}
+    }
+    if let Some(parent) = dir.parent() {
+        Box::pin(create_below_existing(parent, levels - 1)).await?;
+    }
+    match fs::create_dir(dir).await {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        other => other,
+    }
 }
 
 async fn sync_dir(dir: &Path) -> io::Result<()> {

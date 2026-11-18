@@ -116,7 +116,7 @@ impl S3Auth for KeyStore {
             .directory
             .key(access_key)
             .await
-            .map_err(internal)?
+            .map_err(s3_err)?
             .filter(|k| k.active)
             .ok_or_else(|| s3_error!(InvalidAccessKeyId))?;
         let secret = self.cipher.decrypt(&key.id, &key.secret_enc).map_err(|e| {
@@ -154,14 +154,14 @@ impl S3Service {
             .directory
             .key(&cred.access_key)
             .await
-            .map_err(internal)?
+            .map_err(s3_err)?
             .filter(|k| k.active)
             .ok_or_else(|| s3_error!(InvalidAccessKeyId))?;
         let tenant = t
             .directory
             .tenant(&key.tenant_id)
             .await
-            .map_err(internal)?
+            .map_err(s3_err)?
             .ok_or_else(|| s3_error!(InvalidAccessKeyId))?;
         if tenant.suspended {
             t.meter.rejected_total.fetch_add(1, Ordering::Relaxed);
@@ -210,7 +210,7 @@ impl S3Service {
             .metadata()
             .get_bucket(bucket)
             .await
-            .map_err(internal)?
+            .map_err(s3_err)?
             .map(|b| b.owner)
             .unwrap_or_default();
         self.tenancy.meter.request(&owner, Class::B);
@@ -262,6 +262,10 @@ fn s3_err(e: StoreError) -> S3Error {
         StoreError::InvalidTag(m) => S3Error::with_message(S3ErrorCode::InvalidTag, m),
         e @ (StoreError::InvalidReplicaCount { .. } | StoreError::InvalidArgument(_)) => {
             S3Error::with_message(S3ErrorCode::InvalidArgument, e.to_string())
+        }
+        e if e.is_metadata_unavailable() => {
+            tracing::error!(error = %e, source = ?std::error::Error::source(&e), "metadata database unavailable");
+            s3_error!(ServiceUnavailable)
         }
         e @ (StoreError::WriteQuorum { .. }
         | StoreError::NoHealthyReplica(_)
@@ -867,7 +871,7 @@ impl S3 for S3Service {
             .metadata()
             .get_tenant(&tenant_id)
             .await
-            .map_err(internal)?;
+            .map_err(s3_err)?;
         let buckets = self
             .store
             .list_buckets(&tenant_id)
@@ -2158,6 +2162,12 @@ impl S3 for S3Service {
         if input.delete.objects.len() > 1000 {
             return Err(s3_error!(MalformedXML, "at most 1000 keys per request"));
         }
+        // Like S3, a bucket that is missing or not the caller's fails the whole request (rather
+        // than one error per key).
+        self.store
+            .get_bucket(&tenant, &input.bucket)
+            .await
+            .map_err(s3_err)?;
         let quiet = input.delete.quiet.unwrap_or(false);
         let mut deleted = Vec::new();
         let mut errors = Vec::new();

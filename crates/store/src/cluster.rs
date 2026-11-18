@@ -49,6 +49,10 @@ pub trait Peer: Send + Sync {
         parts: Vec<(Uuid, String)>,
         object: Uuid,
     ) -> io::Result<String>;
+    /// Checks that the node answers (with a short timeout).
+    async fn ping(&self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Looks up the peer serving a node.

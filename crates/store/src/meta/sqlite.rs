@@ -37,6 +37,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("migrations/sqlite/0010_backoff_backfill.sql"),
     ),
     (11, include_str!("migrations/sqlite/0011_job_runs.sql")),
+    (12, include_str!("migrations/sqlite/0012_removed_disks.sql")),
 ];
 
 macro_rules! object_select {
@@ -952,14 +953,29 @@ impl MetadataStore for SqliteMetadata {
         Ok(())
     }
 
+    async fn is_disk_removed(&self, disk_id: DiskId) -> Result<bool> {
+        Ok(sqlx::query("SELECT 1 FROM removed_disks WHERE id = ?")
+            .bind(disk_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some())
+    }
+
+    async fn ping(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
     async fn heartbeat_disk(&self, disk_id: DiskId, free_bytes: u64, now: i64) -> Result<()> {
         let _guard = self.write_lock.lock().await;
-        sqlx::query("UPDATE disks SET free_bytes = ?, heartbeat_at = ? WHERE id = ?")
-            .bind(i64_of(free_bytes)?)
-            .bind(now)
-            .bind(disk_id.to_string())
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE disks SET online = TRUE, free_bytes = ?, heartbeat_at = ? WHERE id = ?",
+        )
+        .bind(i64_of(free_bytes)?)
+        .bind(now)
+        .bind(disk_id.to_string())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -1021,6 +1037,19 @@ impl MetadataStore for SqliteMetadata {
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM replicas WHERE disk_id = ?")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        // Remembered so that the disk is not registered again if it stays in a config.
+        let removed_at = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
+        sqlx::query("INSERT OR IGNORE INTO removed_disks (id, node_id, removed_at) SELECT id, node_id, ? FROM disks WHERE id = ?")
+            .bind(removed_at)
             .bind(&id)
             .execute(&mut *tx)
             .await?;
