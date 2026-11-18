@@ -48,7 +48,8 @@ AWS CLI はホストにシステムインストールしていないので、公
     - `cluster.rs` — ノード間 API（`[cluster] listen` の別リスナー、`x-suhms-node-auth` の HMAC 認証）と
       `HttpPeer`（`reqwest`）。`open_store` がクラスタ構成ならピア付きで Store を開く
     - `main.rs` — 全リスナーで受け付けた接続に TCP_NODELAY を設定（`nodelay`。無いとキープアライブ接続の小さい応答が遅延 ACK で約 40ms 待つ）
-    - `tls.rs` — ノード間の相互 TLS（`[cluster.tls]`）。rustls（暗号プロバイダは `ring`。aws-lc はビルドが重いので使わない）。
+    - `drain.rs` — S3 がリクエスト本文を読まずにエラーを返したとき、残りが 1 MiB 以下なら読み捨ててから応答する（読まずに閉じるとクライアントには `SlowDown` 等より先に BrokenPipe が見える）。`Expect: 100-continue` のリクエストは対象外
+    - `tls.rs` — ノード間の相互 TLS（`[cluster.tls]`）。起動時に自ノードの証明書の有効期間を検査し（`check_node_cert`。X.509 パーサは使わず DER を直接読む）、期限切れなら起動しない。30 日前から警告、期限は `/metrics` に出す。rustls（暗号プロバイダは `ring`。aws-lc はビルドが重いので使わない）。
       クラスタ CA が署名したクライアント証明書を必須にし、サーバ証明書も同じ CA でだけ検証する。HMAC 認証は残す。
       `TlsListener` はハンドシェイクを別タスクで行う `axum::serve` 用リスナー。手順は `docs/cluster-tls.md`
     - `tenancy.rs` — アクセスキー/テナントの 10 秒キャッシュ（`Directory`。管理 API での変更は同ノードで即時無効化）、
@@ -97,7 +98,7 @@ AWS CLI はホストにシステムインストールしていないので、公
       ノード障害中も書き込みは過半数で成功し、復旧後に repair で補う。複数ノード構成では同一ノードに 2 コピー置かない
     - `list.rs` — S3 の ListObjects 意味論（prefix / delimiter / marker / continuation）。キー順は UTF-8 バイト順
     - `store.rs` — `Store`: テナント・バケット・オブジェクト操作（すべて owner = テナント ID でスコープ。他テナントのバケットは AccessDenied）、
-      コピー、マルチパート、`scrub()`、`repair()`
+      コピー、マルチパート、`scrub()`（ファイルが無い・不一致のときは replicas 行がまだあるか確かめ直す。並行する削除・上書きを欠損と誤認しないため）、`repair()`
     - マルチパート: アップロード開始時にディスクを決め、パートは各ディスクの `.suhms/multipart/<upload>/<blob>` に置く。
       完了時は各ディスク上でローカルにパートを連結して普通のオブジェクトファイルにする（パートごとに BLAKE3 を検証）。
       ETag は S3 と同じ `md5(パートMD5の連結)-N`。完了処理中は s3s がキープアライブの空白を送る
@@ -118,7 +119,7 @@ AWS CLI はホストにシステムインストールしていないので、公
     ノードが生きていてディスクだけが落ちている場合、そのディスクのコピーはノード重複判定に数えないので、同じノードの別ディスクへ
     再複製する（`disk remove` を待たない）。ディスクが戻って余ったコピーは、同じノードに 2 つあるものから削る。
     ノードごと落ちている（到達できない）場合は従来どおり数える
-    `node drain/remove` はそのノードの全ディスクに同じことをする。撤去するディスクは先にノードの設定から外すこと（起動時に再登録される）
+    `node drain/remove` はそのノードの全ディスクに同じことをする。撤去するディスクは先にノードの設定から外すこと。外し忘れても、`disk remove` した ID は `removed_disks` テーブルに残り、起動時にそのディスクは使わない（エラーログを出し、scrub の `skipped_disks` に数える。再利用するなら中身を空にして新しいディスクとして初期化させる）
   - `gc`: 各ノードが自分のディスクを走査し、replicas 行のないオブジェクトファイル（猶予 `gc_grace_secs` より古いもの）を
     `.suhms/gc/<unix秒>/` へ移し、次回以降に猶予を過ぎたゴミ箱を消す。存在しないアップロードの `.suhms/multipart/` と古い tmp も消す。
     メタデータにそのディスクのコピーが 1 件もないのにファイルがある場合は DB の取り違えを疑ってスキップ（`--force` で実行）。
@@ -167,6 +168,7 @@ AWS CLI はホストにシステムインストールしていないので、公
 - CORS（`server/src/cors.rs`）: ルールはバケットに JSON で保存し、ミドルウェアがプリフライト（OPTIONS）と応答ヘッダを処理
 - SQLite のマイグレーションは外部キーを無効化して実行する（`objects` の再作成で replicas が CASCADE 削除されないように）
 - サーバ側暗号化（SSE）は実装しない: 「ファイルをそのまま置く」方針と矛盾するため。保存時暗号化はディスク側（LUKS 等）で行う
+- DeleteObjects は、バケットが無い・他テナントのものならリクエスト全体を NoSuchBucket / AccessDenied にする（S3 と同じ。キーごとのエラーにしない）
 - 対応済み S3 操作: ListBuckets, Create/Head/Delete Bucket, GetBucketLocation, GetBucketVersioning,
   Put/Get（Range）/Head/Delete Object, DeleteObjects, ListObjects V1/V2（encoding-type=url 対応）, presigned URL,
   CopyObject（COPY/REPLACE）, Create/UploadPart/UploadPartCopy/Complete/Abort MultipartUpload, ListParts, ListMultipartUploads,

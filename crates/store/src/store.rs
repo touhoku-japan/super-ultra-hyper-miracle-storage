@@ -359,6 +359,12 @@ impl Store {
         let mut unopened = 0;
         for path in &config.disks {
             match Disk::open(path, &config.node_id).await {
+                Ok(disk) if meta.is_disk_removed(disk.id).await? => {
+                    tracing::error!(path = %path.display(), disk_id = %disk.id,
+                        "this disk was removed from the cluster (`suhms disk remove`); not using it. \
+                         Take it out of the config, or empty the directory to reuse it as a new disk");
+                    unopened += 1;
+                }
                 Ok(disk) => {
                     if !seen.insert(disk.id) {
                         return Err(StoreError::Config(format!(

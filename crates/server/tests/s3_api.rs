@@ -2,6 +2,7 @@ mod common;
 
 use axum::{body::Body, http::Request};
 use common::{Creds, Server, path_encode, signed_with_payload_hash, xml_values};
+use futures::StreamExt;
 use md5::{Digest, Md5};
 
 fn data(n: usize) -> Vec<u8> {
@@ -50,6 +51,59 @@ async fn health_fails_while_no_disk_is_usable() {
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let resp = srv.send(health()).await;
     assert_eq!(resp.status, 200);
+}
+
+/// A request body that records how many bytes the server read from it.
+fn counted_body(chunks: usize) -> (Body, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let read = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&read);
+    let stream = futures::stream::iter(0..chunks).map(move |_| {
+        counter.fetch_add(4096, std::sync::atomic::Ordering::SeqCst);
+        Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'x'; 4096]))
+    });
+    (Body::from_stream(stream), read)
+}
+
+#[tokio::test]
+async fn a_rejected_request_body_is_read_before_answering() {
+    use std::sync::atomic::Ordering;
+    let srv = Server::start(1).await;
+    // Anonymous PUT: refused without the service reading the body. The rest is read anyway so
+    // the client sees the 403 instead of a reset connection.
+    let (body, read) = counted_body(16);
+    let resp = srv
+        .send(
+            Request::put("/some-bucket/key")
+                .header("content-length", 16 * 4096)
+                .body(body)
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status, 403);
+    assert_eq!(read.load(Ordering::SeqCst), 16 * 4096);
+
+    // A client waiting for 100 Continue has sent nothing: the body is left alone.
+    let (body, read) = counted_body(16);
+    let resp = srv
+        .send(
+            Request::put("/some-bucket/key")
+                .header("content-length", 16 * 4096)
+                .header("expect", "100-continue")
+                .body(body)
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status, 403);
+    assert_eq!(read.load(Ordering::SeqCst), 0);
+
+    // Large bodies are not read (at most DRAIN_MAX, then the connection is closed).
+    let (body, read) = counted_body(1024);
+    let resp = srv
+        .send(Request::put("/some-bucket/key").body(body).unwrap())
+        .await;
+    assert_eq!(resp.status, 403);
+    let n = read.load(Ordering::SeqCst) as u64;
+    assert!(n <= suhms_server::drain::DRAIN_MAX + 4096, "{n}");
 }
 
 #[tokio::test]
@@ -454,4 +508,35 @@ async fn delete_objects_batch() {
         .s3(&c, "GET", "/bk1", &[("list-type", "2")], &[], vec![])
         .await;
     assert_eq!(xml_values(&resp.text(), "Key"), vec!["c"]);
+}
+
+#[tokio::test]
+async fn delete_objects_on_another_tenants_bucket_is_refused_as_a_whole() {
+    let srv = Server::start(1).await;
+    let (_, alice) = srv.tenant("alice").await;
+    let (_, bob) = srv.tenant("bob").await;
+    srv.s3(&alice, "PUT", "/alices", &[], &[], vec![]).await;
+    srv.s3(&alice, "PUT", "/alices/a", &[], &[], b"x".to_vec())
+        .await;
+    let xml = "<Delete><Object><Key>a</Key></Object></Delete>";
+    let md5 = base64_md5(xml.as_bytes());
+    for (bucket, status, code) in [
+        ("/alices", 403, "AccessDenied"),
+        ("/nobody", 404, "NoSuchBucket"),
+    ] {
+        let resp = srv
+            .s3(
+                &bob,
+                "POST",
+                bucket,
+                &[("delete", "")],
+                &[("content-md5", &md5)],
+                xml.as_bytes().to_vec(),
+            )
+            .await;
+        assert_eq!(resp.status, status, "{}", resp.text());
+        assert_eq!(resp.error_code().as_deref(), Some(code));
+    }
+    let resp = srv.s3(&alice, "GET", "/alices/a", &[], &[], vec![]).await;
+    assert_eq!(resp.status, 200);
 }

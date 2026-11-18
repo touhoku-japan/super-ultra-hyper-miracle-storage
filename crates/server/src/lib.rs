@@ -10,6 +10,7 @@ pub mod config;
 pub mod console;
 pub mod cors;
 pub mod crypto;
+pub mod drain;
 pub mod jobs;
 pub mod s3;
 pub mod session;
@@ -133,6 +134,15 @@ pub fn app(
             if health {
                 return Ok::<_, Infallible>(health_check.respond().await);
             }
+            // A client that waits for `100 Continue` has not sent the body: nothing to read.
+            let expects_continue = req.headers().contains_key(axum::http::header::EXPECT);
+            let (req, drain) = if expects_continue {
+                (req, None)
+            } else {
+                let (parts, body) = req.into_parts();
+                let (drain, body) = drain::Drain::wrap(body);
+                (Request::from_parts(parts, body), Some(drain))
+            };
             let response = match tower::Service::call(&mut svc, req).await {
                 Ok(resp) => resp.map(Body::new),
                 Err(error) => {
@@ -143,6 +153,11 @@ pub fn app(
                         .expect("static response is valid")
                 }
             };
+            if let Some(drain) = drain
+                && (response.status().is_client_error() || response.status().is_server_error())
+            {
+                drain.finish().await;
+            }
             Ok::<_, Infallible>(response)
         }
     });

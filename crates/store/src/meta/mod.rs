@@ -364,7 +364,11 @@ pub trait MetadataStore: Send + Sync {
     async fn set_disk_draining(&self, disk_id: DiskId, draining: bool) -> Result<bool>;
     /// Forgets a disk. Refuses while replica records point at it, unless `force`: then those
     /// records are dropped and their objects queued for repair (for a disk that is gone).
+    /// The id is also remembered: [`MetadataStore::is_disk_removed`].
     async fn remove_disk(&self, disk_id: DiskId, force: bool) -> Result<RemoveDiskOutcome>;
+    /// Whether the disk was removed with [`MetadataStore::remove_disk`] (it must not be
+    /// registered again under the same identity).
+    async fn is_disk_removed(&self, disk_id: DiskId) -> Result<bool>;
     /// Records when repair noticed a disk down (`None` once it is back).
     async fn set_disk_down_since(&self, disk_id: DiskId, since: Option<i64>) -> Result<()>;
     /// Queues every object with a copy on the disk for repair; returns how many were queued.

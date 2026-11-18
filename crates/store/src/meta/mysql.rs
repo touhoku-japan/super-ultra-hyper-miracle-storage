@@ -36,6 +36,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("migrations/mysql/0008_backoff_backfill.sql"),
     ),
     (9, include_str!("migrations/mysql/0009_job_runs.sql")),
+    (10, include_str!("migrations/mysql/0010_removed_disks.sql")),
 ];
 
 macro_rules! object_select {
@@ -1015,6 +1016,14 @@ impl MetadataStore for MysqlMetadata {
         Ok(())
     }
 
+    async fn is_disk_removed(&self, disk_id: DiskId) -> Result<bool> {
+        Ok(sqlx::query("SELECT 1 FROM removed_disks WHERE id = ?")
+            .bind(disk_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some())
+    }
+
     async fn ping(&self) -> Result<()> {
         sqlx::query("SELECT 1").execute(&self.pool).await?;
         Ok(())
@@ -1088,6 +1097,19 @@ impl MetadataStore for MysqlMetadata {
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM replicas WHERE disk_id = ?")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        // Remembered so that the disk is not registered again if it stays in a config.
+        let removed_at = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
+        sqlx::query("INSERT INTO removed_disks (id, node_id, removed_at) SELECT id, node_id, ? FROM disks WHERE id = ? ON DUPLICATE KEY UPDATE removed_at = removed_at")
+            .bind(removed_at)
             .bind(&id)
             .execute(&mut *tx)
             .await?;

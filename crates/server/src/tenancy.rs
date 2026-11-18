@@ -197,6 +197,8 @@ pub struct Tenancy {
     pub limiter: RateLimiter,
     pub meter: Meter,
     pub allow_public: bool,
+    /// Expiry (UNIX seconds) of this node's cluster TLS certificate; 0 without cluster TLS.
+    pub cluster_cert_not_after: std::sync::atomic::AtomicI64,
 }
 
 impl Tenancy {
@@ -210,6 +212,7 @@ impl Tenancy {
             limiter: RateLimiter::new(limits.requests_per_second, limits.burst),
             meter: Meter::default(),
             allow_public,
+            cluster_cert_not_after: std::sync::atomic::AtomicI64::new(0),
         }
     }
 
@@ -243,6 +246,13 @@ impl Tenancy {
                 out,
                 "# HELP {name} {help}\n# TYPE {name} counter\n{name} {}",
                 v.load(Ordering::Relaxed)
+            );
+        }
+        let not_after = self.cluster_cert_not_after.load(Ordering::Relaxed);
+        if not_after > 0 {
+            let _ = writeln!(
+                out,
+                "# HELP suhms_cluster_cert_expiry_timestamp_seconds When this node's cluster TLS certificate expires.\n# TYPE suhms_cluster_cert_expiry_timestamp_seconds gauge\nsuhms_cluster_cert_expiry_timestamp_seconds {not_after}"
             );
         }
         if let Ok(disks) = store.cluster_disks().await {

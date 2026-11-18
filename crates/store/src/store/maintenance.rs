@@ -271,6 +271,18 @@ impl Store {
                         false
                     }
                 };
+                // The object may have been deleted or overwritten since this page was listed
+                // (its file is then legitimately gone); only a copy still on record is bad.
+                let gone = bad
+                    && !self
+                        .meta
+                        .get_object_by_id(entry.object_id)
+                        .await?
+                        .is_some_and(|o| o.replicas.contains(&entry.disk_id));
+                if gone {
+                    report.checked -= 1;
+                    continue;
+                }
                 if bad {
                     tracing::warn!(path = %path.display(), "dropping missing or corrupt replica");
                     // Also queues the object for repair.

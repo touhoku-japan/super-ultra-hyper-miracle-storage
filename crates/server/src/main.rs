@@ -110,6 +110,11 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn serve(config: Config) -> anyhow::Result<()> {
+    // Before anything starts: with an expired certificate the node would be cut off.
+    let cert_not_after = match &config.cluster.tls {
+        Some(tls) if config.cluster.is_enabled() => Some(suhms_server::tls::check_node_cert(tls)?),
+        _ => None,
+    };
     let cipher = Arc::new(SecretCipher::load(&config.auth)?);
     let store = Arc::new(suhms_server::cluster::open_store(&config).await?);
     store.clear_tmp().await;
@@ -123,6 +128,23 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         tracing::warn!(%error, "cannot mark interrupted maintenance jobs");
     }
     spawn_maintenance(&config, &store, &tenancy, &jobs);
+    if let Some(not_after) = cert_not_after {
+        tenancy
+            .cluster_cert_not_after
+            .store(not_after, std::sync::atomic::Ordering::Relaxed);
+        // A renewed certificate is picked up on restart; meanwhile keep reminding.
+        every(
+            std::time::Duration::from_secs(6 * 3600),
+            "certificate check",
+            move || async move {
+                suhms_server::tls::warn_if_expiring(
+                    not_after,
+                    time::OffsetDateTime::now_utc().unix_timestamp(),
+                );
+                Ok(())
+            },
+        );
+    }
 
     if let Some(addr) = config.admin.listen {
         let token = config.admin.load_token()?;

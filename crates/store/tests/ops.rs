@@ -279,6 +279,33 @@ async fn force_removing_a_dead_disk_rereplicates_its_objects() {
 }
 
 #[tokio::test]
+async fn a_removed_disk_left_in_the_config_is_not_registered_again() {
+    let env = Env::new(4).await;
+    let d1 = env.disk_id(1).await;
+    assert_eq!(
+        env.store.remove_disk(d1, true).await.unwrap(),
+        RemoveDiskOutcome::Removed { dropped: 0 }
+    );
+    // The node restarts with the disk still in its config.
+    let restarted = Store::with_metadata(
+        StoreConfig {
+            disks: env.disks.clone(),
+            ..StoreConfig::default()
+        },
+        env.store.metadata().clone(),
+        std::sync::Arc::new(suhms_store::NoPeers),
+    )
+    .await
+    .unwrap();
+    let disks = restarted.cluster_disks().await.unwrap();
+    assert_eq!(disks.len(), 3);
+    assert!(disks.iter().all(|d| d.id != d1));
+    assert!(restarted.local_disk(d1).is_none());
+    // Scrub reports it as a configured disk it could not use.
+    assert_eq!(restarted.scrub().await.unwrap().skipped_disks, 1);
+}
+
+#[tokio::test]
 async fn one_repair_at_a_time() {
     let env = Env::new(3).await;
     let meta = env.store.metadata();
@@ -486,4 +513,27 @@ async fn job_runs_are_kept_per_node_and_job() {
     meta.delete_job_run("n2", "scrub").await.unwrap();
     assert_eq!(meta.get_job_run("n2", "scrub").await.unwrap(), None);
     assert_eq!(meta.list_job_runs().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn scrub_does_not_report_copies_deleted_while_it_runs() {
+    let env = Env::new(3).await;
+    env.store
+        .create_bucket(OWNER, "scrubbed", None)
+        .await
+        .unwrap();
+    let keys: Vec<String> = (0..200).map(|i| format!("k{i:03}")).collect();
+    for k in &keys {
+        env.put("scrubbed", k, None).await;
+    }
+    // Deletes interleave with the scrub: copies listed by the scrub disappear before it
+    // hashes them. They are gone legitimately, not missing.
+    let deletes = async {
+        for k in &keys {
+            env.store.delete_object(OWNER, "scrubbed", k).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+    };
+    let (report, ()) = tokio::join!(env.store.scrub(), deletes);
+    assert_eq!(report.unwrap().removed, 0);
 }

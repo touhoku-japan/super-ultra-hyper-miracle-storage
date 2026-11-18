@@ -36,6 +36,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("migrations/postgres/0008_backoff_backfill.sql"),
     ),
     (9, include_str!("migrations/postgres/0009_job_runs.sql")),
+    (
+        10,
+        include_str!("migrations/postgres/0010_removed_disks.sql"),
+    ),
 ];
 
 macro_rules! object_select {
@@ -114,9 +118,16 @@ impl PostgresMetadata {
 }
 
 async fn migrate(pool: &PgPool) -> Result<()> {
-    sqlx::raw_sql("CREATE TABLE IF NOT EXISTS schema_migrations (version BIGINT PRIMARY KEY)")
-        .execute(pool)
+    // Checked first: `CREATE TABLE IF NOT EXISTS` on an existing table makes the server send a
+    // NOTICE, which sqlx logs on every start and every admin command.
+    let exists: bool = sqlx::query_scalar("SELECT to_regclass('schema_migrations') IS NOT NULL")
+        .fetch_one(pool)
         .await?;
+    if !exists {
+        sqlx::raw_sql("CREATE TABLE IF NOT EXISTS schema_migrations (version BIGINT PRIMARY KEY)")
+            .execute(pool)
+            .await?;
+    }
     let current: Option<i64> = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
         .fetch_one(pool)
         .await?;
@@ -1005,6 +1016,14 @@ impl MetadataStore for PostgresMetadata {
         Ok(())
     }
 
+    async fn is_disk_removed(&self, disk_id: DiskId) -> Result<bool> {
+        Ok(sqlx::query("SELECT 1 FROM removed_disks WHERE id = $1")
+            .bind(disk_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some())
+    }
+
     async fn ping(&self) -> Result<()> {
         sqlx::query("SELECT 1").execute(&self.pool).await?;
         Ok(())
@@ -1079,6 +1098,19 @@ impl MetadataStore for PostgresMetadata {
             .await?;
         sqlx::query("DELETE FROM replicas WHERE disk_id = $1")
             .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        // Remembered so that the disk is not registered again if it stays in a config.
+        let removed_at = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
+        sqlx::query("INSERT INTO removed_disks (id, node_id, removed_at) SELECT id, node_id, $2 FROM disks WHERE id = $1 ON CONFLICT (id) DO NOTHING")
+            .bind(&id)
+            .bind(removed_at)
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM disks WHERE id = $1")

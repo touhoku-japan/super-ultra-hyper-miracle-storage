@@ -2162,6 +2162,12 @@ impl S3 for S3Service {
         if input.delete.objects.len() > 1000 {
             return Err(s3_error!(MalformedXML, "at most 1000 keys per request"));
         }
+        // Like S3, a bucket that is missing or not the caller's fails the whole request (rather
+        // than one error per key).
+        self.store
+            .get_bucket(&tenant, &input.bucket)
+            .await
+            .map_err(s3_err)?;
         let quiet = input.delete.quiet.unwrap_or(false);
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
