@@ -398,14 +398,34 @@ fn spawn_maintenance(
 }
 
 fn init_tracing(config: &Config) {
+    use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
+    // `RUST_LOG` replaces the configured filter entirely (and shows the events dropped below).
+    let from_env = EnvFilter::try_from_default_env().ok();
+    let quiet_s3s = from_env.is_none();
     // The audit trail stays on whatever the general level is.
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("{},suhms::audit=info", config.log.level)));
-    let builder = fmt().with_env_filter(filter).with_writer(std::io::stderr);
-    match config.log.format {
-        LogFormat::Pretty => builder.init(),
-        LogFormat::Json => builder.json().init(),
-    }
+    let filter = from_env
+        .unwrap_or_else(|| EnvFilter::new(format!("{},suhms::audit=info", config.log.level)));
+    let fmt = fmt::layer().with_writer(std::io::stderr);
+    let fmt = match config.log.format {
+        LogFormat::Pretty => fmt.boxed(),
+        LogFormat::Json => fmt.json().boxed(),
+    };
+    tracing_subscriber::registry()
+        .with(
+            fmt.with_filter(filter)
+                .with_filter(tracing_subscriber::filter::filter_fn(move |meta| {
+                    !(quiet_s3s && is_s3s_request_error(meta))
+                })),
+        )
+        .init();
+}
+
+/// `s3s` logs every request it rejects (bad signature, invalid bucket name, ...) at ERROR,
+/// twice. Those are client errors, already visible in the audit log with their status, and they
+/// would drown real errors in monitoring that watches ERROR. Failures on the server side are
+/// logged by suhms itself.
+fn is_s3s_request_error(meta: &tracing::Metadata<'_>) -> bool {
+    *meta.level() == tracing::Level::ERROR && meta.target() == "s3s::ops"
 }
 
 /// Resolves on Ctrl+C or SIGTERM (systemd stop) so in-flight requests can finish.

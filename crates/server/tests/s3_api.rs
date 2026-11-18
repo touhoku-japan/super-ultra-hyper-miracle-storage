@@ -588,3 +588,42 @@ async fn delete_objects_on_another_tenants_bucket_is_refused_as_a_whole() {
     let resp = srv.s3(&alice, "GET", "/alices/a", &[], &[], vec![]).await;
     assert_eq!(resp.status, 200);
 }
+
+/// Keys with control characters (other than tab / LF / CR) cannot appear in an XML listing, so
+/// writes that would create them are refused instead of breaking every later listing.
+#[tokio::test]
+async fn keys_with_control_characters_are_rejected() {
+    let srv = Server::start(1).await;
+    let (_, c) = srv.tenant("acme").await;
+    srv.s3(&c, "PUT", "/ctl", &[], &[], vec![]).await;
+    srv.s3(&c, "PUT", "/ctl/src", &[], &[], b"x".to_vec()).await;
+    let bad = format!("/ctl/{}", path_encode("a\u{1}b"));
+    let resp = srv.s3(&c, "PUT", &bad, &[], &[], b"x".to_vec()).await;
+    assert_eq!(resp.status, 400, "{}", resp.text());
+    assert_eq!(resp.error_code().as_deref(), Some("InvalidArgument"));
+    let resp = srv
+        .s3(&c, "POST", &bad, &[("uploads", "")], &[], vec![])
+        .await;
+    assert_eq!(resp.status, 400, "{}", resp.text());
+    let resp = srv
+        .s3(
+            &c,
+            "PUT",
+            &bad,
+            &[],
+            &[("x-amz-copy-source", "/ctl/src")],
+            vec![],
+        )
+        .await;
+    assert_eq!(resp.status, 400, "{}", resp.text());
+
+    // Tab, LF and CR are valid XML and stay allowed.
+    let ok = format!("/ctl/{}", path_encode("t\tn\nr\r"));
+    let resp = srv.s3(&c, "PUT", &ok, &[], &[], b"x".to_vec()).await;
+    assert_eq!(resp.status, 200, "{}", resp.text());
+    let resp = srv
+        .s3(&c, "GET", "/ctl", &[("list-type", "2")], &[], vec![])
+        .await;
+    assert_eq!(resp.status, 200, "{}", resp.text());
+    assert_eq!(xml_values(&resp.text(), "Key").len(), 2);
+}

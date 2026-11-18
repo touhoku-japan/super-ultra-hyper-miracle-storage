@@ -5,13 +5,14 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
 
 ## コマンド
 
-- テスト: `CARGO_BUILD_JOBS=1 cargo test --workspace`
+- テスト: `cargo test --workspace`（SQLite。PG / MariaDB は下の「開発ホスト」を参照）
 - Lint: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings`
 - Web コンソール（`web/`）: `npm ci && npm test && npm run build`。出力 `web/dist/` は `crates/server/build.rs` がバイナリに埋め込む
   （無ければ案内ページ。`SUHMS_REQUIRE_WEB=1` で必須にできる）。詳細は `docs/webui.md`
 - ブラウザ E2E（`web/e2e/`、Playwright）: `npm run build` → `cargo build -p suhms-server` → `cd web && npm run e2e`。
   本物の `suhms serve` を一時ディレクトリで起動して顧客用・運用者用コンソールを操作する。ブラウザは初回に
-  `npx playwright install chromium-headless-shell`（このホストは cups-libs を入れ済みで動く）
+  `npx playwright install chromium-headless-shell`（AlmaLinux 10 は公式対応外だが ubuntu24.04 向けのビルドが動く。
+  必要なライブラリは下の「開発ホスト」を参照）
 - 起動: `cargo run -p suhms-server -- -c config.toml serve`（`GET /super-ultra-hyper-miracle-storage/health` で疎通確認。認証不要。健全なディスクが無いかメタデータ DB が 2 秒以内に応答しなければ 503。結果は 1 秒再利用）
 - 管理: `suhms gen-master-key` / `suhms tenant create|list` / `suhms key create|list|disable|enable` /
   `suhms bucket set-replicas <bucket> <n|default>` / `suhms scrub` / `suhms repair [--quick]` / `suhms gc [--grace-secs N] [--force]` /
@@ -19,11 +20,35 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
   - tenant/key/disk/node 系はメタデータ DB だけを触るので、サーバ稼働中に実行してよい
   - ディスクの一時ファイル掃除（`Store::clear_tmp`）は `serve` 起動時のみ。管理コマンドは掃除しない（稼働中サーバの書き込み中ファイルを消さないため）
 
-開発ホストは 2 コア / 2.9GB RAM で他アプリと共有しているため、ビルドは `CARGO_BUILD_JOBS=1` で行う。
-release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレートはこのホストでのビルドが重いので dev-dependency に入れない。
-実クライアントでの互換確認はホストにある `rclone`（環境変数 `RCLONE_CONFIG_S_*` で設定、`force_path_style=true`）か、
-AWS CLI v2 で `scripts/awscli-compat.sh` を実行する（主要操作を一通り叩いて PASS/FAIL を出す。パス形式のアドレッシングが必要）。
-AWS CLI はホストにシステムインストールしていないので、公式インストーラで `-i <dir> -b <dir>` を指定し任意のディレクトリに入れて使う。
+### 開発ホスト
+
+- AlmaLinux 10 / 24 コア / 62GB RAM。ビルド並列数の制限は不要。release ビルドは CI 側で行う想定。
+  aws-sdk-s3 のような巨大クレートはビルドが重い（CI 時間も延びる）ので dev-dependency に入れない
+- **このホスト（melchior）は別プロジェクト `/root/managed-hapgsql` の検証用環境の Patroni ノード（3 台構成、192.168.10.211〜213 の 1 台、:5432）を兼ねている。
+  suhms のテストでは使わない・設定を変えない**（pg_hba.conf はローカルの `postgres` peer と特定ロール以外を拒否している。構成は同プロジェクトの Ansible が管理）
+- PostgreSQL のテスト: インストール済みの `/usr/pgsql-18/bin` で使い捨てクラスタを別ディレクトリ・別ポートに立てる。
+  `initdb` は root で動かないので `sudo -u postgres` で実行し、データディレクトリは `postgres` が書ける場所に置く。
+  Unix ソケットはパス長制限（107 バイト）に当たりやすいので `unix_socket_directories=''` で TCP のみにする。
+  例: `initdb -D <dir> -U suhms --auth=trust` → `pg_ctl -D <dir> -o "-p 55432 -c listen_addresses=127.0.0.1 -c unix_socket_directories='' -c fsync=off" -w start`
+  → `SUHMS_TEST_POSTGRES=postgres://suhms@127.0.0.1:55432 cargo test -p suhms-store` → `pg_ctl -D <dir> stop`
+- MariaDB のテスト: podman（インストール済み）で CI と同じ `mariadb:11` を動かす。
+  `podman run -d --name suhms-test-mariadb -p 127.0.0.1:33306:3306 -e MARIADB_ROOT_PASSWORD=pw docker.io/library/mariadb:11`
+  →（ログに `ready for connections` が 2 回出るまで待つ）→ `SUHMS_TEST_MYSQL=mysql://root:pw@127.0.0.1:33306 cargo test -p suhms-store`
+  → `podman rm -f suhms-test-mariadb`
+- Node / npm・AWS CLI・rclone はシステムに入っていない。Node は nodejs.org の LTS の tarball（`linux-x64.tar.xz`。
+  `SHASUMS256.txt` で検証）を任意のディレクトリに展開して `PATH` に足す。AWS CLI v2 は公式インストーラで
+  `-i <dir> -b <dir>` を指定して任意のディレクトリに入れる
+- Playwright のブラウザ用に dnf で入れたライブラリ: atk, at-spi2-atk, at-spi2-core, libXcomposite, libXdamage, libXfixes,
+  libXrandr, mesa-libgbm, libxkbcommon, alsa-lib（足りなければ `ldd <chrome-headless-shell> | grep 'not found'` で確認）
+- 実クライアントでの互換確認は AWS CLI v2 で `scripts/awscli-compat.sh` を実行する（主要操作を一通り叩いて PASS/FAIL を出す。
+  パス形式のアドレッシングが必要）。稼働中の suhms が要るので、一時ディレクトリにディスク 3 つと SQLite の設定を作り、
+  `gen-master-key` / `tenant create` / `key create` してから `serve` する。rclone を使うなら環境変数
+  `RCLONE_CONFIG_S_*` で設定し `force_path_style=true`
+- CPU は Xeon E5-2697 v2（SHA-NI・AVX2 なし）。負荷試験の数値は本番機より悪く出る。PUT の CPU の内訳（2026-11-19、平文 HTTP の
+  AWS CLI、3 ノード・mTLS）は SigV4 の本文 SHA-256（s3s。クライアントが署名付きペイロードを送るときだけ。HTTPS では AWS CLI は
+  UNSIGNED-PAYLOAD）約 2 割、BLAKE3 約 2 割（マルチパートは完了時の連結でもパート照合とオブジェクトのハッシュで 2 回）、
+  ノード間 TLS の AES-GCM 約 2 割、MD5 約 1 割
+- 192.168.10.220（vm-gate01）/ 192.168.10.221（vm-gate02）は managed-hapgsql の検証用環境の PgBouncer（2026-11-19 追加）。suhms とは無関係
 
 ## 構成
 
@@ -47,7 +72,9 @@ AWS CLI はホストにシステムインストールしていないので、公
       無ければコピー元のアルゴリズムで計算し直す
     - `cluster.rs` — ノード間 API（`[cluster] listen` の別リスナー、`x-suhms-node-auth` の HMAC 認証）と
       `HttpPeer`（`reqwest`）。`open_store` がクラスタ構成ならピア付きで Store を開く
-    - `main.rs` — 全リスナーで受け付けた接続に TCP_NODELAY を設定（`nodelay`。無いとキープアライブ接続の小さい応答が遅延 ACK で約 40ms 待つ）
+    - `main.rs` — 全リスナーで受け付けた接続に TCP_NODELAY を設定（`nodelay`。無いとキープアライブ接続の小さい応答が遅延 ACK で約 40ms 待つ）。
+      s3s が拒否したリクエスト（署名不一致・不正なバケット名等のクライアントエラー）を `s3s::ops` の ERROR で 2 行ずつ出すので、
+      そのターゲットの ERROR は捨てる（`is_s3s_request_error`。状態コードは監査ログに残る。`RUST_LOG` を指定したときは捨てない）
     - `drain.rs` — S3 がリクエスト本文を読まずにエラーを返したとき、残りが 1 MiB 以下なら読み捨ててから応答する（読まずに閉じるとクライアントには `SlowDown` 等より先に BrokenPipe が見える）。`Expect: 100-continue` のリクエストは対象外
     - `tls.rs` — ノード間の相互 TLS（`[cluster.tls]`）。起動時に自ノードの証明書の有効期間を検査し（`check_node_cert`。X.509 パーサは使わず DER を直接読む）、期限切れなら起動しない。30 日前から警告、期限は `/metrics` に出す。rustls（暗号プロバイダは `ring`。aws-lc はビルドが重いので使わない）。
       クラスタ CA が署名したクライアント証明書を必須にし、サーバ証明書も同じ CA でだけ検証する。HMAC 認証は残す。
@@ -72,7 +99,11 @@ AWS CLI はホストにシステムインストールしていないので、公
     - `disk.rs` — ディスク = 既存ディレクトリ。`.suhms/format.json` の UUID で識別（マウント順が変わっても同一視）。
       ルートが無ければ作らない（未マウント時にルート FS へ書くのを防ぐ）。中身のある未フォーマットのディレクトリは使わない
     - `placement.rs` — 配置（別ノード優先 → 同ノード別ディスク、空き容量の多い順）と ACK 閾値（過半数）
-    - `blob.rs` — 全レプリカへの同時ストリーミング書き込み（MD5=ETag と BLAKE3 を同時計算）、検証付きコピー
+    - `blob.rs` — 全レプリカへの同時ストリーミング書き込み（MD5=ETag と BLAKE3 を同時計算）、検証付きコピー。
+      書き込みは本文を読む前に全コピーを開き（`Replicas`）、開けなかったディスクは `Store::open_replicas` が別のディスクに差し替える
+      （前回の ping 以降に落ちたノードを選んでも、2/2 の STANDARD_IA 等が 503 にならない）。リモートのコピーは `HttpPeer::open_sink` が
+      接続できて本文の送信が始まるまで待つ（最大 3 秒）。本文は 1 MiB ずつまとめてから各コピーへ渡し、ローカルの書き込みは
+      `tokio::fs::File` ではなく blocking タスクの std の File で行う（tokio の File はバッファを毎回コピーするため）
     - `cluster.rs` — `Peer`（他ノードのディスク操作）/ `Peers` / `ReplicaSink` / `DiskRef`（ローカルかリモートかを隠す）
     - `meta/` — `MetadataStore` trait と SQLite / PostgreSQL / MariaDB(MySQL) 実装。スキーマは `meta/migrations/<backend>/NNNN_*.sql`
       （リリース済みのマイグレーションは編集しない。バックエンドごとに番号は独立）。
@@ -169,6 +200,9 @@ AWS CLI はホストにシステムインストールしていないので、公
 - SQLite のマイグレーションは外部キーを無効化して実行する（`objects` の再作成で replicas が CASCADE 削除されないように）
 - サーバ側暗号化（SSE）は実装しない: 「ファイルをそのまま置く」方針と矛盾するため。保存時暗号化はディスク側（LUKS 等）で行う
 - DeleteObjects は、バケットが無い・他テナントのものならリクエスト全体を NoSuchBucket / AccessDenied にする（S3 と同じ。キーごとのエラーにしない）
+- オブジェクトキーに制御文字（タブ・LF・CR 以外の 0x00〜0x1F）は使えない（`validate_key` で InvalidArgument）。XML 1.0 で表せず、
+  s3s は一覧の応答全体を 500 にする（AWS は文字参照で返すが、s3s では出せない）。それ以前に保存されたキーが一覧に含まれる場合、
+  `encoding-type=url` なしの一覧は 500 ではなく 400 で `encoding-type=url` を案内する（`require_xml_safe`。500 だとクライアントが再試行し続ける）
 - 対応済み S3 操作: ListBuckets, Create/Head/Delete Bucket, GetBucketLocation, GetBucketVersioning,
   Put/Get（Range）/Head/Delete Object, DeleteObjects, ListObjects V1/V2（encoding-type=url 対応）, presigned URL,
   CopyObject（COPY/REPLACE）, Create/UploadPart/UploadPartCopy/Complete/Abort MultipartUpload, ListParts, ListMultipartUploads,
@@ -219,17 +253,18 @@ npm 側は cargo-deny の対象外なので、依存を足すときは手で確�
 
 ## 未対応（既知の穴）
 
-- `deny.toml` で RUSTSEC-2026-0459（同梱 SQLite の脆弱性）を一時除外中。sqlx が libsqlite3-sys >= 0.39 を許容したら更新して除外を外す
 - `deny.toml` で RUSTSEC-2026-0543（chrono の保守終了。脆弱性ではない）を一時除外中。s3s 0.17 経由でだけ入り、suhms は直接使っていない。chrono を使わない s3s がリリースされたら更新して除外を外す
-- PostgreSQL / MariaDB はこのホストでは未検証（CI の `metadata-backends` ジョブでサービスコンテナに対して store のテストを実行）。
-  ローカルで試すなら `SUHMS_TEST_POSTGRES=postgres://... cargo test -p suhms-store`（テストごとに DB を作る）
+- PostgreSQL / MariaDB のテストは store クレートだけ（`SUHMS_TEST_POSTGRES` / `SUHMS_TEST_MYSQL`。テストごとに DB を作る）。
+  server クレートの E2E は SQLite でしか回していない。CI の `metadata-backends` ジョブと開発ホスト（上の手順）で実行できる
 - `[cluster.tls]` を設定しないとノード間通信は平文 HTTP（HMAC 認証のみ）。その場合はプライベートネットワークか WireGuard 等で保護すること
 - チェックサムの後付けはオブジェクトのみ。既定チェックサム導入前に始まった未完了マルチパートのパートには付かない
   （完了後のオブジェクトには後付けされる）
 - 読み出し時の BLAKE3 照合は全体読み（範囲なしの GET、CopyObject、範囲なしの UploadPartCopy）だけ（`blob::VerifyingReader`）。
   最後の塊を渡す前に照合し、不一致ならそれを渡さずにエラーにする（hyper は Content-Length 分を送ると本文を読まないので、
-  EOF での照合では間に合わない）。範囲指定 GET（AWS CLI の `s3 cp` は大きいファイルを範囲指定で分割取得する）は照合せず scrub 任せ。
-  不一致のコピーが自ノードなら読み直して確認してから捨てて repair に積むが、他ノードのコピーはログだけで、そのノードの scrub 任せ
+  EOF での照合では間に合わない）。不一致のコピーが自ノードなら読み直して確認してから捨てて repair に積むが、他ノードのコピーはログだけで、そのノードの scrub 任せ。
+  範囲指定 GET（AWS CLI の `s3 cp` は大きいファイルを範囲指定で分割取得する）は返す前には照合できないので、壊れたコピーの中身を
+  そのまま返しうる。代わりに読んだコピーを後からバックグラウンドで全体照合し（`RangeChecks`。コピーごとに 1 時間に 1 回、同時 2 件、
+  待ち 256 件まで）、2 回続けて不一致なら自ノード・他ノードを問わず捨てて repair に積む。次の読み出しからは健全なコピーになる
 - `repair_full`（週 1）は従来どおり objects の全件走査。数億件規模では間隔を延ばすか止める
 - rebalance は自動実行しない（ディスク・ノード追加後に手動で `suhms rebalance`）
 

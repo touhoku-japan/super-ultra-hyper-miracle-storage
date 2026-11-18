@@ -356,10 +356,41 @@ impl ReplicaSink for HttpSink {
 impl Peer for HttpPeer {
     async fn open_sink(&self, disk: DiskId, dest: Dest) -> io::Result<Box<dyn ReplicaSink>> {
         let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(4);
+        // hyper polls the body only once the request is on a connection, so the first poll tells
+        // that the peer is reachable. Waiting for it lets a dead peer fail here, before any of
+        // the object is read, where the caller can still pick another disk.
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut ready_tx = Some(ready_tx);
+        let mut rx = ReceiverStream::new(rx);
+        let body = futures::stream::poll_fn(move |cx| {
+            if let Some(t) = ready_tx.take() {
+                let _ = t.send(());
+            }
+            rx.poll_next_unpin(cx)
+        });
         let req = self
             .request(Method::PUT, &Self::path(disk, dest))
-            .body(reqwest::Body::wrap_stream(ReceiverStream::new(rx)));
-        let response = tokio::spawn(req.send());
+            .body(reqwest::Body::wrap_stream(body));
+        let mut response = tokio::spawn(req.send());
+        tokio::select! {
+            r = ready_rx => {
+                if r.is_err() {
+                    // The request was dropped before sending its body.
+                    return Err(io_err("peer request ended before sending the body"));
+                }
+            }
+            r = &mut response => {
+                return Err(match r {
+                    Ok(Err(e)) => io_err(e),
+                    Ok(Ok(resp)) => io_err(format!("peer answered {} before the body", resp.status())),
+                    Err(e) => io_err(e),
+                });
+            }
+            () = tokio::time::sleep(OPEN_TIMEOUT) => {
+                response.abort();
+                return Err(io_err("timed out connecting to peer"));
+            }
+        }
         Ok(Box::new(HttpSink {
             tx: Some(tx),
             response,
@@ -449,6 +480,8 @@ impl Peer for HttpPeer {
 /// The other nodes of the cluster, by node id.
 /// How long a peer may take to answer a ping before it counts as unreachable.
 const PING_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long opening a remote copy may wait for a connection to the peer.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct HttpPeers {
     peers: HashMap<String, Arc<dyn Peer>>,
