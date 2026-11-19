@@ -517,20 +517,32 @@ async fn get_of_a_corrupt_copy_is_cut_short() {
     let (_, c) = srv.tenant("acme").await;
     srv.s3(&c, "PUT", "/bk1", &[], &[], vec![]).await;
     let body = data(300_000);
-    assert_eq!(
-        srv.s3(&c, "PUT", "/bk1/k", &[], &[], body.clone())
-            .await
-            .status,
-        200
-    );
-    let locs = srv.store.object_locations("bk1", "k").await.unwrap();
     let mut bad = body.clone();
     bad[1234] ^= 0xff;
-    std::fs::write(&locs[0], &bad).unwrap();
+    // Two objects: the ranged read schedules a background check that drops the corrupt (and
+    // only) copy, after which the object could no longer be read at all.
+    for key in ["k", "ranged"] {
+        let path = format!("/bk1/{key}");
+        assert_eq!(
+            srv.s3(&c, "PUT", &path, &[], &[], body.clone())
+                .await
+                .status,
+            200
+        );
+        let locs = srv.store.object_locations("bk1", key).await.unwrap();
+        std::fs::write(&locs[0], &bad).unwrap();
+    }
 
     // A ranged GET is not checked (that would mean reading the whole object).
     let resp = srv
-        .s3(&c, "GET", "/bk1/k", &[], &[("range", "bytes=0-9")], vec![])
+        .s3(
+            &c,
+            "GET",
+            "/bk1/ranged",
+            &[],
+            &[("range", "bytes=0-9")],
+            vec![],
+        )
         .await;
     assert_eq!(resp.status, 206);
     assert_eq!(&resp.body[..], &bad[..10]);
