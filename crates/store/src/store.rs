@@ -2138,14 +2138,19 @@ impl Store {
         }))
         .await;
         let mut written: Vec<(DiskId, String)> = Vec::new();
+        let mut full: Vec<DiskId> = Vec::new();
         for (disk, r) in results {
             match r {
                 Ok(hash) => written.push((disk.id(), hash)),
                 Err(error) => {
                     tracing::warn!(disk = %disk.label(), %error, "cannot assemble upload on disk");
+                    if error.kind() == std::io::ErrorKind::StorageFull {
+                        full.push(disk.id());
+                    }
                 }
             }
         }
+        self.mark_full(&full).await;
         // Every part was verified on every disk, so all results must agree.
         let blake3 = written.first().map(|(_, h)| h.clone()).unwrap_or_default();
         let replicas: Vec<DiskId> = written
@@ -2181,6 +2186,13 @@ impl Store {
         };
         if replicas.len() < required || replicas.len() != new_object.replicas.len() {
             self.remove_files(&new_object).await;
+            // Disks that filled up while assembling: retrying would fail the same way (507).
+            if replicas.len() < required && !full.is_empty() {
+                return Err(self.note_refusal(StoreError::InsufficientStorage {
+                    required,
+                    available: replicas.len(),
+                }));
+            }
             return Err(StoreError::WriteQuorum {
                 required,
                 written: replicas.len(),

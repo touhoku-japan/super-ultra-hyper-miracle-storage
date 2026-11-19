@@ -302,6 +302,8 @@ async fn concat(
     let object = req.object;
     match blob::concat_parts(disk, upload, &req.into_parts(), object).await {
         Ok(blake3) => Json(ConcatResponse { blake3 }).into_response(),
+        // A full disk is told apart (see `write_err`); the rest is a part that does not check out.
+        Err(e) if e.kind() == io::ErrorKind::StorageFull => write_err(&e),
         Err(e) => err(StatusCode::CONFLICT, e),
     }
 }
