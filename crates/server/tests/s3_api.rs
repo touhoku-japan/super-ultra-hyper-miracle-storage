@@ -656,4 +656,24 @@ async fn writes_without_room_get_507() {
         .s3(&c, "POST", "/bk1/mp", &[("uploads", "")], &[], vec![])
         .await;
     assert_eq!(resp.status, 507, "{}", resp.text());
+
+    // Counted for alerting.
+    use tower::ServiceExt as _;
+    let resp = srv
+        .admin
+        .clone()
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let text = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        text.contains("suhms_storage_full_refusals_total 2"),
+        "{text}"
+    );
 }

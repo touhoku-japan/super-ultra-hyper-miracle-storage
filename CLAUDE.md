@@ -79,6 +79,7 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
     - `main.rs` — 全リスナーで受け付けた接続に TCP_NODELAY を設定（`nodelay`。無いとキープアライブ接続の小さい応答が遅延 ACK で約 40ms 待つ）。
       s3s が拒否したリクエスト（署名不一致・不正なバケット名等のクライアントエラー）を `s3s::ops` の ERROR で 2 行ずつ出すので、
       そのターゲットの ERROR は捨てる（`is_s3s_request_error`。状態コードは監査ログに残る。`RUST_LOG` を指定したときは捨てない）。
+      `s3s::service` が 5xx の応答を丸ごと ERROR で出すもの（容量不足の 507 も含む）も同じく捨てる（原因は suhms が出す）。
       TraceLayer の 5xx の報告（`response failed`）は WARN にする（原因は S3 サービスが ERROR で出すので二重になるため）
     - `drain.rs` — S3 がリクエスト本文を読まずにエラーを返したとき、残りが 1 MiB 以下なら読み捨ててから応答する（読まずに閉じるとクライアントには `SlowDown` 等より先に BrokenPipe が見える）。`Expect: 100-continue` のリクエストは対象外
     - `tls.rs` — ノード間の相互 TLS（`[cluster.tls]`）。起動時に自ノードの証明書の有効期間を検査し（`check_node_cert`。X.509 パーサは使わず DER を直接読む）、期限切れなら起動しない。30 日前から警告、期限は `/metrics` に出す。rustls（暗号プロバイダは `ring`。aws-lc はビルドが重いので使わない）。
@@ -158,6 +159,9 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
       オブジェクト全体を書くので、「オブジェクトのサイズ＋欠けたパートの分＋`min_free_bytes`」の空きが無いディスクでは連結しない。
       パートを持つディスクで足りなければ、パートを持たないディスクも配置と同じ方法で選んでパートをコピーする。
       容量のせいで足りないときは `InsufficientStorage`（507）。
+      書き込みの途中で満杯になったコピー（ローカルは ENOSPC、リモートはノード間 API の 507 → `io::ErrorKind::StorageFull`）で
+      必要数を割ったときも 507。満杯になった他ノードのディスクは、そのノードの heartbeat が空き容量を更新するまで
+      （`FULL_TTL`、21 秒）空き 0 として扱う（`Store::mark_full`）。断った件数は `/metrics` の `suhms_storage_full_refusals_total`
       ETag は S3 と同じ `md5(パートMD5の連結)-N`。完了処理中は s3s がキープアライブの空白を送る
 - S3 プロトコル層は `s3s` クレート（Apache-2.0。`openssl` feature は使わない）
 - 運用（`store/src/store/maintenance.rs`）:

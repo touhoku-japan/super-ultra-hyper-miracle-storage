@@ -421,11 +421,12 @@ fn init_tracing(config: &Config) {
 }
 
 /// `s3s` logs every request it rejects (bad signature, invalid bucket name, ...) at ERROR,
-/// twice. Those are client errors, already visible in the audit log with their status, and they
-/// would drown real errors in monitoring that watches ERROR. Failures on the server side are
-/// logged by suhms itself.
+/// twice (`s3s::ops`). Those are client errors, already visible in the audit log with their
+/// status, and they would drown real errors in monitoring that watches ERROR. It also logs every
+/// 5xx response at ERROR with the whole response (`s3s::service`), including the expected 507 of
+/// a full cluster; suhms logs the cause itself, and TraceLayer reports every 5xx at WARN.
 fn is_s3s_request_error(meta: &tracing::Metadata<'_>) -> bool {
-    *meta.level() == tracing::Level::ERROR && meta.target() == "s3s::ops"
+    *meta.level() == tracing::Level::ERROR && matches!(meta.target(), "s3s::ops" | "s3s::service")
 }
 
 /// Resolves on Ctrl+C or SIGTERM (systemd stop) so in-flight requests can finish.

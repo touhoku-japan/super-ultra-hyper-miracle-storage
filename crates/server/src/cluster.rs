@@ -95,6 +95,17 @@ fn err(status: StatusCode, e: impl std::fmt::Display) -> Response {
     (status, e.to_string()).into_response()
 }
 
+/// A failed local write: 507 when the disk is full, so that the writing node can tell (see
+/// [`HttpPeer::check`]).
+fn write_err(e: &io::Error) -> Response {
+    let status = if e.kind() == io::ErrorKind::StorageFull {
+        StatusCode::INSUFFICIENT_STORAGE
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    err(status, e)
+}
+
 impl Internal {
     fn disk(&self, id: DiskId) -> Result<&Arc<Disk>, (StatusCode, String)> {
         self.store.local_disk(id).ok_or_else(|| {
@@ -115,7 +126,7 @@ async fn receive(st: &Internal, disk: DiskId, dest: Dest, body: Body) -> Respons
     };
     let mut sink = match LocalSink::create(disk, dest).await {
         Ok(s) => s,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+        Err(e) => return write_err(&e),
     };
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
@@ -128,12 +139,12 @@ async fn receive(st: &Internal, disk: DiskId, dest: Dest, body: Body) -> Respons
         };
         if let Err(e) = sink.write(chunk).await {
             Box::new(sink).abort().await;
-            return err(StatusCode::INTERNAL_SERVER_ERROR, e);
+            return write_err(&e);
         }
     }
     match Box::new(sink).commit().await {
         Ok(()) => StatusCode::OK.into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+        Err(e) => write_err(&e),
     }
 }
 
@@ -442,10 +453,10 @@ impl HttpPeer {
             return Ok(resp);
         }
         let body = resp.text().await.unwrap_or_default();
-        let kind = if status == StatusCode::NOT_FOUND {
-            io::ErrorKind::NotFound
-        } else {
-            io::ErrorKind::Other
+        let kind = match status {
+            StatusCode::NOT_FOUND => io::ErrorKind::NotFound,
+            StatusCode::INSUFFICIENT_STORAGE => io::ErrorKind::StorageFull,
+            _ => io::ErrorKind::Other,
         };
         Err(io::Error::new(
             kind,
@@ -459,30 +470,45 @@ impl HttpPeer {
 struct HttpSink {
     peer: HttpPeer,
     tx: Option<mpsc::Sender<io::Result<Bytes>>>,
-    response: tokio::task::JoinHandle<reqwest::Result<reqwest::Response>>,
+    /// Taken once awaited (a finished `JoinHandle` must not be polled again).
+    response: Option<tokio::task::JoinHandle<reqwest::Result<reqwest::Response>>>,
+}
+
+impl HttpSink {
+    /// Waits for the peer's response to the upload and checks its status.
+    async fn finish(&mut self) -> io::Result<()> {
+        let Some(mut response) = self.response.take() else {
+            return Err(io_err("peer response already consumed"));
+        };
+        let resp = match self.peer.alive(&mut response).await {
+            Ok(r) => r.map_err(io_err)?.map_err(io_err)?,
+            Err(e) => {
+                response.abort();
+                return Err(e);
+            }
+        };
+        self.peer.alive(HttpPeer::check(resp)).await?.map(drop)
+    }
 }
 
 #[async_trait]
 impl ReplicaSink for HttpSink {
     async fn write(&mut self, chunk: Bytes) -> io::Result<()> {
         let tx = self.tx.as_ref().expect("sink used after finishing");
-        self.peer
-            .alive(tx.send(Ok(chunk)))
-            .await?
-            .map_err(|_| io_err("peer stopped receiving"))
+        if self.peer.alive(tx.send(Ok(chunk))).await?.is_ok() {
+            return Ok(());
+        }
+        // The peer gave up on the body: its response says why (a full disk, say).
+        self.tx = None;
+        match self.finish().await {
+            Err(e) => Err(e),
+            Ok(()) => Err(io_err("peer stopped receiving")),
+        }
     }
 
     async fn commit(mut self: Box<Self>) -> io::Result<()> {
-        let this = &mut *self;
-        drop(this.tx.take());
-        let resp = match this.peer.alive(&mut this.response).await {
-            Ok(r) => r.map_err(io_err)?.map_err(io_err)?,
-            Err(e) => {
-                this.response.abort();
-                return Err(e);
-            }
-        };
-        this.peer.alive(HttpPeer::check(resp)).await?.map(drop)
+        drop(self.tx.take());
+        self.finish().await
     }
 
     async fn abort(mut self: Box<Self>) {
@@ -491,8 +517,10 @@ impl ReplicaSink for HttpSink {
         if let Some(tx) = this.tx.take() {
             let _ = this.peer.alive(tx.send(Err(io_err("write aborted")))).await;
         }
-        if this.peer.alive(&mut this.response).await.is_err() {
-            this.response.abort();
+        if let Some(mut response) = this.response.take()
+            && this.peer.alive(&mut response).await.is_err()
+        {
+            response.abort();
         }
     }
 }
@@ -527,6 +555,9 @@ impl Peer for HttpPeer {
             r = &mut response => {
                 return Err(match r {
                     Ok(Err(e)) => io_err(e),
+                    Ok(Ok(resp)) if resp.status() == StatusCode::INSUFFICIENT_STORAGE => {
+                        io::Error::new(io::ErrorKind::StorageFull, "peer disk is full")
+                    }
                     Ok(Ok(resp)) => io_err(format!("peer answered {} before the body", resp.status())),
                     Err(e) => io_err(e),
                 });
@@ -539,7 +570,7 @@ impl Peer for HttpPeer {
         Ok(Box::new(HttpSink {
             peer: self.clone(),
             tx: Some(tx),
-            response,
+            response: Some(response),
         }))
     }
 
@@ -779,6 +810,49 @@ mod tests {
             .unwrap();
         sink.write(Bytes::from_static(b"data")).await.unwrap();
         sink.commit().await.unwrap();
+    }
+
+    /// A peer whose disk fills up mid-write answers 507; the writer sees `StorageFull` (from the
+    /// write that finds the body refused, or from the commit), so the write is reported as a lack
+    /// of space rather than a failing node.
+    #[tokio::test]
+    async fn a_peer_out_of_space_is_reported_as_storage_full() {
+        use axum::routing::put;
+        use futures::StreamExt as _;
+        let app = Router::new()
+            .route("/internal/v1/ping", get(|| async { "ok" }))
+            .route(
+                "/internal/v1/disks/{disk}/objects/{blob}",
+                put(|body: Body| async move {
+                    // Takes the first chunk, then stops: the disk is full.
+                    let _ = body.into_data_stream().next().await;
+                    write_err(&io::Error::from(io::ErrorKind::StorageFull))
+                }),
+            );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await });
+        let peer = fast_peer(format!("http://{addr}"));
+        let mut sink = peer
+            .open_sink(Uuid::new_v4(), Dest::Object(Uuid::new_v4()))
+            .await
+            .unwrap();
+        let chunk = Bytes::from(vec![0u8; 1 << 20]);
+        let mut failed = None;
+        for _ in 0..64 {
+            if let Err(e) = within(sink.write(chunk.clone())).await {
+                failed = Some(e);
+                break;
+            }
+        }
+        let err = match failed {
+            Some(e) => {
+                sink.abort().await;
+                e
+            }
+            None => within(sink.commit()).await.unwrap_err(),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::StorageFull, "{err}");
     }
 
     #[test]
