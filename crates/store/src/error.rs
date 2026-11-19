@@ -109,6 +109,12 @@ pub enum StoreError {
     #[error("only {written} of the required {required} replicas could be written")]
     WriteQuorum { required: usize, written: usize },
 
+    /// Like [`StoreError::WriteQuorum`], but enough disks are reachable: they lack free space
+    /// (see [`crate::StoreConfig::min_free_bytes`]). Retrying does not help until space is freed
+    /// or disks are added.
+    #[error("only {available} of the required {required} replicas have room for the object")]
+    InsufficientStorage { required: usize, available: usize },
+
     #[error("no healthy replica of object {0} is available")]
     NoHealthyReplica(Uuid),
 

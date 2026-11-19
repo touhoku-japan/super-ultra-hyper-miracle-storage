@@ -889,6 +889,17 @@ impl Store {
         size: u64,
     ) -> Result<Vec<DiskRef>> {
         let need = size.saturating_add(self.config.min_free_bytes);
+        self.place_needing(count, existing, exclude, need).await
+    }
+
+    /// [`Store::place`] with the free space a disk needs given directly.
+    async fn place_needing(
+        &self,
+        count: usize,
+        existing: &[DiskId],
+        exclude: &[DiskId],
+        need: u64,
+    ) -> Result<Vec<DiskRef>> {
         let view = self.cluster_disks().await?;
         let existing: Vec<(DiskId, &str)> = existing
             .iter()
@@ -1023,12 +1034,49 @@ impl Store {
         let open = copies.open_disks().len();
         if open < required {
             copies.abort().await;
-            return Err(StoreError::WriteQuorum {
-                required,
-                written: open,
-            });
+            return Err(self.too_few_disks(required, open, size).await);
         }
         Ok(copies)
+    }
+
+    /// The error for a write of `size` bytes that found only `found` of the `required` disks:
+    /// running out of space when too few disks have room for it but enough would be usable
+    /// without the free-space requirement (S3 clients retry the 503 of
+    /// [`StoreError::WriteQuorum`], which only re-sends the body in vain). When enough disks do
+    /// have room, the failure lies elsewhere (a node that just died, say): a 503.
+    async fn too_few_disks(&self, required: usize, found: usize, size: u64) -> StoreError {
+        let roomy = self.place(required, &[], &[], size).await;
+        let without_space = self.place_needing(required, &[], &[], 0).await;
+        if roomy.is_ok_and(|d| d.len() < required)
+            && without_space.is_ok_and(|d| d.len() >= required)
+        {
+            StoreError::InsufficientStorage {
+                required,
+                available: found,
+            }
+        } else {
+            StoreError::WriteQuorum {
+                required,
+                written: found,
+            }
+        }
+    }
+
+    /// The disks among `disks` with room for `size` bytes plus [`StoreConfig::min_free_bytes`].
+    async fn with_room(&self, disks: Vec<DiskRef>, size: u64) -> Result<Vec<DiskRef>> {
+        let need = size.saturating_add(self.config.min_free_bytes);
+        if need == 0 {
+            return Ok(disks);
+        }
+        let view = self.cluster_disks().await?;
+        Ok(disks
+            .into_iter()
+            .filter(|d| {
+                view.iter()
+                    .find(|i| i.id == d.id())
+                    .is_some_and(|i| i.free >= need)
+            })
+            .collect())
     }
 
     async fn require_bucket(&self, name: &str) -> Result<BucketRecord> {
@@ -1459,10 +1507,7 @@ impl Store {
         let targets = self.place(usize::from(replicas), &[], &[], 0).await?;
         let required = placement::ack_threshold(replicas);
         if targets.len() < required {
-            return Err(StoreError::WriteQuorum {
-                required,
-                written: targets.len(),
-            });
+            return Err(self.too_few_disks(required, targets.len(), 0).await);
         }
         let upload = UploadRecord {
             id: Uuid::new_v4(),
@@ -1528,12 +1573,15 @@ impl Store {
             part_number,
             content_md5,
             None,
+            None,
             body,
         )
         .await
     }
 
     /// Like [`Store::upload_part`], recording the checksum published to `checksum`.
+    /// `size_hint` is the part's size when known (`Content-Length`, a copied range): the
+    /// upload's disks without room for it are replaced like disks that are down.
     #[allow(clippy::too_many_arguments)]
     pub async fn upload_part_with<R: AsyncRead + Unpin>(
         &self,
@@ -1544,6 +1592,7 @@ impl Store {
         part_number: u32,
         content_md5: Option<[u8; 16]>,
         checksum: Option<ChecksumSlot>,
+        size_hint: Option<u64>,
         body: R,
     ) -> Result<PartRecord> {
         if !(1..=MAX_PART_NUMBER).contains(&part_number) {
@@ -1552,9 +1601,13 @@ impl Store {
             )));
         }
         let upload = self.owned_upload(owner, bucket, key, upload_id).await?;
-        // The upload's disks first; one that is down is replaced like for a plain PUT. The
-        // replacement lacks the earlier parts, which completion copies over if it needs to.
-        let targets = self.reachable(&upload.disks).await?;
+        // The upload's disks first; one that is down or has filled up is replaced like for a
+        // plain PUT (otherwise every retry of the part would fail on it again). The replacement
+        // lacks the earlier parts, which completion copies over if it needs to.
+        let size = size_hint.unwrap_or(0);
+        let targets = self
+            .with_room(self.reachable(&upload.disks).await?, size)
+            .await?;
         let required = placement::ack_threshold(upload.desired_replicas);
         let blob_id = Uuid::new_v4();
         let dest = Dest::Part {
@@ -1567,8 +1620,7 @@ impl Store {
                 &targets,
                 usize::from(upload.desired_replicas),
                 required,
-                // A part's disks were chosen when the upload started; its total size was unknown.
-                0,
+                size,
             )
             .await?;
         let outcome = self.write_copies(copies, required, body).await?;
@@ -1638,6 +1690,7 @@ impl Store {
                 "copy range is out of bounds".into(),
             ));
         }
+        let size = range.end - range.start;
         let mut reader = self.read_object(&source, range).await?;
         if let Some(wrap) = wrap {
             reader = wrap(&source.object, reader);
@@ -1651,6 +1704,7 @@ impl Store {
                 part_number,
                 None,
                 checksum,
+                Some(size),
                 reader,
             )
             .await?;
@@ -1780,7 +1834,23 @@ impl Store {
         }
         let reachable = self.reachable(&all).await?;
         let holds = |d: &DiskRef, p: &PartRecord| p.disks.contains(&d.id());
-        let (mut holders, mut others): (Vec<DiskRef>, Vec<DiskRef>) = reachable
+        // Assembling writes the whole object next to its parts (deleted only afterwards), and a
+        // disk lacking parts first receives copies of them: a disk without room for that would
+        // fail midway, and the completion with it once too few disks are left.
+        let view = self.cluster_disks().await?;
+        let total: u64 = chosen.iter().map(|p| p.size).sum();
+        let has_room = |d: &DiskRef| {
+            let missing: u64 = chosen.iter().filter(|p| !holds(d, p)).map(|p| p.size).sum();
+            let need = total
+                .saturating_add(missing)
+                .saturating_add(self.config.min_free_bytes);
+            view.iter()
+                .find(|i| i.id == d.id())
+                .is_some_and(|i| i.free >= need)
+        };
+        let (roomy, full): (Vec<DiskRef>, Vec<DiskRef>) =
+            reachable.into_iter().partition(|d| has_room(d));
+        let (mut holders, mut others): (Vec<DiskRef>, Vec<DiskRef>) = roomy
             .into_iter()
             .partition(|d| chosen.iter().all(|p| holds(d, p)));
         if holders.len() >= required {
@@ -1795,6 +1865,16 @@ impl Store {
             .len()
             <= 1;
         others.sort_by_key(|d| std::cmp::Reverse(chosen.iter().filter(|p| holds(d, p)).count()));
+        // Disks holding no part at all come last, chosen like for a new object (room for every
+        // part and the object), when those holding some are not enough.
+        let short = required.saturating_sub(holders.len() + others.len());
+        if short > 0 {
+            let holding: Vec<DiskId> = holders.iter().chain(&others).map(DiskRef::id).collect();
+            let fresh = self
+                .place(short, &holding, &all, total.saturating_mul(2))
+                .await?;
+            others.extend(fresh);
+        }
         for disk in others {
             if holders.len() >= required {
                 break;
@@ -1807,6 +1887,19 @@ impl Store {
                 Err(error) => {
                     tracing::warn!(disk = %disk.label(), upload = %upload.id, %error, "cannot copy missing parts to disk");
                 }
+            }
+        }
+        if holders.len() < required && !full.is_empty() {
+            // Disks were left out for lack of space: not worth a retry (see `too_few_disks`).
+            let usable =
+                |d: &&DiskRef| single_node || !holders.iter().any(|h| h.node_id() == d.node_id());
+            let nodes: HashSet<&str> = full.iter().filter(usable).map(|d| d.node_id()).collect();
+            let more = if single_node { full.len() } else { nodes.len() };
+            if holders.len() + more >= required {
+                return Err(StoreError::InsufficientStorage {
+                    required,
+                    available: holders.len(),
+                });
             }
         }
         Ok(holders)

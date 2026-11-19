@@ -16,7 +16,7 @@ use std::{
 use async_trait::async_trait;
 use suhms_store::{
     BoxReader, CompletedPart, MIN_PART_SIZE, Peer, Peers, PutObjectRequest, ReplicaSink, Store,
-    StoreConfig, TenantRecord,
+    StoreConfig, StoreError, TenantRecord,
     blob::{self, Dest, LocalSink},
     disk::DiskId,
 };
@@ -1067,4 +1067,228 @@ async fn a_known_size_keeps_copies_off_disks_without_room_for_it() {
         .await
         .unwrap();
     assert_eq!(c.nodes_holding("data", "big").await, vec!["node1", "node2"]);
+}
+
+/// A disk of a multipart upload that fills up during the upload is replaced for the following
+/// parts (as a disk that is down would be), so a 2-copy upload still completes instead of every
+/// retry of the part failing on the full disk.
+#[tokio::test]
+async fn a_disk_that_fills_up_during_a_multipart_upload_is_replaced() {
+    let c = Cluster::start().await;
+    c.nodes[0]
+        .create_bucket(OWNER, "mpu", Some(2))
+        .await
+        .unwrap();
+    let upload = c.nodes[0]
+        .create_multipart_upload(OWNER, put("mpu", "big"))
+        .await
+        .unwrap();
+    let p1: Vec<u8> = vec![1; MIN_PART_SIZE as usize];
+    let p2: Vec<u8> = vec![2; 1000];
+    let r1 = c.nodes[0]
+        .upload_part_with(
+            OWNER,
+            "mpu",
+            "big",
+            upload.id,
+            1,
+            None,
+            None,
+            Some(p1.len() as u64),
+            &p1[..],
+        )
+        .await
+        .unwrap();
+
+    // One of the upload's disks on another node fills up.
+    let full = *upload
+        .disks
+        .iter()
+        .find(|d| c.disk_node[*d] != "node1")
+        .expect("a copy on another node");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    c.nodes[0]
+        .metadata()
+        .heartbeat_disk(full, 100 << 20, now)
+        .await
+        .unwrap();
+    c.refresh().await;
+    let r2 = c.nodes[0]
+        .upload_part_with(
+            OWNER,
+            "mpu",
+            "big",
+            upload.id,
+            2,
+            None,
+            None,
+            Some(p2.len() as u64),
+            &p2[..],
+        )
+        .await
+        .unwrap();
+    assert!(!r2.disks.contains(&full), "{:?}", r2.disks);
+    assert_eq!(r2.disks.len(), 2);
+
+    let parts = [
+        CompletedPart {
+            part_number: 1,
+            etag: r1.etag,
+        },
+        CompletedPart {
+            part_number: 2,
+            etag: r2.etag,
+        },
+    ];
+    c.nodes[0]
+        .complete_multipart_upload(OWNER, "mpu", "big", upload.id, &parts)
+        .await
+        .unwrap();
+    let mut expected = p1;
+    expected.extend_from_slice(&p2);
+    assert_eq!(read(&c.nodes[1], "mpu", "big").await, expected);
+}
+
+/// Too few disks with room is reported as such (a 507 for S3 clients); too few reachable
+/// disks stays a quorum failure (a 503 worth retrying).
+#[tokio::test]
+async fn running_out_of_space_is_told_apart_from_losing_nodes() {
+    let c = Cluster::start().await;
+    c.nodes[0].create_bucket(OWNER, "data", None).await.unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let others: Vec<DiskId> = c
+        .disk_node
+        .iter()
+        .filter(|(_, n)| *n != "node1")
+        .map(|(d, _)| *d)
+        .collect();
+    for d in &others {
+        c.nodes[0]
+            .metadata()
+            .heartbeat_disk(*d, 100 << 20, now)
+            .await
+            .unwrap();
+    }
+    c.refresh().await;
+    let err = c.nodes[0]
+        .put_object(OWNER, put("data", "k"), &b"x"[..])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::InsufficientStorage {
+                required: 2,
+                available: 1
+            }
+        ),
+        "{err:?}"
+    );
+
+    // With node2 and node3 down instead, it is the usual quorum failure.
+    for n in [1, 2] {
+        c.recover(n).await;
+        c.crash(n).await;
+    }
+    let err = c.nodes[0]
+        .put_object(OWNER, put("data", "k"), &b"x"[..])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::WriteQuorum { .. }), "{err:?}");
+}
+
+/// Completing writes the whole object on each disk: a disk without room for it is left out
+/// (another disk gets the parts copied and assembles instead), and with no disk left to take
+/// its place the completion reports the lack of space.
+#[tokio::test]
+async fn completion_skips_disks_without_room_for_the_object() {
+    let c = Cluster::start().await;
+    c.nodes[0]
+        .create_bucket(OWNER, "mpu", Some(2))
+        .await
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let fill = |disks: Vec<DiskId>| {
+        let meta = Arc::clone(c.nodes[0].metadata());
+        async move {
+            for d in disks {
+                meta.heartbeat_disk(d, 100 << 20, now).await.unwrap();
+            }
+        }
+    };
+    let upload_two_parts = |key: &'static str| {
+        let node = Arc::clone(&c.nodes[0]);
+        async move {
+            let upload = node
+                .create_multipart_upload(OWNER, put("mpu", key))
+                .await
+                .unwrap();
+            let mut parts = Vec::new();
+            for (n, body) in [(1, vec![1u8; MIN_PART_SIZE as usize]), (2, vec![2u8; 1000])] {
+                let r = node
+                    .upload_part(OWNER, "mpu", key, upload.id, n, None, &body[..])
+                    .await
+                    .unwrap();
+                parts.push(CompletedPart {
+                    part_number: n,
+                    etag: r.etag,
+                });
+            }
+            (upload, parts)
+        }
+    };
+
+    // The parts are on node1 and one other node, whose disk then fills up.
+    let (upload, parts) = upload_two_parts("a").await;
+    let full = *upload
+        .disks
+        .iter()
+        .find(|d| c.disk_node[*d] != "node1")
+        .unwrap();
+    fill(vec![full]).await;
+    c.refresh().await;
+    c.nodes[0]
+        .complete_multipart_upload(OWNER, "mpu", "a", upload.id, &parts)
+        .await
+        .unwrap();
+    let stored = c.nodes[0].get_object(OWNER, "mpu", "a").await.unwrap();
+    assert_eq!(stored.replicas.len(), 2);
+    assert!(!stored.replicas.contains(&full), "{:?}", stored.replicas);
+
+    // Every disk outside node1 full: nowhere to put the second copy.
+    c.recover(1).await;
+    c.recover(2).await;
+    let (upload, parts) = upload_two_parts("b").await;
+    fill(
+        c.disk_node
+            .iter()
+            .filter(|(_, n)| *n != "node1")
+            .map(|(d, _)| *d)
+            .collect(),
+    )
+    .await;
+    c.refresh().await;
+    let err = c.nodes[0]
+        .complete_multipart_upload(OWNER, "mpu", "b", upload.id, &parts)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::InsufficientStorage {
+                required: 2,
+                available: 1
+            }
+        ),
+        "{err:?}"
+    );
 }
