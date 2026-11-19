@@ -717,14 +717,25 @@ pub(crate) fn prefix_end(prefix: &str) -> Result<String> {
     Ok(format!("{:0width$x}", n + 1, width = prefix.len()))
 }
 
-/// Opens the backend named by the URL scheme.
+/// Default connection pool size of the PostgreSQL / MariaDB backends.
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 16;
+
+/// Opens the backend named by the URL scheme, with the default pool size.
 pub async fn connect(url: &str) -> Result<Arc<dyn MetadataStore>> {
+    connect_with(url, DEFAULT_MAX_CONNECTIONS).await
+}
+
+/// Like [`connect`]; `max_connections` sizes the pool of PostgreSQL / MariaDB (SQLite keeps its
+/// own small pool: it has a single writer anyway).
+pub async fn connect_with(url: &str, max_connections: u32) -> Result<Arc<dyn MetadataStore>> {
     let scheme = url.split(':').next().unwrap_or_default();
     match scheme {
         "sqlite" => Ok(Arc::new(SqliteMetadata::connect(url).await?)),
-        "postgres" | "postgresql" => Ok(Arc::new(PostgresMetadata::connect(url).await?)),
+        "postgres" | "postgresql" => Ok(Arc::new(
+            PostgresMetadata::connect(url, max_connections).await?,
+        )),
         "mysql" | "mariadb" => Ok(Arc::new(
-            MysqlMetadata::connect(&url.replacen("mariadb:", "mysql:", 1)).await?,
+            MysqlMetadata::connect(&url.replacen("mariadb:", "mysql:", 1), max_connections).await?,
         )),
         _ => Err(StoreError::Config(format!(
             "unsupported metadata URL scheme {scheme:?} (expected sqlite, postgres or mysql)"

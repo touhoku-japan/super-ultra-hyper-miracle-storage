@@ -40,6 +40,7 @@ impl Env {
         StoreConfig {
             disks: self.disks.clone(),
             metadata_url: self.meta_url.clone(),
+            metadata_max_connections: common::MAX_CONNECTIONS,
             ..StoreConfig::default()
         }
     }

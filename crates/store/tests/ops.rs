@@ -39,6 +39,7 @@ impl Env {
         let store = Store::open(StoreConfig {
             disks: disks.clone(),
             metadata_url: meta_url,
+            metadata_max_connections: common::MAX_CONNECTIONS,
             ..StoreConfig::default()
         })
         .await

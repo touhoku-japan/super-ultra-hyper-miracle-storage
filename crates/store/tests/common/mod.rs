@@ -8,6 +8,11 @@ use std::path::Path;
 
 use sqlx::{AssertSqlSafe, Connection};
 
+/// Connection pool size for test stores on PostgreSQL / MariaDB. Tests run in parallel and a
+/// cluster test opens three stores, so the default pool size would add up to more connections
+/// than a database server allows by default (100 for PostgreSQL).
+pub const MAX_CONNECTIONS: u32 = 4;
+
 pub async fn metadata_url(dir: &Path) -> String {
     let db = format!("t{}", uuid::Uuid::new_v4().simple());
     if let Ok(base) = std::env::var("SUHMS_TEST_POSTGRES") {

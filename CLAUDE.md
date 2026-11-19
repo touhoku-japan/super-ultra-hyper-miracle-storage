@@ -107,7 +107,9 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
     - `placement.rs` — 配置（別ノード優先 → 同ノード別ディスク、空き容量の多い順）と ACK 閾値（過半数）。
       空き容量が最大のディスクから 5% 以内のディスクは同等とみなしてランダムに選ぶ（空き容量は heartbeat でしか更新されず、
       厳密な順だと次の heartbeat まで各ノードの同じ 1 本に書き込みが集中するため）。追加したばかりの空のディスクは従来どおり優先される。
-      空きが `[storage] min_free_bytes`（既定 1 GiB、0 で無効）未満のディスクは候補にしない（repair はさらにオブジェクトのサイズ分を要求）。
+      空きが `[storage] min_free_bytes`（既定 1 GiB、0 で無効）未満のディスクは候補にしない。サイズが先に分かる書き込み
+      （PUT の Content-Length、CopyObject のコピー元、repair）はさらにオブジェクトのサイズ分を要求する（`PutObjectRequest::size_hint`。
+      マルチパートは全体のサイズが分からないので最低限だけ）。
       満杯に近いディスクに書くと途中で失敗して転送が無駄になるため。そのノードに使えるディスクが無ければ、そのノードにはコピーを置かない
     - `blob.rs` — 全レプリカへの同時ストリーミング書き込み（MD5=ETag と BLAKE3 を同時計算）、検証付きコピー。
       書き込みは本文を読む前に全コピーを開き（`Replicas`）、開けなかったディスクは `Store::open_replicas` が別のディスクに差し替える
@@ -120,6 +122,8 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
       （リリース済みのマイグレーションは編集しない。バックエンドごとに番号は独立）。
       `postgres.rs` / `mysql.rs` は `sqlite.rs` と同じ構造（SQL の差分: プレースホルダ `$n`、`ON DUPLICATE KEY UPDATE`、
       MySQL の object_key は `VARBINARY(1024)`、PG は `COLLATE "C"`）。SQLite 以外は書き込み競合を `is_retryable` で再試行。
+      PG / MariaDB の接続プールは `[storage] metadata_max_connections`（既定 16）。テストは並列に走り、クラスタのテストは
+      1 件で 3 つのストアを開くので 4 にしている（`tests/common` の `MAX_CONNECTIONS`）。
       PG / MariaDB はプールの接続待ちを 5 秒（`ACQUIRE_TIMEOUT`）で打ち切り、DB に届かないエラー（`StoreError::is_metadata_unavailable`）は S3 では 503
     - 監査用タイムスタンプ: 全テーブル（schema_migrations 含む）に `created_at`（行の挿入日時）/ `updated_at`（最終更新日時）があり、
       DB 側で自動設定する（アプリは読み書きしない）。PG は `TIMESTAMPTZ` + `DEFAULT now()` + BEFORE UPDATE トリガー

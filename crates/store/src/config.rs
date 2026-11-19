@@ -24,6 +24,10 @@ pub struct StoreConfig {
     /// written to a nearly full disk fails midway, wasting the transfer, and fills the disk up
     /// completely. Repair also requires room for the object itself.
     pub min_free_bytes: u64,
+    /// Connection pool size for a PostgreSQL / MariaDB metadata database (per process). Each
+    /// node holds up to this many connections; the database's own limit must cover all nodes
+    /// plus admin commands.
+    pub metadata_max_connections: u32,
 }
 
 impl Default for StoreConfig {
@@ -39,6 +43,7 @@ impl Default for StoreConfig {
                 ("REDUCED_REDUNDANCY".to_owned(), 1),
             ]),
             min_free_bytes: DEFAULT_MIN_FREE_BYTES,
+            metadata_max_connections: crate::meta::DEFAULT_MAX_CONNECTIONS,
         }
     }
 }
@@ -54,6 +59,11 @@ impl StoreConfig {
         if self.default_replicas == 0 {
             return Err(StoreError::Config(
                 "default_replicas must be at least 1".into(),
+            ));
+        }
+        if self.metadata_max_connections == 0 {
+            return Err(StoreError::Config(
+                "metadata_max_connections must be at least 1".into(),
             ));
         }
         if let Some((name, _)) = self.storage_classes.iter().find(|(_, n)| **n == 0) {
