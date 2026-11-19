@@ -255,6 +255,11 @@ impl Tenancy {
                 "# HELP suhms_cluster_cert_expiry_timestamp_seconds When this node's cluster TLS certificate expires.\n# TYPE suhms_cluster_cert_expiry_timestamp_seconds gauge\nsuhms_cluster_cert_expiry_timestamp_seconds {not_after}"
             );
         }
+        let _ = writeln!(
+            out,
+            "# HELP suhms_storage_full_refusals_total Writes refused because too few disks had room (507 InsufficientStorage).\n# TYPE suhms_storage_full_refusals_total counter\nsuhms_storage_full_refusals_total {}",
+            store.space_refusals()
+        );
         if let Ok(disks) = store.cluster_disks().await {
             out.push_str("# HELP suhms_disk_alive Whether a disk is online and heartbeating.\n# TYPE suhms_disk_alive gauge\n");
             for d in disks.iter() {

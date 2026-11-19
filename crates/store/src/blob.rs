@@ -123,8 +123,12 @@ struct Slot {
 }
 
 impl Slot {
-    async fn fail(&mut self, error: &io::Error) {
+    /// Drops the copy; records its disk in `full` when it ran out of space.
+    async fn fail(&mut self, error: &io::Error, full: &mut Vec<DiskId>) {
         tracing::warn!(disk = %self.disk.label(), %error, "replica write failed");
+        if error.kind() == io::ErrorKind::StorageFull {
+            full.push(self.disk.id());
+        }
         if let Some(sink) = self.sink.take() {
             sink.abort().await;
         }
@@ -215,22 +219,34 @@ impl Replicas {
     pub async fn write<R: AsyncRead + Unpin>(
         self,
         required: usize,
-        mut body: R,
+        body: R,
     ) -> Result<WriteOutcome> {
+        self.write_tracking(required, body).await.0
+    }
+
+    /// Like [`Replicas::write`]; also returns the disks that ran out of space during the write.
+    /// When those cost the write its quorum, the error is [`StoreError::InsufficientStorage`].
+    pub async fn write_tracking<R: AsyncRead + Unpin>(
+        self,
+        required: usize,
+        mut body: R,
+    ) -> (Result<WriteOutcome>, Vec<DiskId>) {
         let Self {
             dest, mut slots, ..
         } = self;
-        let (size, md5, blake3) = match stream_into(&mut slots, required, &mut body).await {
-            Ok(v) => v,
-            Err(e) => {
-                for slot in &mut slots {
-                    if let Some(sink) = slot.sink.take() {
-                        sink.abort().await;
+        let mut full = Vec::new();
+        let (size, md5, blake3) =
+            match stream_into(&mut slots, required, &mut body, &mut full).await {
+                Ok(v) => v,
+                Err(e) => {
+                    for slot in &mut slots {
+                        if let Some(sink) = slot.sink.take() {
+                            sink.abort().await;
+                        }
                     }
+                    return (Err(out_of_space(e, &full)), full);
                 }
-                return Err(e);
-            }
-        };
+            };
 
         let committing: Vec<(DiskRef, Box<dyn ReplicaSink>)> = slots
             .into_iter()
@@ -245,7 +261,12 @@ impl Replicas {
         for (disk, r) in results {
             match r {
                 Ok(()) => written.push(disk),
-                Err(error) => tracing::warn!(disk = %disk.label(), %error, "replica commit failed"),
+                Err(error) => {
+                    tracing::warn!(disk = %disk.label(), %error, "replica commit failed");
+                    if error.kind() == io::ErrorKind::StorageFull {
+                        full.push(disk.id());
+                    }
+                }
             }
         }
 
@@ -253,18 +274,33 @@ impl Replicas {
             for disk in &written {
                 disk.remove(dest).await;
             }
-            return Err(StoreError::WriteQuorum {
+            let e = StoreError::WriteQuorum {
                 required,
                 written: written.len(),
-            });
+            };
+            return (Err(out_of_space(e, &full)), full);
         }
 
-        Ok(WriteOutcome {
+        let outcome = WriteOutcome {
             size,
             md5,
             blake3,
             written: written.iter().map(DiskRef::id).collect(),
-        })
+        };
+        (Ok(outcome), full)
+    }
+}
+
+/// A lost quorum caused by disks running out of space is reported as such.
+fn out_of_space(e: StoreError, full: &[DiskId]) -> StoreError {
+    match e {
+        StoreError::WriteQuorum { required, written } if !full.is_empty() => {
+            StoreError::InsufficientStorage {
+                required,
+                available: written,
+            }
+        }
+        e => e,
     }
 }
 
@@ -272,6 +308,7 @@ async fn stream_into<R: AsyncRead + Unpin>(
     slots: &mut [Slot],
     required: usize,
     body: &mut R,
+    full: &mut Vec<DiskId>,
 ) -> Result<(u64, String, String)> {
     let check = |slots: &[Slot]| {
         let written = slots.iter().filter(|s| s.sink.is_some()).count();
@@ -318,7 +355,7 @@ async fn stream_into<R: AsyncRead + Unpin>(
         .await;
         for (slot, res) in slots.iter_mut().zip(results) {
             if let Err(error) = res {
-                slot.fail(&error).await;
+                slot.fail(&error, full).await;
             }
         }
         check(slots)?;

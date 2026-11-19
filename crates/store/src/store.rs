@@ -240,7 +240,16 @@ pub struct Store {
     probing: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Background checks of copies that served ranged reads.
     range_checks: Arc<RangeChecks>,
+    /// Other nodes' disks that ran out of space during a write, and when: placed as having no
+    /// free space until their node's next heartbeats report the real figure ([`FULL_TTL`]).
+    full_disks: std::sync::Mutex<HashMap<DiskId, Instant>>,
+    /// Writes refused with [`StoreError::InsufficientStorage`] (for `/metrics`).
+    space_refusals: std::sync::atomic::AtomicU64,
 }
+
+/// How long a disk found full during a write counts as full (see `Store::full_disks`): until
+/// a heartbeat of its node is certain to have refreshed its free space.
+const FULL_TTL: Duration = Duration::from_secs(2 * HEARTBEAT_INTERVAL.as_secs() + 1);
 
 /// How long a copy that was checked after a ranged read is not checked again.
 const RANGE_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
@@ -597,8 +606,47 @@ impl Store {
             unreachable: Arc::new(std::sync::RwLock::new(HashSet::new())),
             probing: Arc::new(std::sync::Mutex::new(HashSet::new())),
             range_checks: Arc::new(RangeChecks::new()),
+            full_disks: std::sync::Mutex::new(HashMap::new()),
+            space_refusals: std::sync::atomic::AtomicU64::new(0),
             config,
         })
+    }
+
+    /// Writes refused so far for lack of space ([`StoreError::InsufficientStorage`]).
+    pub fn space_refusals(&self) -> u64 {
+        self.space_refusals
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Counts `e` when it is a refusal for lack of space; returns it.
+    fn note_refusal(&self, e: StoreError) -> StoreError {
+        if matches!(e, StoreError::InsufficientStorage { .. }) {
+            self.space_refusals
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        e
+    }
+
+    /// Treats other nodes' disks that ran out of space as full until [`FULL_TTL`] passes.
+    async fn mark_full(&self, disks: &[DiskId]) {
+        let remote: Vec<DiskId> = disks
+            .iter()
+            .filter(|d| self.local_disk(**d).is_none())
+            .copied()
+            .collect();
+        if remote.is_empty() {
+            // A local disk's free space is read live.
+            return;
+        }
+        let now = Instant::now();
+        {
+            let mut full = self.full_disks.lock().expect("lock poisoned");
+            full.retain(|_, at| at.elapsed() < FULL_TTL);
+            for d in remote {
+                full.insert(d, now);
+            }
+        }
+        self.refresh_cluster().await;
     }
 
     pub fn node_id(&self) -> &str {
@@ -746,6 +794,14 @@ impl Store {
             return Ok(Arc::clone(view));
         }
         let alive_since = now_millis() - ALIVE_MS;
+        let full: HashSet<DiskId> = self
+            .full_disks
+            .lock()
+            .expect("lock poisoned")
+            .iter()
+            .filter(|(_, at)| at.elapsed() < FULL_TTL)
+            .map(|(d, _)| *d)
+            .collect();
         let infos: Vec<DiskInfo> = self
             .meta
             .list_disks()
@@ -766,7 +822,11 @@ impl Store {
                         && r.heartbeat_at >= alive_since
                         && r.node_id != self.config.node_id,
                     node_id: r.node_id,
-                    free: r.free_bytes,
+                    free: if full.contains(&r.id) {
+                        0
+                    } else {
+                        r.free_bytes
+                    },
                     draining: r.draining,
                 },
             })
@@ -966,11 +1026,15 @@ impl Store {
             .into_iter()
             .filter(|d| !d.is_local())
             .collect();
-        let result = copies.write(required, body).await;
+        let (result, full) = copies.write_tracking(required, body).await;
+        self.mark_full(&full).await;
+        let result = result.map_err(|e| self.note_refusal(e));
         let written = match &result {
             Ok(outcome) => outcome.written.clone(),
             // Which copies failed is not known; pinging the others costs little.
             Err(StoreError::WriteQuorum { .. }) => Vec::new(),
+            // Disks filled up; the nodes answer.
+            Err(StoreError::InsufficientStorage { .. }) => return result,
             // The body itself failed (client gone, bad digest): not the peers' fault.
             Err(_) => return result,
         };
@@ -1050,10 +1114,10 @@ impl Store {
         if roomy.is_ok_and(|d| d.len() < required)
             && without_space.is_ok_and(|d| d.len() >= required)
         {
-            StoreError::InsufficientStorage {
+            self.note_refusal(StoreError::InsufficientStorage {
                 required,
                 available: found,
-            }
+            })
         } else {
             StoreError::WriteQuorum {
                 required,
@@ -1896,10 +1960,10 @@ impl Store {
             let nodes: HashSet<&str> = full.iter().filter(usable).map(|d| d.node_id()).collect();
             let more = if single_node { full.len() } else { nodes.len() };
             if holders.len() + more >= required {
-                return Err(StoreError::InsufficientStorage {
+                return Err(self.note_refusal(StoreError::InsufficientStorage {
                     required,
                     available: holders.len(),
-                });
+                }));
             }
         }
         Ok(holders)

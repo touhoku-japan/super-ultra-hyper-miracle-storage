@@ -27,7 +27,9 @@ use uuid::Uuid;
 const OWNER: &str = "tenant-1";
 
 /// Routes peer calls straight to the target node's local disks.
-struct InProcPeer(Arc<Store>);
+/// With a counter: the node's disks run out of space as soon as a write starts (the counter
+/// counts those writes).
+struct InProcPeer(Arc<Store>, Option<Arc<AtomicUsize>>);
 
 impl InProcPeer {
     fn disk(&self, id: DiskId) -> io::Result<&Arc<suhms_store::disk::Disk>> {
@@ -40,7 +42,12 @@ impl InProcPeer {
 #[async_trait]
 impl Peer for InProcPeer {
     async fn open_sink(&self, disk: DiskId, dest: Dest) -> io::Result<Box<dyn ReplicaSink>> {
-        Ok(Box::new(LocalSink::create(self.disk(disk)?, dest).await?))
+        let sink = LocalSink::create(self.disk(disk)?, dest).await?;
+        if let Some(opens) = &self.1 {
+            opens.fetch_add(1, Ordering::Relaxed);
+            return Ok(Box::new(FullSink(Box::new(sink))));
+        }
+        Ok(Box::new(sink))
     }
     async fn read(&self, disk: DiskId, b: Uuid, size: u64, r: Range<u64>) -> io::Result<BoxReader> {
         blob::read_local(self.disk(disk)?, b, size, r).await
@@ -64,6 +71,22 @@ impl Peer for InProcPeer {
         object: Uuid,
     ) -> io::Result<String> {
         blob::concat_parts(self.disk(disk)?, upload, &parts, object).await
+    }
+}
+
+/// A copy on a disk that is full: every write fails with ENOSPC.
+struct FullSink(Box<dyn ReplicaSink>);
+
+#[async_trait]
+impl ReplicaSink for FullSink {
+    async fn write(&mut self, _: bytes::Bytes) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::StorageFull))
+    }
+    async fn commit(self: Box<Self>) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::StorageFull))
+    }
+    async fn abort(self: Box<Self>) {
+        self.0.abort().await;
     }
 }
 
@@ -114,6 +137,10 @@ struct Registry {
     nodes: RwLock<HashMap<String, Weak<Store>>>,
     down: RwLock<HashSet<String>>,
     partitioned: RwLock<HashSet<String>>,
+    /// Nodes whose disks are full, unknown to the free space they report.
+    full: RwLock<HashSet<String>>,
+    /// Writes opened on those nodes.
+    full_opens: Arc<AtomicUsize>,
     /// Writes attempted to partitioned nodes.
     cut_opens: Arc<AtomicUsize>,
 }
@@ -127,7 +154,13 @@ impl Peers for Registry {
             return Some(Arc::new(CutPeer(Arc::clone(&self.cut_opens))));
         }
         let store = self.nodes.read().unwrap().get(node_id)?.upgrade()?;
-        Some(Arc::new(InProcPeer(store)))
+        let full = self
+            .full
+            .read()
+            .unwrap()
+            .contains(node_id)
+            .then(|| Arc::clone(&self.full_opens));
+        Some(Arc::new(InProcPeer(store, full)))
     }
 }
 
@@ -1291,4 +1324,40 @@ async fn completion_skips_disks_without_room_for_the_object() {
         ),
         "{err:?}"
     );
+}
+
+/// A disk that fills up during a write (its node's heartbeat still reports room): the write
+/// is refused as out of space when it costs the quorum, the disks found full are avoided by the
+/// next writes (instead of each write sending its body to them first), and refusals are counted.
+#[tokio::test]
+async fn disks_that_fill_up_during_writes_are_avoided_and_reported() {
+    let c = Cluster::start().await;
+    c.nodes[0]
+        .create_bucket(OWNER, "data", Some(2))
+        .await
+        .unwrap();
+    c.registry
+        .full
+        .write()
+        .unwrap()
+        .extend(["node2".to_owned(), "node3".to_owned()]);
+    for i in 0..8 {
+        let err = c.nodes[0]
+            .put_object(OWNER, put("data", &format!("k{i}")), &b"x"[..])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::InsufficientStorage { required: 2, .. }),
+            "{err:?}"
+        );
+    }
+    assert_eq!(c.nodes[0].space_refusals(), 8);
+    // node2 and node3 have four disks: each was written to at most once before being avoided.
+    let opens = c.registry.full_opens.load(Ordering::Relaxed);
+    assert!((1..=4).contains(&opens), "{opens}");
+    c.nodes[0]
+        .put_object(OWNER, put("data", "again"), &b"x"[..])
+        .await
+        .unwrap_err();
+    assert_eq!(c.registry.full_opens.load(Ordering::Relaxed), opens);
 }
