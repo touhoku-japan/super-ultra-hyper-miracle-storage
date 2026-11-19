@@ -4,6 +4,9 @@ use serde::Deserialize;
 
 use crate::error::{Result, StoreError};
 
+/// Default for [`StoreConfig::min_free_bytes`]: 1 GiB.
+pub const DEFAULT_MIN_FREE_BYTES: u64 = 1 << 30;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StoreConfig {
@@ -17,6 +20,10 @@ pub struct StoreConfig {
     pub default_replicas: u8,
     /// S3 storage class name -> replica count.
     pub storage_classes: BTreeMap<String, u8>,
+    /// Disks with less free space than this get no new copies (0 disables the limit). A copy
+    /// written to a nearly full disk fails midway, wasting the transfer, and fills the disk up
+    /// completely. Repair also requires room for the object itself.
+    pub min_free_bytes: u64,
 }
 
 impl Default for StoreConfig {
@@ -31,6 +38,7 @@ impl Default for StoreConfig {
                 ("STANDARD_IA".to_owned(), 2),
                 ("REDUCED_REDUNDANCY".to_owned(), 1),
             ]),
+            min_free_bytes: DEFAULT_MIN_FREE_BYTES,
         }
     }
 }

@@ -21,8 +21,8 @@ use crate::{
     lock::{self, BucketLock},
     meta::{
         self, BucketRecord, BucketSetting, DeleteBucketOutcome, LifecycleScan, MetadataStore,
-        NULL_VERSION, ObjectRecord, PartRecord, StorageUsage, StoredObject, TenantRecord,
-        UploadRecord, VersioningMode, WriteCondition,
+        NULL_VERSION, ObjectRecord, PartRecord, PendingRemoval, RemovalTarget, StorageUsage,
+        StoredObject, TenantRecord, UploadRecord, VersioningMode, WriteCondition,
     },
     placement::{self, Candidate},
 };
@@ -38,6 +38,8 @@ const MAX_USER_METADATA: usize = 2048;
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 pub const MAX_PART_NUMBER: u32 = 10_000;
 const PAGE: u32 = 500;
+/// Pending removals handled per disk and heartbeat.
+const PENDING_REMOVAL_BATCH: u32 = 1000;
 /// How often nodes refresh their disks' liveness and free space in the metadata store.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// A disk whose last heartbeat is older than this is treated as offline.
@@ -317,7 +319,17 @@ impl CopyChecker {
                 tracing::warn!(object = %self.object, disk = %disk.label(), "dropping a copy that does not match its hash");
                 // Also queues the object for repair.
                 match self.meta.remove_replica(self.object, disk.id()).await {
-                    Ok(()) => disk.remove(Dest::Object(self.object)).await,
+                    Ok(()) => {
+                        if !disk.remove(Dest::Object(self.object)).await {
+                            let pending = PendingRemoval {
+                                disk_id: disk.id(),
+                                target: RemovalTarget::Object(self.object),
+                            };
+                            if let Err(error) = self.meta.add_pending_removals(&[pending]).await {
+                                tracing::warn!(object = %self.object, %error, "failed to record a pending removal");
+                            }
+                        }
+                    }
                     Err(error) => {
                         tracing::warn!(object = %self.object, %error, "failed to drop corrupt replica; scrub will retry");
                     }
@@ -604,6 +616,10 @@ impl Store {
         if changed | self.check_peers().await? {
             self.refresh_cluster().await;
         }
+        // A failure here must not stop the heartbeat; the rows stay for the next one.
+        if let Err(error) = self.process_pending_removals().await {
+            tracing::warn!(%error, "failed to process pending removals");
+        }
         Ok(())
     }
 
@@ -858,13 +874,16 @@ impl Store {
     }
 
     /// Picks reachable disks for `count` new copies, avoiding the nodes of the copies in
-    /// `existing` (in a cluster), the disks in `exclude`, and draining disks.
+    /// `existing` (in a cluster), the disks in `exclude`, draining disks, and disks with less
+    /// than `size` (0 when not known in advance) plus [`StoreConfig::min_free_bytes`] free.
     async fn place(
         &self,
         count: usize,
         existing: &[DiskId],
         exclude: &[DiskId],
+        size: u64,
     ) -> Result<Vec<DiskRef>> {
+        let need = size.saturating_add(self.config.min_free_bytes);
         let view = self.cluster_disks().await?;
         let existing: Vec<(DiskId, &str)> = existing
             .iter()
@@ -873,7 +892,7 @@ impl Store {
             .collect();
         let reachable: Vec<(&DiskInfo, DiskRef)> = view
             .iter()
-            .filter(|i| !i.draining && !exclude.contains(&i.id))
+            .filter(|i| !i.draining && !exclude.contains(&i.id) && i.free >= need)
             .filter_map(|i| self.reach(i).map(|r| (i, r)))
             .collect();
         let candidates = reachable
@@ -911,7 +930,7 @@ impl Store {
         count: usize,
         required: usize,
     ) -> Result<blob::Replicas> {
-        let targets = self.place(count, &[], &[]).await?;
+        let targets = self.place(count, &[], &[], 0).await?;
         self.open_replicas_on(dest, &targets, count, required).await
     }
 
@@ -984,7 +1003,7 @@ impl Store {
                         .map(|i| i.id),
                 );
             }
-            let more = self.place(count - open.len(), &open, &exclude).await?;
+            let more = self.place(count - open.len(), &open, &exclude, 0).await?;
             if more.is_empty() {
                 break;
             }
@@ -1009,16 +1028,46 @@ impl Store {
             .ok_or_else(|| StoreError::NoSuchBucket(name.to_owned()))
     }
 
-    /// Deletes an object's files from every reachable disk. Copies on unreachable disks become
-    /// orphans (they only waste space).
+    /// Deletes an object's files from every reachable disk. Copies on unreachable disks are
+    /// recorded as pending removals, which their node carries out once it is back
+    /// ([`Store::process_pending_removals`]); otherwise they would wait for gc.
     async fn remove_files(&self, stored: &StoredObject) {
-        match self.reachable(&stored.replicas).await {
-            Ok(disks) => {
-                for d in disks {
-                    d.remove(Dest::Object(stored.object.id)).await;
-                }
+        let id = stored.object.id;
+        self.remove_everywhere(&stored.replicas, RemovalTarget::Object(id))
+            .await;
+    }
+
+    /// Removes `target` from each of `disks`, recording the disks that could not be reached.
+    async fn remove_everywhere(&self, disks: &[DiskId], target: RemovalTarget) {
+        let view = match self.cluster_disks().await {
+            Ok(view) => view,
+            Err(error) => {
+                tracing::warn!(%error, "cannot resolve disks to remove files");
+                return;
             }
-            Err(error) => tracing::warn!(%error, "cannot resolve disks to remove files"),
+        };
+        let mut pending = Vec::new();
+        // Disks no longer registered (removed) are skipped: nobody would carry it out.
+        for info in disks
+            .iter()
+            .filter_map(|id| view.iter().find(|i| i.id == *id))
+        {
+            let done = match self.reach(info) {
+                Some(d) => match target {
+                    RemovalTarget::Object(id) => d.remove(Dest::Object(id)).await,
+                    RemovalTarget::Upload(id) => d.remove_upload(id).await,
+                },
+                None => false,
+            };
+            if !done {
+                pending.push(PendingRemoval {
+                    disk_id: info.id,
+                    target,
+                });
+            }
+        }
+        if let Err(error) = self.meta.add_pending_removals(&pending).await {
+            tracing::warn!(%error, ?target, "failed to record pending removals; gc will collect the files");
         }
     }
 
@@ -1391,7 +1440,7 @@ impl Store {
         let (replicas, explicit) = self
             .resolve_replicas(&bucket, req.storage_class.as_deref())
             .await?;
-        let targets = self.place(usize::from(replicas), &[], &[]).await?;
+        let targets = self.place(usize::from(replicas), &[], &[], 0).await?;
         let required = placement::ack_threshold(replicas);
         if targets.len() < required {
             return Err(StoreError::WriteQuorum {
@@ -1687,11 +1736,8 @@ impl Store {
         let mut disks: HashSet<DiskId> = upload.disks.iter().copied().collect();
         disks.extend(parts.iter().flat_map(|p| p.disks.iter().copied()));
         let disks: Vec<DiskId> = disks.into_iter().collect();
-        if let Ok(refs) = self.reachable(&disks).await {
-            for d in refs {
-                d.remove_upload(upload.id).await;
-            }
-        }
+        self.remove_everywhere(&disks, RemovalTarget::Upload(upload.id))
+            .await;
     }
 
     /// Reachable disks to assemble an upload on: those holding every chosen part. When a disk

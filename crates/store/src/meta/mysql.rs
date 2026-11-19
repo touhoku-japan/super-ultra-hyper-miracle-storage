@@ -8,11 +8,11 @@ use uuid::Uuid;
 
 use super::{
     AccessKeyRecord, BucketRecord, BucketSetting, DeleteBucketOutcome, DiskRecord, JobRun,
-    LifecycleScan, MetadataStore, NULL_VERSION, ObjectRecord, PartRecord, RemoveDiskOutcome,
-    RepairQueueEntry, ReplicaEntry, StorageUsage, StoredObject, TenantRecord, TenantUpdate,
-    UploadRecord, UsageDelta, UsageRow, VersioningMode, WriteCondition, decode_disks, decode_tags,
-    decode_user_metadata, encode_disks, encode_tags, encode_user_metadata, is_retryable,
-    prefix_end,
+    LifecycleScan, MetadataStore, NULL_VERSION, ObjectRecord, PartRecord, PendingRemoval,
+    RemovalTarget, RemoveDiskOutcome, RepairQueueEntry, ReplicaEntry, StorageUsage, StoredObject,
+    TenantRecord, TenantUpdate, UploadRecord, UsageDelta, UsageRow, VersioningMode, WriteCondition,
+    decode_disks, decode_tags, decode_user_metadata, encode_disks, encode_tags,
+    encode_user_metadata, is_retryable, prefix_end,
 };
 use crate::{
     disk::DiskId,
@@ -37,6 +37,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ),
     (9, include_str!("migrations/mysql/0009_job_runs.sql")),
     (10, include_str!("migrations/mysql/0010_removed_disks.sql")),
+    (
+        11,
+        include_str!("migrations/mysql/0011_pending_removals.sql"),
+    ),
 ];
 
 macro_rules! object_select {
@@ -1016,6 +1020,65 @@ impl MetadataStore for MysqlMetadata {
         Ok(())
     }
 
+    async fn add_pending_removals(&self, items: &[PendingRemoval]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        for item in items {
+            sqlx::query(
+                "INSERT IGNORE INTO pending_removals (disk_id, target_id, kind) VALUES (?, ?, ?)",
+            )
+            .bind(item.disk_id.to_string())
+            .bind(item.target.id().to_string())
+            .bind(item.target.kind())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn list_pending_removals(
+        &self,
+        disk_id: DiskId,
+        limit: u32,
+    ) -> Result<Vec<PendingRemoval>> {
+        let rows = sqlx::query(
+            "SELECT target_id, kind FROM pending_removals WHERE disk_id = ? ORDER BY target_id LIMIT ?",
+        )
+        .bind(disk_id.to_string())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                let id: String = r.try_get("target_id")?;
+                let kind: String = r.try_get("kind")?;
+                Ok(PendingRemoval {
+                    disk_id,
+                    target: RemovalTarget::parse(&kind, &id)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn delete_pending_removals(&self, items: &[PendingRemoval]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        for item in items {
+            sqlx::query("DELETE FROM pending_removals WHERE disk_id = ? AND target_id = ?")
+                .bind(item.disk_id.to_string())
+                .bind(item.target.id().to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn is_disk_removed(&self, disk_id: DiskId) -> Result<bool> {
         Ok(sqlx::query("SELECT 1 FROM removed_disks WHERE id = ?")
             .bind(disk_id.to_string())
@@ -1110,6 +1173,10 @@ impl MetadataStore for MysqlMetadata {
         .unwrap_or(i64::MAX);
         sqlx::query("INSERT INTO removed_disks (id, node_id, removed_at) SELECT id, node_id, ? FROM disks WHERE id = ? ON DUPLICATE KEY UPDATE removed_at = removed_at")
             .bind(removed_at)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM pending_removals WHERE disk_id = ?")
             .bind(&id)
             .execute(&mut *tx)
             .await?;

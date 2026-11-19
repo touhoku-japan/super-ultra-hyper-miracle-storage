@@ -840,3 +840,182 @@ async fn a_node_that_fails_a_write_is_pinged_and_skipped() {
         vec!["node1", "node2", "node3"]
     );
 }
+
+impl Cluster {
+    /// Pending removals recorded for a node's disks.
+    async fn pending_on(&self, node: &str) -> usize {
+        let mut n = 0;
+        for (id, owner) in &self.disk_node {
+            if owner == node {
+                n += self.nodes[0]
+                    .metadata()
+                    .list_pending_removals(*id, 1000)
+                    .await
+                    .unwrap()
+                    .len();
+            }
+        }
+        n
+    }
+
+    /// Whether any disk of the node still has the parts directory of an upload.
+    fn has_upload_dir(&self, node: &str, upload: Uuid) -> bool {
+        self.node_disks[node].iter().any(|d| {
+            d.join(".suhms/multipart")
+                .join(upload.simple().to_string())
+                .exists()
+        })
+    }
+}
+
+/// Deletes and overwrites while a node is down leave its copies behind; the node deletes them
+/// as soon as it is back (its first heartbeat) instead of waiting for gc.
+async fn removals_missed_by_a_node_are_carried_out_when_it_returns(partition: bool) {
+    let c = Cluster::start().await;
+    c.nodes[0].create_bucket(OWNER, "data", None).await.unwrap();
+    for key in ["gone", "replaced", "kept"] {
+        c.nodes[0]
+            .put_object(OWNER, put("data", key), &b"old"[..])
+            .await
+            .unwrap();
+    }
+    let upload = c.nodes[0]
+        .create_multipart_upload(OWNER, put("data", "mpu"))
+        .await
+        .unwrap();
+    c.nodes[0]
+        .upload_part(OWNER, "data", "mpu", upload.id, 1, None, &b"part"[..])
+        .await
+        .unwrap();
+    assert_eq!(c.files_on("node3"), 3);
+    assert!(c.has_upload_dir("node3", upload.id));
+
+    if partition {
+        // Cut off without node1 noticing: the removal requests themselves fail.
+        c.nodes[0].heartbeat().await.unwrap();
+        c.registry
+            .partitioned
+            .write()
+            .unwrap()
+            .insert("node3".into());
+    } else {
+        c.crash(2).await;
+    }
+    c.nodes[0]
+        .delete_object(OWNER, "data", "gone")
+        .await
+        .unwrap();
+    c.nodes[0]
+        .put_object(OWNER, put("data", "replaced"), &b"new"[..])
+        .await
+        .unwrap();
+    c.nodes[0]
+        .abort_multipart_upload(OWNER, "data", "mpu", upload.id)
+        .await
+        .unwrap();
+    // node1 and node2 deleted their copies; node3's are recorded.
+    assert_eq!(c.files_on("node1"), 2);
+    assert_eq!(c.files_on("node3"), 3);
+    assert_eq!(c.pending_on("node3").await, 3);
+    assert_eq!(c.pending_on("node1").await, 0);
+
+    if partition {
+        c.registry.partitioned.write().unwrap().remove("node3");
+    }
+    c.recover(2).await;
+    // Only the copy of the object that still exists is left on node3.
+    assert_eq!(c.files_on("node3"), 1);
+    assert!(!c.has_upload_dir("node3", upload.id));
+    assert_eq!(c.pending_on("node3").await, 0);
+    assert_eq!(read(&c.nodes[2], "data", "kept").await, b"old");
+}
+
+#[tokio::test]
+async fn removals_missed_by_a_crashed_node_are_carried_out_when_it_returns() {
+    removals_missed_by_a_node_are_carried_out_when_it_returns(false).await;
+}
+
+#[tokio::test]
+async fn removals_missed_by_a_partitioned_node_are_carried_out_when_it_returns() {
+    removals_missed_by_a_node_are_carried_out_when_it_returns(true).await;
+}
+
+/// A pending removal of a file the metadata still points at (it should never be recorded, but
+/// the rows are only a hint) leaves the file alone.
+#[tokio::test]
+async fn a_pending_removal_never_deletes_a_live_copy() {
+    let c = Cluster::start().await;
+    c.nodes[0].create_bucket(OWNER, "data", None).await.unwrap();
+    c.nodes[0]
+        .put_object(OWNER, put("data", "obj"), &b"live"[..])
+        .await
+        .unwrap();
+    let stored = c.nodes[0].get_object(OWNER, "data", "obj").await.unwrap();
+    let pending: Vec<_> = stored
+        .replicas
+        .iter()
+        .map(|d| suhms_store::meta::PendingRemoval {
+            disk_id: *d,
+            target: suhms_store::meta::RemovalTarget::Object(stored.object.id),
+        })
+        .collect();
+    c.nodes[0]
+        .metadata()
+        .add_pending_removals(&pending)
+        .await
+        .unwrap();
+    for n in &c.nodes {
+        n.heartbeat().await.unwrap();
+    }
+    for node in ["node1", "node2", "node3"] {
+        assert_eq!(c.files_on(node), 1, "{node}");
+        assert_eq!(c.pending_on(node).await, 0, "{node}");
+    }
+    assert_eq!(read(&c.nodes[2], "data", "obj").await, b"live");
+}
+
+/// Disks reported with less than `min_free_bytes` free get no new copies: node3 with one nearly
+/// full disk writes to its other disk, and with both nearly full it is left out.
+#[tokio::test]
+async fn nearly_full_disks_get_no_new_copies() {
+    let c = Cluster::start().await;
+    c.nodes[0].create_bucket(OWNER, "data", None).await.unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let mut node3: Vec<DiskId> = c
+        .disk_node
+        .iter()
+        .filter(|(_, n)| *n == "node3")
+        .map(|(d, _)| *d)
+        .collect();
+    node3.sort();
+    let meta = c.nodes[0].metadata();
+    meta.heartbeat_disk(node3[0], 100 << 20, now).await.unwrap();
+    c.refresh().await;
+    for i in 0..8 {
+        let key = format!("k{i}");
+        c.nodes[0]
+            .put_object(OWNER, put("data", &key), &b"x"[..])
+            .await
+            .unwrap();
+        let stored = c.nodes[0].get_object(OWNER, "data", &key).await.unwrap();
+        assert!(stored.replicas.contains(&node3[1]), "{key}");
+        assert!(!stored.replicas.contains(&node3[0]), "{key}");
+    }
+
+    meta.heartbeat_disk(node3[1], 100 << 20, now).await.unwrap();
+    c.refresh().await;
+    c.nodes[0]
+        .put_object(OWNER, put("data", "full"), &b"x"[..])
+        .await
+        .unwrap();
+    assert_eq!(
+        c.nodes_holding("data", "full").await,
+        vec!["node1", "node2"]
+    );
+    // Repair has nowhere to put the third copy either.
+    let r = c.nodes[0].repair().await.unwrap();
+    assert_eq!(r.copied, 0, "{r:?}");
+}

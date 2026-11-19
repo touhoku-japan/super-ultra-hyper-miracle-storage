@@ -8,11 +8,11 @@ use uuid::Uuid;
 
 use super::{
     AccessKeyRecord, BucketRecord, BucketSetting, DeleteBucketOutcome, DiskRecord, JobRun,
-    LifecycleScan, MetadataStore, NULL_VERSION, ObjectRecord, PartRecord, RemoveDiskOutcome,
-    RepairQueueEntry, ReplicaEntry, StorageUsage, StoredObject, TenantRecord, TenantUpdate,
-    UploadRecord, UsageDelta, UsageRow, VersioningMode, WriteCondition, decode_disks, decode_tags,
-    decode_user_metadata, encode_disks, encode_tags, encode_user_metadata, is_retryable,
-    prefix_end,
+    LifecycleScan, MetadataStore, NULL_VERSION, ObjectRecord, PartRecord, PendingRemoval,
+    RemovalTarget, RemoveDiskOutcome, RepairQueueEntry, ReplicaEntry, StorageUsage, StoredObject,
+    TenantRecord, TenantUpdate, UploadRecord, UsageDelta, UsageRow, VersioningMode, WriteCondition,
+    decode_disks, decode_tags, decode_user_metadata, encode_disks, encode_tags,
+    encode_user_metadata, is_retryable, prefix_end,
 };
 use crate::{
     disk::DiskId,
@@ -39,6 +39,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (
         10,
         include_str!("migrations/postgres/0010_removed_disks.sql"),
+    ),
+    (
+        11,
+        include_str!("migrations/postgres/0011_pending_removals.sql"),
     ),
 ];
 
@@ -1016,6 +1020,63 @@ impl MetadataStore for PostgresMetadata {
         Ok(())
     }
 
+    async fn add_pending_removals(&self, items: &[PendingRemoval]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        for item in items {
+            sqlx::query("INSERT INTO pending_removals (disk_id, target_id, kind) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+                .bind(item.disk_id.to_string())
+                .bind(item.target.id().to_string())
+                .bind(item.target.kind())
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn list_pending_removals(
+        &self,
+        disk_id: DiskId,
+        limit: u32,
+    ) -> Result<Vec<PendingRemoval>> {
+        let rows = sqlx::query(
+            "SELECT target_id, kind FROM pending_removals WHERE disk_id = $1 ORDER BY target_id LIMIT $2",
+        )
+        .bind(disk_id.to_string())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                let id: String = r.try_get("target_id")?;
+                let kind: String = r.try_get("kind")?;
+                Ok(PendingRemoval {
+                    disk_id,
+                    target: RemovalTarget::parse(&kind, &id)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn delete_pending_removals(&self, items: &[PendingRemoval]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        for item in items {
+            sqlx::query("DELETE FROM pending_removals WHERE disk_id = $1 AND target_id = $2")
+                .bind(item.disk_id.to_string())
+                .bind(item.target.id().to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn is_disk_removed(&self, disk_id: DiskId) -> Result<bool> {
         Ok(sqlx::query("SELECT 1 FROM removed_disks WHERE id = $1")
             .bind(disk_id.to_string())
@@ -1111,6 +1172,10 @@ impl MetadataStore for PostgresMetadata {
         sqlx::query("INSERT INTO removed_disks (id, node_id, removed_at) SELECT id, node_id, $2 FROM disks WHERE id = $1 ON CONFLICT (id) DO NOTHING")
             .bind(&id)
             .bind(removed_at)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM pending_removals WHERE disk_id = $1")
+            .bind(&id)
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM disks WHERE id = $1")

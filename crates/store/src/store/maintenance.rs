@@ -18,13 +18,13 @@ use std::{
 use tokio::{fs, task::JoinHandle};
 use uuid::Uuid;
 
-use super::{ALIVE_MS, PAGE, RepairReport, ScrubReport, Store, now_millis};
+use super::{ALIVE_MS, PAGE, PENDING_REMOVAL_BATCH, RepairReport, ScrubReport, Store, now_millis};
 use crate::{
     blob::{self, CopyOutcome, Dest},
     cluster::DiskRef,
     disk::{Disk, DiskId},
     error::{Result, StoreError},
-    meta::{MetadataStore, RemoveDiskOutcome, StoredObject},
+    meta::{MetadataStore, RemovalTarget, RemoveDiskOutcome, StoredObject},
 };
 
 /// Lease shared by every job that adds, moves or removes copies.
@@ -502,7 +502,12 @@ impl Store {
                 .copied()
                 .collect();
             let targets = self
-                .place(desired - healthy.len(), &keep, &stored.replicas)
+                .place(
+                    desired - healthy.len(),
+                    &keep,
+                    &stored.replicas,
+                    stored.object.size,
+                )
                 .await?;
             let mut sources: Vec<DiskRef> = healthy.iter().chain(&draining).cloned().collect();
             for target in targets {
@@ -595,6 +600,46 @@ impl Store {
     }
 
     // ---- garbage collection ----
+
+    /// Deletes files on this node's disks that other nodes could not delete while the disk was
+    /// unreachable (see [`MetadataStore::add_pending_removals`]); returns how many were deleted.
+    /// A file is kept when the metadata still points at it on that disk. Runs with every
+    /// heartbeat, [`PENDING_REMOVAL_BATCH`] per disk at a time.
+    pub async fn process_pending_removals(&self) -> Result<u64> {
+        let mut removed = 0;
+        for disk in self.healthy_disks() {
+            let items = self
+                .meta
+                .list_pending_removals(disk.id, PENDING_REMOVAL_BATCH)
+                .await?;
+            for item in &items {
+                let in_use = match item.target {
+                    RemovalTarget::Object(id) => self
+                        .meta
+                        .get_object_by_id(id)
+                        .await?
+                        .is_some_and(|o| o.replicas.contains(&disk.id)),
+                    RemovalTarget::Upload(id) => self.meta.get_upload(id).await?.is_some(),
+                };
+                if in_use {
+                    continue;
+                }
+                match item.target {
+                    RemovalTarget::Object(id) => blob::remove(disk, id).await,
+                    RemovalTarget::Upload(id) => blob::remove_upload_dir(disk, id).await,
+                }
+                removed += 1;
+            }
+            self.meta.delete_pending_removals(&items).await?;
+        }
+        if removed > 0 {
+            tracing::info!(
+                removed,
+                "deleted files left over while their disk was unreachable"
+            );
+        }
+        Ok(removed)
+    }
 
     /// Collects files on this node's disks that no metadata refers to: object files without a
     /// replica record (left by a crash between writing and committing, or by deletes while

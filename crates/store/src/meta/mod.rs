@@ -251,6 +251,48 @@ pub struct RepairQueueEntry {
     pub attempts: u32,
 }
 
+/// A file left behind on an unreachable disk (see [`MetadataStore::add_pending_removals`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PendingRemoval {
+    pub disk_id: DiskId,
+    pub target: RemovalTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RemovalTarget {
+    /// An object's file.
+    Object(Uuid),
+    /// The parts directory of a multipart upload.
+    Upload(Uuid),
+}
+
+impl RemovalTarget {
+    pub fn id(self) -> Uuid {
+        match self {
+            Self::Object(id) | Self::Upload(id) => id,
+        }
+    }
+
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::Object(_) => "object",
+            Self::Upload(_) => "upload",
+        }
+    }
+
+    /// The inverse of [`RemovalTarget::kind`] and [`RemovalTarget::id`].
+    pub fn parse(kind: &str, id: &str) -> Result<Self> {
+        let id = Uuid::parse_str(id).map_err(|e| StoreError::Metadata(Box::new(e)))?;
+        match kind {
+            "object" => Ok(Self::Object(id)),
+            "upload" => Ok(Self::Upload(id)),
+            other => Err(StoreError::Metadata(
+                format!("unknown pending removal kind {other}").into(),
+            )),
+        }
+    }
+}
+
 /// Result of [`MetadataStore::remove_disk`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoveDiskOutcome {
@@ -369,6 +411,17 @@ pub trait MetadataStore: Send + Sync {
     /// Whether the disk was removed with [`MetadataStore::remove_disk`] (it must not be
     /// registered again under the same identity).
     async fn is_disk_removed(&self, disk_id: DiskId) -> Result<bool>;
+    /// Remembers files that could not be deleted because their disk was unreachable; already
+    /// recorded ones are ignored. Rows of a disk are dropped with [`MetadataStore::remove_disk`].
+    async fn add_pending_removals(&self, items: &[PendingRemoval]) -> Result<()>;
+    /// Up to `limit` pending removals on a disk.
+    async fn list_pending_removals(
+        &self,
+        disk_id: DiskId,
+        limit: u32,
+    ) -> Result<Vec<PendingRemoval>>;
+    /// Forgets pending removals once done.
+    async fn delete_pending_removals(&self, items: &[PendingRemoval]) -> Result<()>;
     /// Records when repair noticed a disk down (`None` once it is back).
     async fn set_disk_down_since(&self, disk_id: DiskId, since: Option<i64>) -> Result<()>;
     /// Queues every object with a copy on the disk for repair; returns how many were queued.
