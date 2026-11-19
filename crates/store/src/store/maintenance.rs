@@ -508,6 +508,11 @@ impl Store {
             for target in targets {
                 loop {
                     let Some(source) = sources.first().cloned() else {
+                        // An object deleted or overwritten meanwhile loses its files: nothing
+                        // to repair then.
+                        if self.meta.get_object_by_id(id).await?.is_none() {
+                            return Ok(true);
+                        }
                         tracing::error!(object = %id, bucket = %stored.object.bucket, key = %stored.object.key,
                             "no healthy copy on a reachable disk; cannot repair");
                         report.unrecoverable += 1;
