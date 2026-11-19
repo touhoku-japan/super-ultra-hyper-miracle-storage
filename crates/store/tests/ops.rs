@@ -286,10 +286,18 @@ async fn force_removing_a_dead_disk_rereplicates_its_objects() {
 async fn a_removed_disk_left_in_the_config_is_not_registered_again() {
     let env = Env::new(4).await;
     let d1 = env.disk_id(1).await;
+    let meta = env.store.metadata();
+    let pending = suhms_store::meta::PendingRemoval {
+        disk_id: d1,
+        target: suhms_store::meta::RemovalTarget::Object(Uuid::new_v4()),
+    };
+    meta.add_pending_removals(&[pending]).await.unwrap();
     assert_eq!(
         env.store.remove_disk(d1, true).await.unwrap(),
         RemoveDiskOutcome::Removed { dropped: 0 }
     );
+    // Its pending removals go with it.
+    assert!(meta.list_pending_removals(d1, 10).await.unwrap().is_empty());
     // The node restarts with the disk still in its config.
     let restarted = Store::with_metadata(
         StoreConfig {

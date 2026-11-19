@@ -2064,6 +2064,14 @@ async fn every_table_gets_audit_timestamps() {
     .await
     .unwrap();
 
+    let disk = store.cluster_disks().await.unwrap()[0].id;
+    meta.add_pending_removals(&[suhms_store::meta::PendingRemoval {
+        disk_id: disk,
+        target: suhms_store::meta::RemovalTarget::Object(uuid::Uuid::new_v4()),
+    }])
+    .await
+    .unwrap();
+
     for table in [
         "tenants",
         "access_keys",
@@ -2074,6 +2082,7 @@ async fn every_table_gets_audit_timestamps() {
         "multipart_uploads",
         "multipart_parts",
         "usage_hourly",
+        "pending_removals",
         "schema_migrations",
     ] {
         let url = &env.meta_url;

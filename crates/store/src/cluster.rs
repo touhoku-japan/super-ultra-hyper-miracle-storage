@@ -151,27 +151,38 @@ impl DiskRef {
         }
     }
 
-    /// Best effort: failures are logged (an orphaned file only wastes space).
-    pub async fn remove(&self, dest: Dest) {
+    /// Best effort: failures are logged (an orphaned file only wastes space). Returns false when
+    /// a remote disk could not be asked (its node did not answer), so the caller may retry later.
+    pub async fn remove(&self, dest: Dest) -> bool {
         match self {
-            Self::Local(d) => blob::remove_path(&dest.path(d)).await,
-            Self::Remote { id, peer, .. } => {
-                if let Err(error) = peer.remove(*id, dest).await {
-                    tracing::warn!(disk = %self.label(), ?dest, %error, "remote remove failed");
-                }
-                let _ = id;
+            Self::Local(d) => {
+                blob::remove_path(&dest.path(d)).await;
+                true
             }
+            Self::Remote { id, peer, .. } => match peer.remove(*id, dest).await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(disk = %self.label(), ?dest, %error, "remote remove failed");
+                    false
+                }
+            },
         }
     }
 
-    pub async fn remove_upload(&self, upload: Uuid) {
+    /// Like [`DiskRef::remove`], for the parts directory of an upload.
+    pub async fn remove_upload(&self, upload: Uuid) -> bool {
         match self {
-            Self::Local(d) => blob::remove_upload_dir(d, upload).await,
-            Self::Remote { id, peer, .. } => {
-                if let Err(error) = peer.remove_upload(*id, upload).await {
-                    tracing::warn!(disk = %self.label(), %upload, %error, "remote upload cleanup failed");
-                }
+            Self::Local(d) => {
+                blob::remove_upload_dir(d, upload).await;
+                true
             }
+            Self::Remote { id, peer, .. } => match peer.remove_upload(*id, upload).await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(disk = %self.label(), %upload, %error, "remote upload cleanup failed");
+                    false
+                }
+            },
         }
     }
 
