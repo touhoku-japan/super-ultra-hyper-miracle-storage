@@ -1478,6 +1478,7 @@ impl S3 for S3Service {
         let tenant = self.tenant(&req, Class::A).await?;
         let expected = checksum::expected(&req.headers, req.trailing_headers.as_ref())?;
         let input = req.input;
+        let size_hint = input.content_length.and_then(|n| u64::try_from(n).ok());
         let condition = write_condition(input.if_match.as_ref(), input.if_none_match.as_ref())?;
         let policy = Algo::of(input.checksum_algorithm.as_ref())?
             .map_or(Policy::ClientOrDefault, Policy::Required);
@@ -1501,6 +1502,7 @@ impl S3 for S3Service {
             legal_hold: input
                 .object_lock_legal_hold_status
                 .is_some_and(|s| s.as_str() == ObjectLockLegalHoldStatus::ON),
+            size_hint,
             ..PutObjectRequest::default()
         };
         let rec = self

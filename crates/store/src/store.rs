@@ -112,6 +112,10 @@ pub struct PutObjectRequest {
     pub lock_mode: Option<String>,
     pub lock_until: Option<i64>,
     pub legal_hold: bool,
+    /// The body's size when known in advance (`Content-Length`, the source of a copy). Disks
+    /// without room for it plus [`StoreConfig::min_free_bytes`] get no copy (see
+    /// [`Store::place`]); without it only the minimum is required.
+    pub size_hint: Option<u64>,
 }
 
 /// Outcome of a DeleteObject.
@@ -530,7 +534,8 @@ impl Store {
     /// Opens a store that is part of a cluster; `peers` reaches the other nodes.
     pub async fn open_with_peers(config: StoreConfig, peers: Arc<dyn Peers>) -> Result<Self> {
         config.validate()?;
-        let meta = meta::connect(&config.metadata_url).await?;
+        let meta =
+            meta::connect_with(&config.metadata_url, config.metadata_max_connections).await?;
         Self::with_metadata(config, meta, peers).await
     }
 
@@ -929,9 +934,11 @@ impl Store {
         dest: Dest,
         count: usize,
         required: usize,
+        size: u64,
     ) -> Result<blob::Replicas> {
-        let targets = self.place(count, &[], &[], 0).await?;
-        self.open_replicas_on(dest, &targets, count, required).await
+        let targets = self.place(count, &[], &[], size).await?;
+        self.open_replicas_on(dest, &targets, count, required, size)
+            .await
     }
 
     /// Writes `body` into the open copies. Nodes whose copy failed (a remote copy that broke off
@@ -983,6 +990,7 @@ impl Store {
         targets: &[DiskRef],
         count: usize,
         required: usize,
+        size: u64,
     ) -> Result<blob::Replicas> {
         let mut copies = blob::Replicas::open(targets, dest).await;
         // Nodes where opening a copy failed: most likely down, so their other disks are not
@@ -1003,7 +1011,9 @@ impl Store {
                         .map(|i| i.id),
                 );
             }
-            let more = self.place(count - open.len(), &open, &exclude, 0).await?;
+            let more = self
+                .place(count - open.len(), &open, &exclude, size)
+                .await?;
             if more.is_empty() {
                 break;
             }
@@ -1288,7 +1298,12 @@ impl Store {
         }
         let id = Uuid::new_v4();
         let copies = self
-            .open_replicas(Dest::Object(id), usize::from(replicas), required)
+            .open_replicas(
+                Dest::Object(id),
+                usize::from(replicas),
+                required,
+                req.size_hint.unwrap_or(0),
+            )
             .await?;
         let outcome = self.write_copies(copies, required, body).await?;
         let written = StoredObject {
@@ -1415,6 +1430,7 @@ impl Store {
             dest.tags = Some(source.object.tags.clone());
         }
         dest.content_md5 = None;
+        dest.size_hint = Some(source.object.size);
         let mut reader = self.read_object(&source, 0..source.object.size).await?;
         if let Some(wrap) = wrap {
             reader = wrap(&source.object, reader);
@@ -1551,6 +1567,8 @@ impl Store {
                 &targets,
                 usize::from(upload.desired_replicas),
                 required,
+                // A part's disks were chosen when the upload started; its total size was unknown.
+                0,
             )
             .await?;
         let outcome = self.write_copies(copies, required, body).await?;

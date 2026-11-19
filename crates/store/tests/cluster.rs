@@ -8,7 +8,7 @@ use std::{
     ops::Range,
     path::PathBuf,
     sync::{
-        Arc, RwLock,
+        Arc, RwLock, Weak,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -109,7 +109,9 @@ impl Peer for CutPeer {
 
 #[derive(Default)]
 struct Registry {
-    nodes: RwLock<HashMap<String, Arc<Store>>>,
+    /// Weak: each store holds the registry as its peers; strong references both ways would
+    /// keep every store (and its database connections) alive after the test.
+    nodes: RwLock<HashMap<String, Weak<Store>>>,
     down: RwLock<HashSet<String>>,
     partitioned: RwLock<HashSet<String>>,
     /// Writes attempted to partitioned nodes.
@@ -124,7 +126,7 @@ impl Peers for Registry {
         if self.partitioned.read().unwrap().contains(node_id) {
             return Some(Arc::new(CutPeer(Arc::clone(&self.cut_opens))));
         }
-        let store = self.nodes.read().unwrap().get(node_id).cloned()?;
+        let store = self.nodes.read().unwrap().get(node_id)?.upgrade()?;
         Some(Arc::new(InProcPeer(store)))
     }
 }
@@ -157,6 +159,7 @@ impl Cluster {
                 node_id: id.clone(),
                 disks: disks.clone(),
                 metadata_url: meta.clone(),
+                metadata_max_connections: common::MAX_CONNECTIONS,
                 ..StoreConfig::default()
             };
             let store = Arc::new(
@@ -168,7 +171,7 @@ impl Cluster {
                 .nodes
                 .write()
                 .unwrap()
-                .insert(id.clone(), store.clone());
+                .insert(id.clone(), Arc::downgrade(&store));
             node_disks.insert(id, disks);
             nodes.push(store);
         }
@@ -1018,4 +1021,50 @@ async fn nearly_full_disks_get_no_new_copies() {
     // Repair has nowhere to put the third copy either.
     let r = c.nodes[0].repair().await.unwrap();
     assert_eq!(r.copied, 0, "{r:?}");
+}
+
+/// A PUT whose size is known (`Content-Length`, a copy's source) needs room for the object on
+/// top of `min_free_bytes`: disks that have the minimum but not the object's size are skipped.
+#[tokio::test]
+async fn a_known_size_keeps_copies_off_disks_without_room_for_it() {
+    let c = Cluster::start().await;
+    c.nodes[0].create_bucket(OWNER, "data", None).await.unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let node3: Vec<DiskId> = c
+        .disk_node
+        .iter()
+        .filter(|(_, n)| *n == "node3")
+        .map(|(d, _)| *d)
+        .collect();
+    // 3 GiB free on each disk of node3: above the 1 GiB minimum.
+    for d in &node3 {
+        c.nodes[0]
+            .metadata()
+            .heartbeat_disk(*d, 3 << 30, now)
+            .await
+            .unwrap();
+    }
+    c.refresh().await;
+    let sized = |key: &str, size: u64| PutObjectRequest {
+        size_hint: Some(size),
+        ..put("data", key)
+    };
+
+    // 1 GiB fits (1 + 1 <= 3); 4 GiB does not, so node3 is left out.
+    c.nodes[0]
+        .put_object(OWNER, sized("small", 1 << 30), &b"x"[..])
+        .await
+        .unwrap();
+    assert_eq!(
+        c.nodes_holding("data", "small").await,
+        vec!["node1", "node2", "node3"]
+    );
+    c.nodes[0]
+        .put_object(OWNER, sized("big", 4 << 30), &b"x"[..])
+        .await
+        .unwrap();
+    assert_eq!(c.nodes_holding("data", "big").await, vec!["node1", "node2"]);
 }

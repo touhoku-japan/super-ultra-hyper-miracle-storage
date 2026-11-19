@@ -23,6 +23,9 @@ metadata_url = "sqlite:///var/lib/suhms/meta.db"
 default_replicas = 3
 # 空き容量がこれより少ないディスクには新しいコピーを置かない（0 で無効）。repair はさらにオブジェクトのサイズ分を要求する
 min_free_bytes = 1073741824
+# PostgreSQL / MariaDB の接続プールの大きさ（プロセスごと）。DB 側の max_connections は
+# 「ノード数 × この値」に管理コマンドの分を足した数より大きくしておくこと
+metadata_max_connections = 16
 
 # S3 のストレージクラス名 → レプリカ数
 [storage.storage_classes]

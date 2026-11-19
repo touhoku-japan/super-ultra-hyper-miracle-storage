@@ -98,6 +98,7 @@ impl Server {
                 disks: disk_paths.clone(),
                 metadata_url: metadata_url(dir.path()).await,
                 default_replicas: u8::try_from(disks.min(3)).unwrap(),
+                metadata_max_connections: MAX_CONNECTIONS,
                 ..StoreConfig::default()
             },
             s3: S3Config {
@@ -355,6 +356,11 @@ pub fn signed_with_payload_hash(
 /// `SUHMS_TEST_POSTGRES` (e.g. `postgres://postgres:pw@127.0.0.1:5432`) or `SUHMS_TEST_MYSQL`
 /// (e.g. `mysql://root:pw@127.0.0.1:3306`), otherwise a SQLite file in `dir` (as in the store
 /// crate's tests).
+/// Connection pool size for test stores on PostgreSQL / MariaDB. Tests run in parallel and a
+/// cluster test opens three stores, so the default pool size would add up to more connections
+/// than a database server allows by default (100 for PostgreSQL).
+pub const MAX_CONNECTIONS: u32 = 4;
+
 pub async fn metadata_url(dir: &std::path::Path) -> String {
     use sqlx::{AssertSqlSafe, Connection};
     let db = format!("t{}", uuid::Uuid::new_v4().simple());

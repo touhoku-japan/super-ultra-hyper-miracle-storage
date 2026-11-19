@@ -119,6 +119,7 @@ impl Cluster {
                     node_id: id.clone(),
                     disks: disks.clone(),
                     metadata_url: meta.clone(),
+                    metadata_max_connections: common::MAX_CONNECTIONS,
                     ..StoreConfig::default()
                 },
                 s3: S3Config {

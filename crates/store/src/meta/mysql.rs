@@ -105,11 +105,12 @@ impl MysqlMetadata {
         Ok((parts, removed))
     }
 
-    pub async fn connect(url: &str) -> Result<Self> {
+    /// `max_connections`: size of the connection pool.
+    pub async fn connect(url: &str, max_connections: u32) -> Result<Self> {
         // Fail fast while the database is down instead of holding requests for sqlx's default
         // 30 s per query (requests that touch the database several times took minutes).
         let pool = MySqlPoolOptions::new()
-            .max_connections(16)
+            .max_connections(max_connections)
             .acquire_timeout(ACQUIRE_TIMEOUT)
             .connect(url)
             .await?;
