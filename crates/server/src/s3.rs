@@ -271,6 +271,16 @@ fn s3_err(e: StoreError) -> S3Error {
             tracing::error!(error = %e, source = ?std::error::Error::source(&e), "metadata database unavailable");
             s3_error!(ServiceUnavailable)
         }
+        e @ StoreError::InsufficientStorage { .. } => {
+            tracing::warn!(error = %e, "out of storage space");
+            // 507 like MinIO's XMinioStorageFull: not a status S3 clients retry, unlike 503.
+            let mut err = S3Error::with_message(
+                S3ErrorCode::Custom("InsufficientStorage".into()),
+                "The cluster does not have enough free space to store the object.",
+            );
+            err.set_status_code(axum::http::StatusCode::INSUFFICIENT_STORAGE);
+            err
+        }
         e @ (StoreError::WriteQuorum { .. }
         | StoreError::NoHealthyReplica(_)
         | StoreError::NoDisks) => {
@@ -1685,6 +1695,7 @@ impl S3 for S3Service {
                 part_number(input.part_number)?,
                 parse_md5(input.content_md5.as_deref())?,
                 Some(slot),
+                input.content_length.and_then(|n| u64::try_from(n).ok()),
                 body,
             )
             .await

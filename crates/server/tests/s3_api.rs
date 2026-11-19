@@ -639,3 +639,21 @@ async fn keys_with_control_characters_are_rejected() {
     assert_eq!(resp.status, 200, "{}", resp.text());
     assert_eq!(xml_values(&resp.text(), "Key").len(), 2);
 }
+
+/// A cluster out of space answers 507 (not retried by S3 clients), not a retryable 503.
+#[tokio::test]
+async fn writes_without_room_get_507() {
+    let srv = Server::start_with(1, |c| c.storage.min_free_bytes = u64::MAX / 2).await;
+    let (_, c) = srv.tenant("acme").await;
+    srv.s3(&c, "PUT", "/bk1", &[], &[], vec![]).await;
+    let resp = srv.s3(&c, "PUT", "/bk1/k", &[], &[], data(1000)).await;
+    assert_eq!(resp.status, 507, "{}", resp.text());
+    assert_eq!(
+        xml_values(&resp.text(), "Code"),
+        vec!["InsufficientStorage"]
+    );
+    let resp = srv
+        .s3(&c, "POST", "/bk1/mp", &[("uploads", "")], &[], vec![])
+        .await;
+    assert_eq!(resp.status, 507, "{}", resp.text());
+}
