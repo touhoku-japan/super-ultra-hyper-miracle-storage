@@ -39,6 +39,21 @@ pub trait Peer: Send + Sync {
         size: u64,
         range: Range<u64>,
     ) -> io::Result<BoxReader>;
+    /// Reads a whole part file of a multipart upload, whose size must be `size`. Used to copy a
+    /// part to a disk that missed it, so that the upload can still be completed there.
+    async fn read_part(
+        &self,
+        disk: DiskId,
+        upload: Uuid,
+        blob: Uuid,
+        size: u64,
+    ) -> io::Result<BoxReader> {
+        let _ = (disk, upload, blob, size);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "reading parts from this node is not supported",
+        ))
+    }
     async fn remove(&self, disk: DiskId, dest: Dest) -> io::Result<()>;
     async fn remove_upload(&self, disk: DiskId, upload: Uuid) -> io::Result<()>;
     /// Concatenates parts into an object file on that disk; returns the object's BLAKE3.
@@ -46,9 +61,13 @@ pub trait Peer: Send + Sync {
         &self,
         disk: DiskId,
         upload: Uuid,
-        parts: Vec<(Uuid, String)>,
+        parts: Vec<blob::JoinPart>,
         object: Uuid,
     ) -> io::Result<String>;
+    /// Checks that the node answers (with a short timeout).
+    async fn ping(&self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Looks up the peer serving a node.
@@ -123,34 +142,54 @@ impl DiskRef {
         }
     }
 
-    /// Best effort: failures are logged (an orphaned file only wastes space).
-    pub async fn remove(&self, dest: Dest) {
+    pub async fn read_part(&self, upload: Uuid, blob: Uuid, size: u64) -> io::Result<BoxReader> {
         match self {
-            Self::Local(d) => blob::remove_path(&dest.path(d)).await,
-            Self::Remote { id, peer, .. } => {
-                if let Err(error) = peer.remove(*id, dest).await {
-                    tracing::warn!(disk = %self.label(), ?dest, %error, "remote remove failed");
-                }
-                let _ = id;
+            Self::Local(d) => {
+                blob::read_local_path(&d.part_path(upload, blob), size, 0..size).await
             }
+            Self::Remote { id, peer, .. } => peer.read_part(*id, upload, blob, size).await,
         }
     }
 
-    pub async fn remove_upload(&self, upload: Uuid) {
+    /// Best effort: failures are logged (an orphaned file only wastes space). Returns false when
+    /// a remote disk could not be asked (its node did not answer), so the caller may retry later.
+    pub async fn remove(&self, dest: Dest) -> bool {
         match self {
-            Self::Local(d) => blob::remove_upload_dir(d, upload).await,
-            Self::Remote { id, peer, .. } => {
-                if let Err(error) = peer.remove_upload(*id, upload).await {
-                    tracing::warn!(disk = %self.label(), %upload, %error, "remote upload cleanup failed");
-                }
+            Self::Local(d) => {
+                blob::remove_path(&dest.path(d)).await;
+                true
             }
+            Self::Remote { id, peer, .. } => match peer.remove(*id, dest).await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(disk = %self.label(), ?dest, %error, "remote remove failed");
+                    false
+                }
+            },
+        }
+    }
+
+    /// Like [`DiskRef::remove`], for the parts directory of an upload.
+    pub async fn remove_upload(&self, upload: Uuid) -> bool {
+        match self {
+            Self::Local(d) => {
+                blob::remove_upload_dir(d, upload).await;
+                true
+            }
+            Self::Remote { id, peer, .. } => match peer.remove_upload(*id, upload).await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(disk = %self.label(), %upload, %error, "remote upload cleanup failed");
+                    false
+                }
+            },
         }
     }
 
     pub async fn concat(
         &self,
         upload: Uuid,
-        parts: Vec<(Uuid, String)>,
+        parts: Vec<blob::JoinPart>,
         object: Uuid,
     ) -> io::Result<String> {
         match self {

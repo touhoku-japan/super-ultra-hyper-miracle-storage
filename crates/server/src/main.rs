@@ -110,12 +110,41 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn serve(config: Config) -> anyhow::Result<()> {
+    // Before anything starts: with an expired certificate the node would be cut off.
+    let cert_not_after = match &config.cluster.tls {
+        Some(tls) if config.cluster.is_enabled() => Some(suhms_server::tls::check_node_cert(tls)?),
+        _ => None,
+    };
     let cipher = Arc::new(SecretCipher::load(&config.auth)?);
     let store = Arc::new(suhms_server::cluster::open_store(&config).await?);
     store.clear_tmp().await;
 
     let tenancy = suhms_server::tenancy(Arc::clone(&store), &config);
-    spawn_maintenance(&config, &store, &tenancy);
+    let jobs = Arc::new(suhms_server::jobs::Jobs::from_config(
+        Arc::clone(&store),
+        &config,
+    ));
+    if let Err(error) = jobs.recover().await {
+        tracing::warn!(%error, "cannot mark interrupted maintenance jobs");
+    }
+    spawn_maintenance(&config, &store, &tenancy, &jobs);
+    if let Some(not_after) = cert_not_after {
+        tenancy
+            .cluster_cert_not_after
+            .store(not_after, std::sync::atomic::Ordering::Relaxed);
+        // A renewed certificate is picked up on restart; meanwhile keep reminding.
+        every(
+            std::time::Duration::from_secs(6 * 3600),
+            "certificate check",
+            move || async move {
+                suhms_server::tls::warn_if_expiring(
+                    not_after,
+                    time::OffsetDateTime::now_utc().unix_timestamp(),
+                );
+                Ok(())
+            },
+        );
+    }
 
     if let Some(addr) = config.admin.listen {
         let token = config.admin.load_token()?;
@@ -123,6 +152,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             Arc::clone(&store),
             Arc::clone(&tenancy),
             Arc::clone(&cipher),
+            Arc::clone(&jobs),
             &token,
             &config,
         );
@@ -130,7 +160,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         tracing::info!(%addr, ui = config.admin.ui, "admin API up");
         tokio::spawn(async move {
             if let Err(error) = axum::serve(
-                listener,
+                nodelay(listener),
                 admin.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .with_graceful_shutdown(shutdown_signal())
@@ -166,7 +196,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             None => {
                 tracing::warn!(%addr, "cluster listener up WITHOUT TLS; protect node-to-node traffic with a private network");
                 tokio::spawn(async move {
-                    if let Err(error) = axum::serve(listener, internal)
+                    if let Err(error) = axum::serve(nodelay(listener), internal)
                         .with_graceful_shutdown(shutdown_signal())
                         .await
                     {
@@ -201,7 +231,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         tracing::info!(%addr, "customer console up");
         tokio::spawn(async move {
             if let Err(error) = axum::serve(
-                listener,
+                nodelay(listener),
                 console.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .with_graceful_shutdown(shutdown_signal())
@@ -214,7 +244,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 
     let listener = TcpListener::bind(config.server.listen).await?;
     tracing::info!(addr = %listener.local_addr()?, "listening");
-    axum::serve(listener, app)
+    axum::serve(nodelay(listener), app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     if let Err(error) = tenancy.meter.flush(&store).await {
@@ -222,6 +252,19 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     }
     tracing::info!("shut down cleanly");
     Ok(())
+}
+
+/// Accepted connections get `TCP_NODELAY`: without it, a small response written in two pieces
+/// (headers, then body) on a keep-alive connection waits for the client's delayed ACK (~40 ms).
+fn nodelay(
+    listener: TcpListener,
+) -> axum::serve::TapIo<TcpListener, fn(&mut tokio::net::TcpStream)> {
+    use axum::serve::ListenerExt;
+    listener.tap_io(|tcp| {
+        if let Err(error) = tcp.set_nodelay(true) {
+            tracing::warn!(%error, "cannot set TCP_NODELAY");
+        }
+    })
 }
 
 /// Runs `job` every `period` (first run after one period) in the background.
@@ -250,6 +293,7 @@ fn spawn_maintenance(
     config: &Config,
     store: &Arc<suhms_store::Store>,
     tenancy: &Arc<suhms_server::tenancy::Tenancy>,
+    jobs: &Arc<suhms_server::jobs::Jobs>,
 ) {
     use std::time::Duration;
     let m = &config.maintenance;
@@ -265,77 +309,21 @@ fn spawn_maintenance(
         let (s, t) = (Arc::clone(&s), Arc::clone(&t));
         async move { Ok(t.meter.flush(&s).await?) }
     });
-    let s = Arc::clone(store);
-    every(secs(m.scrub_interval_secs), "scrub", move || {
-        let s = Arc::clone(&s);
-        async move {
-            let r = s.scrub().await?;
-            tracing::info!(checked = r.checked, removed = r.removed, "scrub finished");
-            Ok(())
-        }
-    });
-    let (s, gc) = (
-        Arc::clone(store),
-        suhms_store::GcOptions {
-            grace: secs(m.gc_grace_secs),
-            force: false,
-        },
-    );
-    every(secs(m.gc_interval_secs), "gc", move || {
-        let s = Arc::clone(&s);
-        async move {
-            let r = s.gc(gc).await?;
-            if r != suhms_store::GcReport::default() {
-                tracing::info!(
-                    orphans = r.orphans,
-                    orphan_bytes = r.orphan_bytes,
-                    uploads = r.uploads,
-                    tmp = r.tmp,
-                    purged = r.purged,
-                    skipped_disks = r.skipped_disks,
-                    "garbage collection finished"
-                );
-            }
-            Ok(())
-        }
-    });
-    // Every node tries; the lease lets one at a time run, so repair survives losing a node.
-    for (period, full, name) in [
-        (m.repair_interval_secs, false, "repair"),
-        (m.full_repair_interval_secs, true, "full repair"),
+    // Scrub and gc work on this node's disks. Repair runs on every node; the lease lets one at
+    // a time do the work, so repair survives losing a node. Runs are recorded for the console
+    // (`jobs.rs`).
+    for (period, name) in [
+        (m.scrub_interval_secs, "scrub"),
+        (m.gc_interval_secs, "gc"),
+        (m.repair_interval_secs, "repair"),
+        (m.full_repair_interval_secs, "repair-full"),
     ] {
-        let s = Arc::clone(store);
+        let jobs = Arc::clone(jobs);
         every(secs(period), name, move || {
-            let s = Arc::clone(&s);
+            let jobs = Arc::clone(&jobs);
             async move {
-                let r = if full {
-                    s.repair_full().await
-                } else {
-                    s.repair().await
-                };
-                match r {
-                    Ok(r) => {
-                        if r != suhms_store::RepairReport::default() {
-                            tracing::info!(
-                                job = name,
-                                copied = r.copied,
-                                trimmed = r.trimmed,
-                                drained = r.drained,
-                                queued = r.queued,
-                                postponed = r.postponed,
-                                resumed = r.resumed,
-                                unrecoverable = r.unrecoverable,
-                                "repair finished"
-                            );
-                        }
-                        Ok(())
-                    }
-                    Err(suhms_store::StoreError::Busy(reason)) => {
-                        tracing::debug!(job = name, %reason, "skipped");
-                        Ok(())
-                    }
-                    Err(e) => Err(e.into()),
-                }
+                jobs.run_scheduled(name).await?;
+                Ok(())
             }
         });
     }
@@ -353,43 +341,27 @@ fn spawn_maintenance(
             Ok(())
         }
     });
-    let (s, rate) = (Arc::clone(store), m.checksum_backfill_mib_per_sec);
-    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (jobs, finished) = (
+        Arc::clone(jobs),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
     every(
         secs(m.checksum_backfill_interval_secs),
         "checksum backfill",
         move || {
-            let (s, finished) = (Arc::clone(&s), Arc::clone(&finished));
+            let (jobs, finished) = (Arc::clone(&jobs), Arc::clone(&finished));
             async move {
                 use std::sync::atomic::Ordering;
                 if finished.load(Ordering::Relaxed) {
                     return Ok(());
                 }
-                let options = suhms_server::backfill::BackfillOptions {
-                    max_objects: None,
-                    bytes_per_sec: (rate > 0).then_some(rate << 20),
-                };
-                match suhms_server::backfill::backfill_checksums(&s, options).await {
-                    Ok(r) if r.is_idle() => {
-                        // New uploads always get a checksum, so there is nothing more to do.
-                        finished.store(true, Ordering::Relaxed);
-                        Ok(())
-                    }
-                    Ok(r) => {
-                        tracing::info!(
-                            updated = r.updated,
-                            corrupt = r.corrupt,
-                            failed = r.failed,
-                            "checksum backfill finished"
-                        );
-                        Ok(())
-                    }
-                    Err(suhms_store::StoreError::Busy(reason)) => {
-                        tracing::debug!(%reason, "checksum backfill skipped");
-                        Ok(())
-                    }
-                    Err(e) => Err(e.into()),
+                if let Some(r) = jobs.run_scheduled("checksum-backfill").await?
+                    && suhms_server::jobs::is_idle(&r)
+                {
+                    // New uploads always get a checksum, so there is nothing more to do.
+                    finished.store(true, Ordering::Relaxed);
                 }
+                Ok(())
             }
         },
     );
@@ -426,14 +398,35 @@ fn spawn_maintenance(
 }
 
 fn init_tracing(config: &Config) {
+    use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
+    // `RUST_LOG` replaces the configured filter entirely (and shows the events dropped below).
+    let from_env = EnvFilter::try_from_default_env().ok();
+    let quiet_s3s = from_env.is_none();
     // The audit trail stays on whatever the general level is.
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("{},suhms::audit=info", config.log.level)));
-    let builder = fmt().with_env_filter(filter).with_writer(std::io::stderr);
-    match config.log.format {
-        LogFormat::Pretty => builder.init(),
-        LogFormat::Json => builder.json().init(),
-    }
+    let filter = from_env
+        .unwrap_or_else(|| EnvFilter::new(format!("{},suhms::audit=info", config.log.level)));
+    let fmt = fmt::layer().with_writer(std::io::stderr);
+    let fmt = match config.log.format {
+        LogFormat::Pretty => fmt.boxed(),
+        LogFormat::Json => fmt.json().boxed(),
+    };
+    tracing_subscriber::registry()
+        .with(
+            fmt.with_filter(filter)
+                .with_filter(tracing_subscriber::filter::filter_fn(move |meta| {
+                    !(quiet_s3s && is_s3s_request_error(meta))
+                })),
+        )
+        .init();
+}
+
+/// `s3s` logs every request it rejects (bad signature, invalid bucket name, ...) at ERROR,
+/// twice (`s3s::ops`). Those are client errors, already visible in the audit log with their
+/// status, and they would drown real errors in monitoring that watches ERROR. It also logs every
+/// 5xx response at ERROR with the whole response (`s3s::service`), including the expected 507 of
+/// a full cluster; suhms logs the cause itself, and TraceLayer reports every 5xx at WARN.
+fn is_s3s_request_error(meta: &tracing::Metadata<'_>) -> bool {
+    *meta.level() == tracing::Level::ERROR && matches!(meta.target(), "s3s::ops" | "s3s::service")
 }
 
 /// Resolves on Ctrl+C or SIGTERM (systemd stop) so in-flight requests can finish.

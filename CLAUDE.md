@@ -5,25 +5,51 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
 
 ## コマンド
 
-- テスト: `CARGO_BUILD_JOBS=1 cargo test --workspace`
+- テスト: `cargo test --workspace`（SQLite）。`SUHMS_TEST_POSTGRES` / `SUHMS_TEST_MYSQL` を設定すると store と server のテストを
+  PostgreSQL / MariaDB で実行する（テストごとに DB を作る。手順は下の「開発ホスト」、CI では `metadata-backends` ジョブ）
 - Lint: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings`
 - Web コンソール（`web/`）: `npm ci && npm test && npm run build`。出力 `web/dist/` は `crates/server/build.rs` がバイナリに埋め込む
   （無ければ案内ページ。`SUHMS_REQUIRE_WEB=1` で必須にできる）。詳細は `docs/webui.md`
 - ブラウザ E2E（`web/e2e/`、Playwright）: `npm run build` → `cargo build -p suhms-server` → `cd web && npm run e2e`。
   本物の `suhms serve` を一時ディレクトリで起動して顧客用・運用者用コンソールを操作する。ブラウザは初回に
-  `npx playwright install chromium-headless-shell`（このホストは cups-libs を入れ済みで動く）
-- 起動: `cargo run -p suhms-server -- -c config.toml serve`（`GET /super-ultra-hyper-miracle-storage/health` で疎通確認。認証不要）
+  `npx playwright install chromium-headless-shell`（AlmaLinux 10 は公式対応外だが ubuntu24.04 向けのビルドが動く。
+  必要なライブラリは下の「開発ホスト」を参照）
+- 起動: `cargo run -p suhms-server -- -c config.toml serve`（`GET /super-ultra-hyper-miracle-storage/health` で疎通確認。認証不要。健全なディスクが無いかメタデータ DB が 2 秒以内に応答しなければ 503。結果は 1 秒再利用）
 - 管理: `suhms gen-master-key` / `suhms tenant create|list` / `suhms key create|list|disable|enable` /
   `suhms bucket set-replicas <bucket> <n|default>` / `suhms scrub` / `suhms repair [--quick]` / `suhms gc [--grace-secs N] [--force]` /
   `suhms rebalance [--margin-gib N] [--max-moves N]` / `suhms checksum-backfill [--max-objects N] [--mib-per-sec N]` / `suhms disk list|drain|undrain|remove [--force]` / `suhms node drain|undrain|remove [--force]`
   - tenant/key/disk/node 系はメタデータ DB だけを触るので、サーバ稼働中に実行してよい
   - ディスクの一時ファイル掃除（`Store::clear_tmp`）は `serve` 起動時のみ。管理コマンドは掃除しない（稼働中サーバの書き込み中ファイルを消さないため）
 
-開発ホストは 2 コア / 2.9GB RAM で他アプリと共有しているため、ビルドは `CARGO_BUILD_JOBS=1` で行う。
-release ビルドは CI 側で行う想定。aws-sdk-s3 のような巨大クレートはこのホストでのビルドが重いので dev-dependency に入れない。
-実クライアントでの互換確認はホストにある `rclone`（環境変数 `RCLONE_CONFIG_S_*` で設定、`force_path_style=true`）か、
-AWS CLI v2 で `scripts/awscli-compat.sh` を実行する（主要操作を一通り叩いて PASS/FAIL を出す。パス形式のアドレッシングが必要）。
-AWS CLI はホストにシステムインストールしていないので、公式インストーラで `-i <dir> -b <dir>` を指定し任意のディレクトリに入れて使う。
+### 開発ホスト
+
+- AlmaLinux 10 / 24 コア / 62GB RAM。ビルド並列数の制限は不要。release ビルドは CI 側で行う想定。
+  aws-sdk-s3 のような巨大クレートはビルドが重い（CI 時間も延びる）ので dev-dependency に入れない
+- **このホスト（melchior）は別プロジェクト `/root/managed-hapgsql` の検証用環境の Patroni ノード（3 台構成、192.168.10.211〜213 の 1 台、:5432）を兼ねている。
+  suhms のテストでは使わない・設定を変えない**（pg_hba.conf はローカルの `postgres` peer と特定ロール以外を拒否している。構成は同プロジェクトの Ansible が管理）
+- PostgreSQL のテスト: インストール済みの `/usr/pgsql-18/bin` で使い捨てクラスタを別ディレクトリ・別ポートに立てる。
+  `initdb` は root で動かないので `sudo -u postgres` で実行し、データディレクトリは `postgres` が書ける場所に置く。
+  Unix ソケットはパス長制限（107 バイト）に当たりやすいので `unix_socket_directories=''` で TCP のみにする。
+  例: `initdb -D <dir> -U suhms --auth=trust` → `pg_ctl -D <dir> -o "-p 55432 -c listen_addresses=127.0.0.1 -c unix_socket_directories='' -c fsync=off" -w start`
+  → `SUHMS_TEST_POSTGRES=postgres://suhms@127.0.0.1:55432 cargo test -p suhms-store -p suhms-server` → `pg_ctl -D <dir> stop`
+- MariaDB のテスト: podman（インストール済み）で CI と同じ `mariadb:11` を動かす。
+  `podman run -d --name suhms-test-mariadb -p 127.0.0.1:33306:3306 -e MARIADB_ROOT_PASSWORD=pw docker.io/library/mariadb:11`
+  →（ログに `ready for connections` が 2 回出るまで待つ）→ `SUHMS_TEST_MYSQL=mysql://root:pw@127.0.0.1:33306 cargo test -p suhms-store -p suhms-server`
+  → `podman rm -f suhms-test-mariadb`
+- Node / npm・AWS CLI・rclone はシステムに入っていない。Node は nodejs.org の LTS の tarball（`linux-x64.tar.xz`。
+  `SHASUMS256.txt` で検証）を任意のディレクトリに展開して `PATH` に足す。AWS CLI v2 は公式インストーラで
+  `-i <dir> -b <dir>` を指定して任意のディレクトリに入れる
+- Playwright のブラウザ用に dnf で入れたライブラリ: atk, at-spi2-atk, at-spi2-core, libXcomposite, libXdamage, libXfixes,
+  libXrandr, mesa-libgbm, libxkbcommon, alsa-lib（足りなければ `ldd <chrome-headless-shell> | grep 'not found'` で確認）
+- 実クライアントでの互換確認は AWS CLI v2 で `scripts/awscli-compat.sh` を実行する（主要操作を一通り叩いて PASS/FAIL を出す。
+  パス形式のアドレッシングが必要）。稼働中の suhms が要るので、一時ディレクトリにディスク 3 つと SQLite の設定を作り、
+  `gen-master-key` / `tenant create` / `key create` してから `serve` する。rclone を使うなら環境変数
+  `RCLONE_CONFIG_S_*` で設定し `force_path_style=true`
+- CPU は Xeon E5-2697 v2（SHA-NI・AVX2 なし）。負荷試験の数値は本番機より悪く出る。PUT の CPU の内訳（2026-11-19、平文 HTTP の
+  AWS CLI、3 ノード・mTLS）は SigV4 の本文 SHA-256（s3s。クライアントが署名付きペイロードを送るときだけ。HTTPS では AWS CLI は
+  UNSIGNED-PAYLOAD）約 2.5 割、BLAKE3 約 1.3 割（受信時と、マルチパート完了時の連結でオブジェクトのハッシュ）、
+  ノード間 TLS の AES-GCM 約 2 割、MD5 約 1 割
+- 192.168.10.220（vm-gate01）/ 192.168.10.221（vm-gate02）は managed-hapgsql の検証用環境の PgBouncer（2026-11-19 追加）。suhms とは無関係
 
 ## 構成
 
@@ -46,8 +72,17 @@ AWS CLI はホストにシステムインストールしていないので、公
       `crc_fast::checksum_combine` で合成。データは読み直さない）を求める。コピーは要求されたアルゴリズム、
       無ければコピー元のアルゴリズムで計算し直す
     - `cluster.rs` — ノード間 API（`[cluster] listen` の別リスナー、`x-suhms-node-auth` の HMAC 認証）と
-      `HttpPeer`（`reqwest`）。`open_store` がクラスタ構成ならピア付きで Store を開く
-    - `tls.rs` — ノード間の相互 TLS（`[cluster.tls]`）。rustls（暗号プロバイダは `ring`。aws-lc はビルドが重いので使わない）。
+      `HttpPeer`（`reqwest`）。`open_store` がクラスタ構成ならピア付きで Store を開く。
+      ピアへの要求には全体のタイムアウトを付けない（大きい転送や連結は時間がかかる）代わりに、待っている間は 5 秒ごとに ping し
+      （`HttpPeer::alive`、`LIVENESS_INTERVAL`）、ping に失敗したら打ち切る。固まったプロセスは TCP 接続だけは受け付けるので、
+      これが無いと要求が永久に待つ。書き込みに失敗したノードは `Store::write_copies` がすぐ ping し、次の書き込みから外す
+    - `main.rs` — 全リスナーで受け付けた接続に TCP_NODELAY を設定（`nodelay`。無いとキープアライブ接続の小さい応答が遅延 ACK で約 40ms 待つ）。
+      s3s が拒否したリクエスト（署名不一致・不正なバケット名等のクライアントエラー）を `s3s::ops` の ERROR で 2 行ずつ出すので、
+      そのターゲットの ERROR は捨てる（`is_s3s_request_error`。状態コードは監査ログに残る。`RUST_LOG` を指定したときは捨てない）。
+      `s3s::service` が 5xx の応答を丸ごと ERROR で出すもの（容量不足の 507 も含む）も同じく捨てる（原因は suhms が出す）。
+      TraceLayer の 5xx の報告（`response failed`）は WARN にする（原因は S3 サービスが ERROR で出すので二重になるため）
+    - `drain.rs` — S3 がリクエスト本文を読まずにエラーを返したとき、残りが 1 MiB 以下なら読み捨ててから応答する（読まずに閉じるとクライアントには `SlowDown` 等より先に BrokenPipe が見える）。`Expect: 100-continue` のリクエストは対象外
+    - `tls.rs` — ノード間の相互 TLS（`[cluster.tls]`）。起動時に自ノードの証明書の有効期間を検査し（`check_node_cert`。X.509 パーサは使わず DER を直接読む）、期限切れなら起動しない。30 日前から警告、期限は `/metrics` に出す。rustls（暗号プロバイダは `ring`。aws-lc はビルドが重いので使わない）。
       クラスタ CA が署名したクライアント証明書を必須にし、サーバ証明書も同じ CA でだけ検証する。HMAC 認証は残す。
       `TlsListener` はハンドシェイクを別タスクで行う `axum::serve` 用リスナー。手順は `docs/cluster-tls.md`
     - `tenancy.rs` — アクセスキー/テナントの 10 秒キャッシュ（`Directory`。管理 API での変更は同ノードで即時無効化）、
@@ -56,23 +91,43 @@ AWS CLI はホストにシステムインストールしていないので、公
     - `admin_api.rs` — SoraHost ポータル用の管理 API（`[admin] listen`、Bearer トークン）。`/metrics` だけ認証なし。
       運用者用 Web コンソール（`/ui/`）も配信し、管理トークンで発行したセッション cookie も受け付ける（書き込みは CSRF ヘッダ必須）。
       ディスク / ノードの drain・remove、概要、メンテナンスジョブ（`jobs.rs`、そのノードのプロセス内で実行）の API もここ
+    - `jobs.rs` — メンテナンスジョブ（scrub / repair / gc / rebalance / checksum-backfill）の実行。`[maintenance]` の定期実行も
+      コンソールからの開始もここを通り、`job_runs` テーブル（ノード × ジョブごとに最後の 1 回、実行中は heartbeat）に記録する。
+      どのノードのコンソールからも全ノードの状態が見える
     - `console.rs` — 顧客用 Web コンソール（`[console] listen`）。アクセスキーでログインし、`/s3/...` へのブラウザのリクエストを
       セッションのキーで SigV4 署名（`sigv4.rs`）して S3 サービスをプロセス内で呼ぶプロキシ。応答は常に attachment + sandbox CSP。
       **S3 と同じホスト名で公開しない**（公開バケットの HTML がセッションを使えてしまう）
     - `session.rs` — コンソールのセッション（HMAC 署名の cookie、サーバ側に状態なし）、CSRF 判定、ログイン試行制限、セキュリティヘッダ
     - `web.rs` — 埋め込んだ `web/dist` の配信（`build.rs` が生成）
     - `admin.rs` — 管理サブコマンド
-    - `tests/` — `common/mod.rs` の自前 SigV4 署名器で、実ルータを in-process で叩く E2E テスト
+    - `tests/` — `common/mod.rs` の自前 SigV4 署名器で、実ルータを in-process で叩く E2E テスト。メタデータ DB は `common::metadata_url`
+      （store のテストと同じく `SUHMS_TEST_POSTGRES` / `SUHMS_TEST_MYSQL` で切り替え）
   - `store/` — ストレージエンジン
     - `disk.rs` — ディスク = 既存ディレクトリ。`.suhms/format.json` の UUID で識別（マウント順が変わっても同一視）。
       ルートが無ければ作らない（未マウント時にルート FS へ書くのを防ぐ）。中身のある未フォーマットのディレクトリは使わない
-    - `placement.rs` — 配置（別ノード優先 → 同ノード別ディスク、空き容量の多い順）と ACK 閾値（過半数）
-    - `blob.rs` — 全レプリカへの同時ストリーミング書き込み（MD5=ETag と BLAKE3 を同時計算）、検証付きコピー
+    - `placement.rs` — 配置（別ノード優先 → 同ノード別ディスク、空き容量の多い順）と ACK 閾値（過半数）。
+      空き容量が最大のディスクから 5% 以内のディスクは同等とみなしてランダムに選ぶ（空き容量は heartbeat でしか更新されず、
+      厳密な順だと次の heartbeat まで各ノードの同じ 1 本に書き込みが集中するため）。追加したばかりの空のディスクは従来どおり優先される。
+      空きが `[storage] min_free_bytes`（既定 1 GiB、0 で無効）未満のディスクは候補にしない。サイズが先に分かる書き込み
+      （PUT の Content-Length、CopyObject のコピー元、repair）はさらにオブジェクトのサイズ分を要求する（`PutObjectRequest::size_hint`。
+      マルチパートは全体のサイズが分からないので最低限だけ）。容量不足で必要なコピー数を置けないときは S3 で 507
+      `InsufficientStorage`（`StoreError::InsufficientStorage`。503 だと S3 クライアントが本文を送り直し続けるため。MinIO の
+      `XMinioStorageFull` と同じ状態コード）。空き容量の条件を外しても足りないとき（ノード障害）は従来どおり 503。
+      満杯に近いディスクに書くと途中で失敗して転送が無駄になるため。そのノードに使えるディスクが無ければ、そのノードにはコピーを置かない
+    - `blob.rs` — 全レプリカへの同時ストリーミング書き込み（MD5=ETag と BLAKE3 を同時計算）、検証付きコピー。
+      書き込みは本文を読む前に全コピーを開き（`Replicas`）、開けなかったディスクは `Store::open_replicas` が別のディスクに差し替える
+      （前回の ping 以降に落ちたノードを選んでも、2/2 の STANDARD_IA 等が 503 にならない）。リモートのコピーは `HttpPeer::open_sink` が
+      接続できて本文の送信が始まるまで待つ（最大 3 秒）。開けなかったリモートのノードは、その書き込みでは他のディスクも使わず、
+      すぐに ping して応答しなければ次の heartbeat まで使わない（`Store::suspect_node`。読み出しの失敗でも同じ）。本文は 1 MiB ずつまとめてから各コピーへ渡し、ローカルの書き込みは
+      `tokio::fs::File` ではなく blocking タスクの std の File で行う（tokio の File はバッファを毎回コピーするため）
     - `cluster.rs` — `Peer`（他ノードのディスク操作）/ `Peers` / `ReplicaSink` / `DiskRef`（ローカルかリモートかを隠す）
     - `meta/` — `MetadataStore` trait と SQLite / PostgreSQL / MariaDB(MySQL) 実装。スキーマは `meta/migrations/<backend>/NNNN_*.sql`
       （リリース済みのマイグレーションは編集しない。バックエンドごとに番号は独立）。
       `postgres.rs` / `mysql.rs` は `sqlite.rs` と同じ構造（SQL の差分: プレースホルダ `$n`、`ON DUPLICATE KEY UPDATE`、
-      MySQL の object_key は `VARBINARY(1024)`、PG は `COLLATE "C"`）。SQLite 以外は書き込み競合を `is_retryable` で再試行
+      MySQL の object_key は `VARBINARY(1024)`、PG は `COLLATE "C"`）。SQLite 以外は書き込み競合を `is_retryable` で再試行。
+      PG / MariaDB の接続プールは `[storage] metadata_max_connections`（既定 16）。テストは並列に走り、クラスタのテストは
+      1 件で 3 つのストアを開くので 4 にしている（`tests/common` の `MAX_CONNECTIONS`）。
+      PG / MariaDB はプールの接続待ちを 5 秒（`ACQUIRE_TIMEOUT`）で打ち切り、DB に届かないエラー（`StoreError::is_metadata_unavailable`）は S3 では 503
     - 監査用タイムスタンプ: 全テーブル（schema_migrations 含む）に `created_at`（行の挿入日時）/ `updated_at`（最終更新日時）があり、
       DB 側で自動設定する（アプリは読み書きしない）。PG は `TIMESTAMPTZ` + `DEFAULT now()` + BEFORE UPDATE トリガー
       （`suhms_set_updated_at()`）、MariaDB は `DATETIME(6)`（TIMESTAMP は 2038 年問題があるため。sqlx がセッションを
@@ -82,13 +137,32 @@ AWS CLI はホストにシステムインストールしていないので、公
       Rust の構造体のフィールド名は従来どおり `created_at: i64`（管理 API の JSON を変えないため）。新しいテーブルを足すときも
       この 2 列とトリガーを付けること
     - クラスタ: 各ノードが自ディスクの空き容量と heartbeat を `disks` に書く（`HEARTBEAT_INTERVAL`）。30 秒更新がないディスクは offline 扱い。
+      heartbeat のたびに自ディスクを `Disk::probe`（`.suhms/format.json` を読んで ID を照合）し、失敗したディスク（アンマウント・
+      消失・I/O エラー）は heartbeat を止めて読み書き・scrub・gc の対象から外す（`local_disk` は健全なものだけ返す）。
+      heartbeat は `online` も TRUE に戻す（ディスクが欠けた状態で管理コマンドを実行すると offline にされるため）。
+      同時に他ノードを ping（`Peer::ping`、3 秒）し、応答しないノードのディスクは heartbeat があっても使わない
+      （DB は分断の両側から見えるため）。repair は冒頭でも ping し、到達できるディスクが増えたら待ち（backoff）を解除する。
+      ファイルの書き込みは `objects/` 等の基底ディレクトリを作らない（アンマウント後にルート FS へ書かないため）
       `Store::cluster_disks()` が全ノードのディスク一覧（2 秒キャッシュ）。レプリカ上限は「登録済み」ディスク/ノード数で判定するので、
       ノード障害中も書き込みは過半数で成功し、復旧後に repair で補う。複数ノード構成では同一ノードに 2 コピー置かない
     - `list.rs` — S3 の ListObjects 意味論（prefix / delimiter / marker / continuation）。キー順は UTF-8 バイト順
     - `store.rs` — `Store`: テナント・バケット・オブジェクト操作（すべて owner = テナント ID でスコープ。他テナントのバケットは AccessDenied）、
-      コピー、マルチパート、`scrub()`、`repair()`
+      コピー、マルチパート、`scrub()`（ファイルが無い・不一致のときは replicas 行がまだあるか確かめ直す。並行する削除・上書きを欠損と誤認しないため）、`repair()`
     - マルチパート: アップロード開始時にディスクを決め、パートは各ディスクの `.suhms/multipart/<upload>/<blob>` に置く。
-      完了時は各ディスク上でローカルにパートを連結して普通のオブジェクトファイルにする（パートごとに BLAKE3 を検証）。
+      落ちているディスクと、そのパートのサイズ（Content-Length、UploadPartCopy の範囲）が入らないディスクは PUT と同じく
+      別のディスクに差し替える（そのパートだけがそこに載る。満杯になったディスクに再送のたびに書いて失敗し続けないため）。
+      完了時は各ディスク上でローカルにパートを連結して普通のオブジェクトファイルにする。パートの照合は、アップロード時に記録した
+      パートのチェックサムが CRC（既定の CRC64NVME / CRC32 / CRC32C）ならそれで、無ければ BLAKE3 で行う（`blob::JoinPart`。
+      BLAKE3 より桁違いに軽く、ディスク上の破損の検出には十分。ノード間 API では `crcs` を別フィールドにしたので旧版のノードは
+      無視して BLAKE3 で照合する）。全パートを持つディスクが過半数に足りないときは、欠けたパートを他のディスクから
+      コピーしてから連結する（`Store::assembly_disks`。ノード間 API の `GET .../parts/<blob>`）。連結はパートを残したまま
+      オブジェクト全体を書くので、「オブジェクトのサイズ＋欠けたパートの分＋`min_free_bytes`」の空きが無いディスクでは連結しない。
+      パートを持つディスクで足りなければ、パートを持たないディスクも配置と同じ方法で選んでパートをコピーする。
+      容量のせいで足りないときは `InsufficientStorage`（507）。
+      書き込みの途中で満杯になったコピー（ローカルは ENOSPC、リモートはノード間 API の 507 → `io::ErrorKind::StorageFull`）で
+      必要数を割ったときと、完了時の連結中に満杯になって必要数を割ったとき（ノード間 API の連結も 507 を返す）も 507。
+      満杯になった他ノードのディスクは、そのノードの heartbeat が空き容量を更新するまで
+      （`FULL_TTL`、21 秒）空き 0 として扱う（`Store::mark_full`）。断った件数は `/metrics` の `suhms_storage_full_refusals_total`
       ETag は S3 と同じ `md5(パートMD5の連結)-N`。完了処理中は s3s がキープアライブの空白を送る
 - S3 プロトコル層は `s3s` クレート（Apache-2.0。`openssl` feature は使わない）
 - 運用（`store/src/store/maintenance.rs`）:
@@ -104,7 +178,14 @@ AWS CLI はホストにシステムインストールしていないので、公
   - ディスクの撤去: `disk drain`（`disks.draining`）で新規配置から外し、repair が他へコピーしてから draining 側を消す。
     draining のコピーはノード重複判定に数えないので、同じノードの別ディスクにも移せる。空になったら `disk remove`
     （コピーが残っていれば拒否。`--force` は壊れたディスク用で、replicas 行を消して再複製キューに積む）。
-    `node drain/remove` はそのノードの全ディスクに同じことをする。撤去するディスクは先にノードの設定から外すこと（起動時に再登録される）
+    ノードが生きていてディスクだけが落ちている場合、そのディスクのコピーはノード重複判定に数えないので、同じノードの別ディスクへ
+    再複製する（`disk remove` を待たない）。ディスクが戻って余ったコピーは、同じノードに 2 つあるものから削る。
+    ノードごと落ちている（到達できない）場合は従来どおり数える
+    `node drain/remove` はそのノードの全ディスクに同じことをする。撤去するディスクは先にノードの設定から外すこと。外し忘れても、`disk remove` した ID は `removed_disks` テーブルに残り、起動時にそのディスクは使わない（エラーログを出し、scrub の `skipped_disks` に数える。再利用するなら中身を空にして新しいディスクとして初期化させる）
+  - 消せなかったファイル: 削除・上書き・マルチパート中止のとき、到達できないディスク（ノード停止・分断）のファイルは
+    `pending_removals` テーブルに記録し、そのディスクのノードが戻ったら heartbeat のたびに消す（`Store::process_pending_removals`、
+    ディスクごとに 1 回 1000 件）。メタデータがまだそのディスクのコピーを指していれば消さない。記録に失敗したものや
+    削除済みディスクのものは gc が拾う
   - `gc`: 各ノードが自分のディスクを走査し、replicas 行のないオブジェクトファイル（猶予 `gc_grace_secs` より古いもの）を
     `.suhms/gc/<unix秒>/` へ移し、次回以降に猶予を過ぎたゴミ箱を消す。存在しないアップロードの `.suhms/multipart/` と古い tmp も消す。
     メタデータにそのディスクのコピーが 1 件もないのにファイルがある場合は DB の取り違えを疑ってスキップ（`--force` で実行）。
@@ -153,6 +234,10 @@ AWS CLI はホストにシステムインストールしていないので、公
 - CORS（`server/src/cors.rs`）: ルールはバケットに JSON で保存し、ミドルウェアがプリフライト（OPTIONS）と応答ヘッダを処理
 - SQLite のマイグレーションは外部キーを無効化して実行する（`objects` の再作成で replicas が CASCADE 削除されないように）
 - サーバ側暗号化（SSE）は実装しない: 「ファイルをそのまま置く」方針と矛盾するため。保存時暗号化はディスク側（LUKS 等）で行う
+- DeleteObjects は、バケットが無い・他テナントのものならリクエスト全体を NoSuchBucket / AccessDenied にする（S3 と同じ。キーごとのエラーにしない）
+- オブジェクトキーに制御文字（タブ・LF・CR 以外の 0x00〜0x1F）は使えない（`validate_key` で InvalidArgument）。XML 1.0 で表せず、
+  s3s は一覧の応答全体を 500 にする（AWS は文字参照で返すが、s3s では出せない）。それ以前に保存されたキーが一覧に含まれる場合、
+  `encoding-type=url` なしの一覧は 500 ではなく 400 で `encoding-type=url` を案内する（`require_xml_safe`。500 だとクライアントが再試行し続ける）
 - 対応済み S3 操作: ListBuckets, Create/Head/Delete Bucket, GetBucketLocation, GetBucketVersioning,
   Put/Get（Range）/Head/Delete Object, DeleteObjects, ListObjects V1/V2（encoding-type=url 対応）, presigned URL,
   CopyObject（COPY/REPLACE）, Create/UploadPart/UploadPartCopy/Complete/Abort MultipartUpload, ListParts, ListMultipartUploads,
@@ -203,12 +288,16 @@ npm 側は cargo-deny の対象外なので、依存を足すときは手で確�
 
 ## 未対応（既知の穴）
 
-- `deny.toml` で RUSTSEC-2026-0459（同梱 SQLite の脆弱性）を一時除外中。sqlx が libsqlite3-sys >= 0.39 を許容したら更新して除外を外す
-- PostgreSQL / MariaDB はこのホストでは未検証（CI の `metadata-backends` ジョブでサービスコンテナに対して store のテストを実行）。
-  ローカルで試すなら `SUHMS_TEST_POSTGRES=postgres://... cargo test -p suhms-store`（テストごとに DB を作る）
+- `deny.toml` で RUSTSEC-2026-0543（chrono の保守終了。脆弱性ではない）を一時除外中。s3s 0.17 経由でだけ入り、suhms は直接使っていない。chrono を使わない s3s がリリースされたら更新して除外を外す
 - `[cluster.tls]` を設定しないとノード間通信は平文 HTTP（HMAC 認証のみ）。その場合はプライベートネットワークか WireGuard 等で保護すること
 - チェックサムの後付けはオブジェクトのみ。既定チェックサム導入前に始まった未完了マルチパートのパートには付かない
   （完了後のオブジェクトには後付けされる）
+- 読み出し時の BLAKE3 照合は全体読み（範囲なしの GET、CopyObject、範囲なしの UploadPartCopy）だけ（`blob::VerifyingReader`）。
+  最後の塊を渡す前に照合し、不一致ならそれを渡さずにエラーにする（hyper は Content-Length 分を送ると本文を読まないので、
+  EOF での照合では間に合わない）。不一致のコピーは、自ノード・他ノードを問わずバックグラウンドで読み直して確認してから捨てて repair に積む（`CopyChecker`）。
+  範囲指定 GET（AWS CLI の `s3 cp` は大きいファイルを範囲指定で分割取得する）は返す前には照合できないので、壊れたコピーの中身を
+  そのまま返しうる。代わりに読んだコピーを後からバックグラウンドで全体照合し（`RangeChecks`。コピーごとに 1 時間に 1 回、同時 2 件、
+  待ち 256 件まで）、2 回続けて不一致なら自ノード・他ノードを問わず捨てて repair に積む。次の読み出しからは健全なコピーになる
 - `repair_full`（週 1）は従来どおり objects の全件走査。数億件規模では間隔を延ばすか止める
 - rebalance は自動実行しない（ディスク・ノード追加後に手動で `suhms rebalance`）
 

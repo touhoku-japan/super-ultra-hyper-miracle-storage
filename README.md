@@ -43,7 +43,9 @@ rclone mkdir s:backups && rclone copy ./data s:backups/
 ## 開発
 
 ```sh
-CARGO_BUILD_JOBS=1 cargo test --workspace
+cargo test --workspace                     # メタデータは SQLite
+SUHMS_TEST_POSTGRES=postgres://user@127.0.0.1:5432 cargo test -p suhms-store -p suhms-server  # PostgreSQL（テストごとに DB を作る）
+SUHMS_TEST_MYSQL=mysql://root:pw@127.0.0.1:3306 cargo test -p suhms-store -p suhms-server      # MariaDB
 curl http://127.0.0.1:9000/super-ultra-hyper-miracle-storage/health
 (cd web && npm test)                       # コンソールの単体テスト
 (cd web && npm run e2e)                    # ブラウザ E2E（先に npm run build と cargo build。docs/webui.md）

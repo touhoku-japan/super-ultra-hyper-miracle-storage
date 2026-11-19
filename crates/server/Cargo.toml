@@ -26,6 +26,7 @@ getrandom = "0.4.3"
 hex = "0.4.3"
 percent-encoding = "2"
 hmac = "0.13.0"
+http-body = "1.1.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["stream", "json", "rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pki-types = { version = "1", features = ["std"] }
@@ -50,6 +51,9 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 md-5 = "0.11.0"
+# Only to create a database per test on SUHMS_TEST_POSTGRES / SUHMS_TEST_MYSQL (same version and
+# features as suhms-store, so nothing extra is built).
+sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "postgres", "mysql"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 tempfile = "3.27.0"
 

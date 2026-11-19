@@ -17,43 +17,66 @@ pub struct Candidate<'a> {
     pub free: u64,
 }
 
+/// Disks whose free space is within this fraction of the emptiest eligible disk count as equally
+/// empty (see [`choose`]).
+const TIE_FRACTION: u64 = 20; // 1/20 = 5%
+
 /// Picks up to `count` disks for new copies.
 ///
 /// Disks already holding a copy (`existing`) are never picked, and copies go to distinct nodes.
 /// Only with `allow_same_node` (single-node deployments) may a node get several copies, on
 /// different disks. In a cluster that is short of live nodes this returns fewer disks than
 /// requested: a second copy on the same node would never be moved once the missing node is back.
-/// Disks with more free space win.
+///
+/// Disks with more free space win, but disks within 5% of the emptiest one are picked among at
+/// random. Free space is only refreshed by heartbeats, so with a strict order every write until
+/// the next heartbeat would land on the same disk of each node (identical disks of a fresh node
+/// differ by a few bytes), leaving the node's other disks idle.
 pub fn choose(
-    mut candidates: Vec<Candidate<'_>>,
+    candidates: Vec<Candidate<'_>>,
     existing: &[(DiskId, &str)],
     count: usize,
     allow_same_node: bool,
 ) -> Vec<DiskId> {
+    choose_with(candidates, existing, count, allow_same_node, || {
+        // uuid's v4 generator is the random source the crate already has.
+        let r = uuid::Uuid::new_v4().as_u128();
+        (r >> 64) as u64 ^ r as u64
+    })
+}
+
+/// [`choose`] with the random source given (`random` returns uniformly distributed values).
+pub fn choose_with(
+    mut candidates: Vec<Candidate<'_>>,
+    existing: &[(DiskId, &str)],
+    count: usize,
+    allow_same_node: bool,
+    mut random: impl FnMut() -> u64,
+) -> Vec<DiskId> {
     let mut used_disks: HashSet<DiskId> = existing.iter().map(|(d, _)| *d).collect();
     let mut used_nodes: HashSet<&str> = existing.iter().map(|(_, n)| *n).collect();
     candidates.retain(|c| !used_disks.contains(&c.disk_id));
-    // Stable sort keeps config order as the tie-breaker.
-    candidates.sort_by_key(|c| std::cmp::Reverse(c.free));
 
     let mut picked = Vec::with_capacity(count);
-    for c in &candidates {
-        if picked.len() == count {
-            return picked;
-        }
-        if used_nodes.insert(c.node_id) {
-            used_disks.insert(c.disk_id);
-            picked.push(c.disk_id);
-        }
-    }
-    if !allow_same_node {
-        return picked;
-    }
-    for c in &candidates {
-        if picked.len() == count {
+    // First one copy per node; then, in a single-node deployment, more disks of the same node.
+    for same_node in [false, true] {
+        if same_node && !allow_same_node {
             break;
         }
-        if used_disks.insert(c.disk_id) {
+        while picked.len() < count {
+            let eligible: Vec<&Candidate<'_>> = candidates
+                .iter()
+                .filter(|c| !used_disks.contains(&c.disk_id))
+                .filter(|c| same_node || !used_nodes.contains(c.node_id))
+                .collect();
+            let Some(best) = eligible.iter().map(|c| c.free).max() else {
+                break;
+            };
+            let floor = best - best / TIE_FRACTION;
+            let tier: Vec<&&Candidate<'_>> = eligible.iter().filter(|c| c.free >= floor).collect();
+            let c = tier[(random() % tier.len() as u64) as usize];
+            used_disks.insert(c.disk_id);
+            used_nodes.insert(c.node_id);
             picked.push(c.disk_id);
         }
     }
@@ -124,5 +147,43 @@ mod tests {
     fn returns_fewer_when_not_enough_disks() {
         let cs = vec![cand("a", 1)];
         assert_eq!(choose(cs, &[], 3, true).len(), 1);
+    }
+
+    #[test]
+    fn nearly_equal_disks_share_the_writes() {
+        // Four identical disks of one node (differing by a few bytes), as on a fresh node.
+        let cs = vec![
+            cand("a", 1_000_000),
+            cand("a", 999_990),
+            cand("a", 1_000_005),
+            cand("a", 999_999),
+        ];
+        let mut counts = std::collections::HashMap::new();
+        for _ in 0..400 {
+            let picked = choose(cs.clone(), &[], 1, true);
+            *counts.entry(picked[0]).or_insert(0) += 1;
+        }
+        assert_eq!(counts.len(), 4, "{counts:?}");
+        assert!(counts.values().all(|n| *n > 50), "{counts:?}");
+    }
+
+    #[test]
+    fn a_clearly_emptier_disk_still_wins() {
+        // A disk added later: much more free space than the others, so it takes every copy.
+        let cs = vec![cand("a", 500), cand("a", 520), cand("a", 1000)];
+        let new = cs[2].disk_id;
+        for _ in 0..50 {
+            assert_eq!(choose(cs.clone(), &[], 1, true), vec![new]);
+        }
+    }
+
+    #[test]
+    fn ties_are_broken_by_the_random_source() {
+        let cs = vec![cand("a", 100), cand("b", 99), cand("c", 98), cand("d", 10)];
+        let ids: Vec<_> = cs.iter().map(|c| c.disk_id).collect();
+        // The tier is a, b, c (d is far behind); index 2 picks c, then index 1 of a, b picks b.
+        let mut draws = [2u64, 1, 0].into_iter();
+        let picked = choose_with(cs, &[], 3, false, || draws.next().unwrap());
+        assert_eq!(picked, vec![ids[2], ids[1], ids[0]]);
     }
 }

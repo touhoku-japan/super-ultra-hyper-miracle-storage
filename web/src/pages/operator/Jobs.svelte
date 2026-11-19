@@ -1,7 +1,7 @@
 <script>
   import PageHead from '../../components/PageHead.svelte';
   import { admin } from '../../lib/admin.js';
-  import { datetime, bytes, count } from '../../lib/format.js';
+  import { datetime, bytes, count, duration } from '../../lib/format.js';
   import { toast } from '../../lib/toast.svelte.js';
 
   let { info } = $props();
@@ -37,7 +37,7 @@
   }
   load();
   $effect(() => {
-    const t = setInterval(load, jobs?.some((j) => j.running) ? 2000 : 10000);
+    const t = setInterval(load, jobs?.some((j) => j.runs.some((r) => r.running)) ? 2000 : 10000);
     return () => clearInterval(t);
   });
 
@@ -64,7 +64,7 @@
 </script>
 
 <PageHead title="メンテナンス" />
-<p class="muted small intro">ここで開始した処理はノード <code>{info.node_id}</code> のサーバ内で動きます。「クラスタで 1 台」の処理は、他のノードが実行中なら待たずに失敗します。定期実行の間隔は設定ファイルの <code>[maintenance]</code> で決まります。</p>
+<p class="muted small intro">各ノードの最後の実行（定期実行を含む）を表示します。ここで開始した処理はノード <code>{info.node_id}</code> のサーバ内で動きます。「クラスタで 1 台」の処理は、どこかのノードで実行中のあいだは開始できません。定期実行の間隔は設定ファイルの <code>[maintenance]</code> で決まります。</p>
 
 {#if error}
   <p class="notice bad">{error}</p>
@@ -74,6 +74,8 @@
   <div class="jobs">
     {#each jobs as j (j.name)}
       {@const a = ABOUT[j.name] ?? { title: j.name, text: '', scope: '' }}
+      {@const here = j.runs.find((r) => r.this_node && r.running)}
+      {@const elsewhere = j.runs.find((r) => !r.this_node && r.running)}
       <section class="sheet">
         <header>
           <h2>{a.title}</h2>
@@ -97,17 +99,33 @@
             </div>
           {/if}
           <div class="spread">
-            <button class="primary" disabled={j.running} onclick={() => start(j.name)}>{j.running ? '実行中…' : '今すぐ実行'}</button>
-            <span class="faint small">
-              {#if j.running}{datetime(j.started_at)} に開始{:else if j.finished_at}前回 {datetime(j.finished_at)} に終了{:else}このプロセスでは未実行{/if}
-            </span>
+            <button class="primary" disabled={j.blocked} onclick={() => start(j.name)}>{here ? '実行中…' : '今すぐ実行'}</button>
+            {#if !here && j.blocked && elsewhere}<span class="faint small">ノード {elsewhere.node_id} で実行中</span>{/if}
           </div>
-          {#if !j.running && j.error}
-            <p class="notice bad small">{j.error}</p>
-          {:else if !j.running && j.result}
-            <dl class="props result">
-              {#each Object.entries(j.result) as [k, v] (k)}<dt>{LABELS[k] ?? k}</dt><dd>{fmt(k, v)}</dd>{/each}
-            </dl>
+          {#if j.runs.length === 0}
+            <p class="faint small">まだ実行されていません。</p>
+          {:else}
+            <ul class="runs">
+              {#each j.runs as r (r.node_id)}
+                <li>
+                  <div class="spread">
+                    <span class="small node"><strong class="mono">{r.node_id}</strong>{#if r.this_node}<span class="badge info">このノード</span>{/if}</span>
+                    {#if r.running}<span class="badge warn">実行中</span>{:else if r.interrupted}<span class="badge bad">中断</span>{:else if r.error}<span class="badge bad">失敗</span>{:else}<span class="badge ok">完了</span>{/if}
+                  </div>
+                  <p class="faint small">
+                    {r.started_by === 'console' ? 'コンソールから開始' : '定期実行'}、
+                    {#if r.running || r.finished_at == null}{datetime(r.started_at)} に開始{:else}{datetime(r.finished_at)} に終了（{duration(r.finished_at - r.started_at)}）{/if}
+                  </p>
+                  {#if !r.running && r.error}
+                    <p class="notice bad small">{r.error}</p>
+                  {:else if !r.running && r.result}
+                    <dl class="props result">
+                      {#each Object.entries(r.result) as [k, v] (k)}<dt>{LABELS[k] ?? k}</dt><dd>{fmt(k, v)}</dd>{/each}
+                    </dl>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
           {/if}
         </div>
       </section>
@@ -124,6 +142,26 @@
     grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
     gap: 1.2rem;
     align-items: start;
+  }
+  .runs {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+  }
+  .runs li {
+    display: grid;
+    gap: 0.35rem;
+    padding: 0.7rem 0;
+    border-top: 1px solid var(--line);
+  }
+  .runs p {
+    margin: 0;
+  }
+  .node {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
   }
   .result {
     font-size: 0.85rem;

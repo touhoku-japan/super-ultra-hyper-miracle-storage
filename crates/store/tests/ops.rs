@@ -39,6 +39,7 @@ impl Env {
         let store = Store::open(StoreConfig {
             disks: disks.clone(),
             metadata_url: meta_url,
+            metadata_max_connections: common::MAX_CONNECTIONS,
             ..StoreConfig::default()
         })
         .await
@@ -213,13 +214,17 @@ async fn gc_skips_a_disk_the_metadata_knows_nothing_about() {
 async fn draining_a_disk_moves_its_copies_then_it_can_be_removed() {
     let env = Env::new(4).await;
     env.store.create_bucket(OWNER, "drain", None).await.unwrap();
-    let keys = ["a", "b", "c", "d", "e"];
-    for k in keys {
-        env.put("drain", k, None).await;
-    }
+    // Placement is random among equally empty disks (and the test's disks share one file
+    // system, so their free space moves with other tests): write until disk 0 holds copies.
     let d0 = env.disk_id(0).await;
+    let mut keys = Vec::new();
+    while keys.len() < 5 || env.copies_on(d0).await == 0 {
+        assert!(keys.len() < 40, "disk 0 never got a copy");
+        let k = format!("k{}", keys.len());
+        env.put("drain", &k, None).await;
+        keys.push(k);
+    }
     let on_d0 = env.copies_on(d0).await;
-    assert!(on_d0 > 0);
 
     assert!(env.store.set_disk_draining(d0, true).await.unwrap());
     assert_eq!(
@@ -240,7 +245,7 @@ async fn draining_a_disk_moves_its_copies_then_it_can_be_removed() {
     assert_eq!((r.copied, r.drained), (on_d0, on_d0), "{r:?}");
     assert_eq!(env.copies_on(d0).await, 0);
     assert_eq!(count_files(&env.disks[0].join("objects")), 0);
-    for k in keys {
+    for k in &keys {
         let replicas = env.store.object_replicas("drain", k).await.unwrap();
         assert_eq!(replicas.len(), 3);
         assert!(!replicas.contains(&d0));
@@ -276,6 +281,41 @@ async fn force_removing_a_dead_disk_rereplicates_its_objects() {
         assert_eq!(replicas.len(), 3);
         assert!(!replicas.contains(&d1));
     }
+}
+
+#[tokio::test]
+async fn a_removed_disk_left_in_the_config_is_not_registered_again() {
+    let env = Env::new(4).await;
+    let d1 = env.disk_id(1).await;
+    let meta = env.store.metadata();
+    let pending = suhms_store::meta::PendingRemoval {
+        disk_id: d1,
+        target: suhms_store::meta::RemovalTarget::Object(Uuid::new_v4()),
+    };
+    meta.add_pending_removals(&[pending]).await.unwrap();
+    assert_eq!(
+        env.store.remove_disk(d1, true).await.unwrap(),
+        RemoveDiskOutcome::Removed { dropped: 0 }
+    );
+    // Its pending removals go with it.
+    assert!(meta.list_pending_removals(d1, 10).await.unwrap().is_empty());
+    // The node restarts with the disk still in its config.
+    let restarted = Store::with_metadata(
+        StoreConfig {
+            disks: env.disks.clone(),
+            ..StoreConfig::default()
+        },
+        env.store.metadata().clone(),
+        std::sync::Arc::new(suhms_store::NoPeers),
+    )
+    .await
+    .unwrap();
+    let disks = restarted.cluster_disks().await.unwrap();
+    assert_eq!(disks.len(), 3);
+    assert!(disks.iter().all(|d| d.id != d1));
+    assert!(restarted.local_disk(d1).is_none());
+    // Scrub reports it as a configured disk it could not use.
+    assert_eq!(restarted.scrub().await.unwrap().skipped_disks, 1);
 }
 
 #[tokio::test]
@@ -443,4 +483,70 @@ async fn unrepairable_objects_wait_instead_of_being_retried_every_pass() {
         meta.list_repair_queue(None, 10, now).await.unwrap().len(),
         1
     );
+}
+
+#[tokio::test]
+async fn job_runs_are_kept_per_node_and_job() {
+    let env = Env::new(1).await;
+    let meta = env.store.metadata();
+    let run = |node: &str, job: &str, running: bool| suhms_store::meta::JobRun {
+        node_id: node.into(),
+        job: job.into(),
+        running,
+        started_by: "console".into(),
+        started_at: 1_000,
+        finished_at: (!running).then_some(2_000),
+        heartbeat_at: 1_500,
+        result: (!running).then(|| r#"{"checked":3}"#.into()),
+        error: None,
+    };
+    assert_eq!(meta.get_job_run("n1", "scrub").await.unwrap(), None);
+    meta.put_job_run(&run("n2", "scrub", true)).await.unwrap();
+    meta.put_job_run(&run("n1", "scrub", true)).await.unwrap();
+    meta.put_job_run(&run("n1", "gc", false)).await.unwrap();
+    // A second write replaces the node's row for that job.
+    let mut done = run("n1", "scrub", false);
+    done.started_by = "schedule".into();
+    done.error = Some("boom".into());
+    meta.put_job_run(&done).await.unwrap();
+
+    assert_eq!(
+        meta.get_job_run("n1", "scrub").await.unwrap(),
+        Some(done.clone())
+    );
+    let all = meta.list_job_runs().await.unwrap();
+    let keys: Vec<_> = all
+        .iter()
+        .map(|r| (r.job.as_str(), r.node_id.as_str()))
+        .collect();
+    assert_eq!(keys, [("gc", "n1"), ("scrub", "n1"), ("scrub", "n2")]);
+    assert_eq!(all[1], done);
+    assert!(all[2].running && all[2].finished_at.is_none() && all[2].result.is_none());
+
+    meta.delete_job_run("n2", "scrub").await.unwrap();
+    assert_eq!(meta.get_job_run("n2", "scrub").await.unwrap(), None);
+    assert_eq!(meta.list_job_runs().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn scrub_does_not_report_copies_deleted_while_it_runs() {
+    let env = Env::new(3).await;
+    env.store
+        .create_bucket(OWNER, "scrubbed", None)
+        .await
+        .unwrap();
+    let keys: Vec<String> = (0..200).map(|i| format!("k{i:03}")).collect();
+    for k in &keys {
+        env.put("scrubbed", k, None).await;
+    }
+    // Deletes interleave with the scrub: copies listed by the scrub disappear before it
+    // hashes them. They are gone legitimately, not missing.
+    let deletes = async {
+        for k in &keys {
+            env.store.delete_object(OWNER, "scrubbed", k).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+    };
+    let (report, ()) = tokio::join!(env.store.scrub(), deletes);
+    assert_eq!(report.unwrap().removed, 0);
 }

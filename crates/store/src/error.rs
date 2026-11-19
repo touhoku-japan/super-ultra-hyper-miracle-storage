@@ -28,6 +28,11 @@ pub enum StoreError {
     #[error("invalid object key")]
     InvalidObjectKey,
 
+    /// The key contains a character that XML 1.0 cannot carry (a control character other than
+    /// tab / LF / CR), so it could never be returned by a listing without `encoding-type=url`.
+    #[error("object key contains a control character")]
+    InvalidKeyCharacter,
+
     #[error("bucket {0} does not exist")]
     NoSuchBucket(String),
 
@@ -104,6 +109,12 @@ pub enum StoreError {
     #[error("only {written} of the required {required} replicas could be written")]
     WriteQuorum { required: usize, written: usize },
 
+    /// Like [`StoreError::WriteQuorum`], but enough disks are reachable: they lack free space
+    /// (see [`crate::StoreConfig::min_free_bytes`]). Retrying does not help until space is freed
+    /// or disks are added.
+    #[error("only {available} of the required {required} replicas have room for the object")]
+    InsufficientStorage { required: usize, available: usize },
+
     #[error("no healthy replica of object {0} is available")]
     NoHealthyReplica(Uuid),
 
@@ -114,8 +125,42 @@ pub enum StoreError {
     Io(#[from] io::Error),
 }
 
+impl StoreError {
+    /// Whether the metadata database could not be reached (connection refused or lost, or no
+    /// pooled connection became free in time), as opposed to a query that failed.
+    pub fn is_metadata_unavailable(&self) -> bool {
+        let Self::Metadata(inner) = self else {
+            return false;
+        };
+        matches!(
+            inner.downcast_ref::<sqlx::Error>(),
+            Some(
+                sqlx::Error::PoolTimedOut
+                    | sqlx::Error::PoolClosed
+                    | sqlx::Error::Io(_)
+                    | sqlx::Error::Tls(_)
+                    | sqlx::Error::Protocol(_)
+            )
+        )
+    }
+}
+
 impl From<sqlx::Error> for StoreError {
     fn from(e: sqlx::Error) -> Self {
         Self::Metadata(Box::new(e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_failures_count_as_metadata_unavailable() {
+        assert!(StoreError::from(sqlx::Error::PoolTimedOut).is_metadata_unavailable());
+        let refused = io::Error::new(io::ErrorKind::ConnectionRefused, "refused");
+        assert!(StoreError::from(sqlx::Error::Io(refused)).is_metadata_unavailable());
+        assert!(!StoreError::from(sqlx::Error::RowNotFound).is_metadata_unavailable());
+        assert!(!StoreError::NoDisks.is_metadata_unavailable());
     }
 }

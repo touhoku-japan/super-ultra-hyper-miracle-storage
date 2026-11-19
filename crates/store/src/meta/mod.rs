@@ -251,6 +251,48 @@ pub struct RepairQueueEntry {
     pub attempts: u32,
 }
 
+/// A file left behind on an unreachable disk (see [`MetadataStore::add_pending_removals`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PendingRemoval {
+    pub disk_id: DiskId,
+    pub target: RemovalTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RemovalTarget {
+    /// An object's file.
+    Object(Uuid),
+    /// The parts directory of a multipart upload.
+    Upload(Uuid),
+}
+
+impl RemovalTarget {
+    pub fn id(self) -> Uuid {
+        match self {
+            Self::Object(id) | Self::Upload(id) => id,
+        }
+    }
+
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::Object(_) => "object",
+            Self::Upload(_) => "upload",
+        }
+    }
+
+    /// The inverse of [`RemovalTarget::kind`] and [`RemovalTarget::id`].
+    pub fn parse(kind: &str, id: &str) -> Result<Self> {
+        let id = Uuid::parse_str(id).map_err(|e| StoreError::Metadata(Box::new(e)))?;
+        match kind {
+            "object" => Ok(Self::Object(id)),
+            "upload" => Ok(Self::Upload(id)),
+            other => Err(StoreError::Metadata(
+                format!("unknown pending removal kind {other}").into(),
+            )),
+        }
+    }
+}
+
 /// Result of [`MetadataStore::remove_disk`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoveDiskOutcome {
@@ -353,6 +395,10 @@ pub trait MetadataStore: Send + Sync {
         now: i64,
     ) -> Result<()>;
     /// Refreshes a disk's free space and liveness.
+    /// Runs a trivial query, to check that the database answers.
+    async fn ping(&self) -> Result<()>;
+    /// Records a heartbeat; also marks the disk online again (an admin command started while
+    /// the disk was missing marks it offline when it opens the store).
     async fn heartbeat_disk(&self, disk_id: DiskId, free_bytes: u64, now: i64) -> Result<()>;
     /// Every disk of every node.
     async fn list_disks(&self) -> Result<Vec<DiskRecord>>;
@@ -360,7 +406,22 @@ pub trait MetadataStore: Send + Sync {
     async fn set_disk_draining(&self, disk_id: DiskId, draining: bool) -> Result<bool>;
     /// Forgets a disk. Refuses while replica records point at it, unless `force`: then those
     /// records are dropped and their objects queued for repair (for a disk that is gone).
+    /// The id is also remembered: [`MetadataStore::is_disk_removed`].
     async fn remove_disk(&self, disk_id: DiskId, force: bool) -> Result<RemoveDiskOutcome>;
+    /// Whether the disk was removed with [`MetadataStore::remove_disk`] (it must not be
+    /// registered again under the same identity).
+    async fn is_disk_removed(&self, disk_id: DiskId) -> Result<bool>;
+    /// Remembers files that could not be deleted because their disk was unreachable; already
+    /// recorded ones are ignored. Rows of a disk are dropped with [`MetadataStore::remove_disk`].
+    async fn add_pending_removals(&self, items: &[PendingRemoval]) -> Result<()>;
+    /// Up to `limit` pending removals on a disk.
+    async fn list_pending_removals(
+        &self,
+        disk_id: DiskId,
+        limit: u32,
+    ) -> Result<Vec<PendingRemoval>>;
+    /// Forgets pending removals once done.
+    async fn delete_pending_removals(&self, items: &[PendingRemoval]) -> Result<()>;
     /// Records when repair noticed a disk down (`None` once it is back).
     async fn set_disk_down_since(&self, disk_id: DiskId, since: Option<i64>) -> Result<()>;
     /// Queues every object with a copy on the disk for repair; returns how many were queued.
@@ -613,6 +674,34 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<bool>;
     /// Gives the lease up if `holder` still has it.
     async fn release_lease(&self, name: &str, holder: &str) -> Result<()>;
+
+    // ---- maintenance job state ----
+
+    /// Stores the state of a node's run of a job (one row per node and job; replaces it).
+    async fn put_job_run(&self, run: &JobRun) -> Result<()>;
+    async fn get_job_run(&self, node_id: &str, job: &str) -> Result<Option<JobRun>>;
+    async fn delete_job_run(&self, node_id: &str, job: &str) -> Result<()>;
+    /// Every node's last run of every job, by job then node.
+    async fn list_job_runs(&self) -> Result<Vec<JobRun>>;
+}
+
+/// The last run of a maintenance job on one node (`job_runs`). Every node writes only its own
+/// rows; the operator console of any node reads them all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobRun {
+    pub node_id: String,
+    pub job: String,
+    pub running: bool,
+    /// `"console"` or `"schedule"`.
+    pub started_by: String,
+    /// Unix ms.
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    /// Unix ms of the last sign of life while running; a crashed node stops updating it.
+    pub heartbeat_at: i64,
+    /// JSON report of a finished run.
+    pub result: Option<String>,
+    pub error: Option<String>,
 }
 
 /// The first id (hyphenated) after every id that starts with `prefix`, for range scans.
@@ -628,14 +717,25 @@ pub(crate) fn prefix_end(prefix: &str) -> Result<String> {
     Ok(format!("{:0width$x}", n + 1, width = prefix.len()))
 }
 
-/// Opens the backend named by the URL scheme.
+/// Default connection pool size of the PostgreSQL / MariaDB backends.
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 16;
+
+/// Opens the backend named by the URL scheme, with the default pool size.
 pub async fn connect(url: &str) -> Result<Arc<dyn MetadataStore>> {
+    connect_with(url, DEFAULT_MAX_CONNECTIONS).await
+}
+
+/// Like [`connect`]; `max_connections` sizes the pool of PostgreSQL / MariaDB (SQLite keeps its
+/// own small pool: it has a single writer anyway).
+pub async fn connect_with(url: &str, max_connections: u32) -> Result<Arc<dyn MetadataStore>> {
     let scheme = url.split(':').next().unwrap_or_default();
     match scheme {
         "sqlite" => Ok(Arc::new(SqliteMetadata::connect(url).await?)),
-        "postgres" | "postgresql" => Ok(Arc::new(PostgresMetadata::connect(url).await?)),
+        "postgres" | "postgresql" => Ok(Arc::new(
+            PostgresMetadata::connect(url, max_connections).await?,
+        )),
         "mysql" | "mariadb" => Ok(Arc::new(
-            MysqlMetadata::connect(&url.replacen("mariadb:", "mysql:", 1)).await?,
+            MysqlMetadata::connect(&url.replacen("mariadb:", "mysql:", 1), max_connections).await?,
         )),
         _ => Err(StoreError::Config(format!(
             "unsupported metadata URL scheme {scheme:?} (expected sqlite, postgres or mysql)"

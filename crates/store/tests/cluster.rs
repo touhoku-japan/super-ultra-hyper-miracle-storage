@@ -7,13 +7,16 @@ use std::{
     io,
     ops::Range,
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock, Weak,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use async_trait::async_trait;
 use suhms_store::{
     BoxReader, CompletedPart, MIN_PART_SIZE, Peer, Peers, PutObjectRequest, ReplicaSink, Store,
-    StoreConfig, TenantRecord,
+    StoreConfig, StoreError, TenantRecord,
     blob::{self, Dest, LocalSink},
     disk::DiskId,
 };
@@ -24,7 +27,9 @@ use uuid::Uuid;
 const OWNER: &str = "tenant-1";
 
 /// Routes peer calls straight to the target node's local disks.
-struct InProcPeer(Arc<Store>);
+/// With a counter: the node's disks run out of space as soon as a write starts (the counter
+/// counts those writes).
+struct InProcPeer(Arc<Store>, Option<Arc<AtomicUsize>>);
 
 impl InProcPeer {
     fn disk(&self, id: DiskId) -> io::Result<&Arc<suhms_store::disk::Disk>> {
@@ -37,10 +42,18 @@ impl InProcPeer {
 #[async_trait]
 impl Peer for InProcPeer {
     async fn open_sink(&self, disk: DiskId, dest: Dest) -> io::Result<Box<dyn ReplicaSink>> {
-        Ok(Box::new(LocalSink::create(self.disk(disk)?, dest).await?))
+        let sink = LocalSink::create(self.disk(disk)?, dest).await?;
+        if let Some(opens) = &self.1 {
+            opens.fetch_add(1, Ordering::Relaxed);
+            return Ok(Box::new(FullSink(Box::new(sink))));
+        }
+        Ok(Box::new(sink))
     }
     async fn read(&self, disk: DiskId, b: Uuid, size: u64, r: Range<u64>) -> io::Result<BoxReader> {
         blob::read_local(self.disk(disk)?, b, size, r).await
+    }
+    async fn read_part(&self, disk: DiskId, up: Uuid, b: Uuid, size: u64) -> io::Result<BoxReader> {
+        blob::read_local_path(&self.disk(disk)?.part_path(up, b), size, 0..size).await
     }
     async fn remove(&self, disk: DiskId, dest: Dest) -> io::Result<()> {
         blob::remove_path(&dest.path(self.disk(disk)?)).await;
@@ -54,17 +67,85 @@ impl Peer for InProcPeer {
         &self,
         disk: DiskId,
         upload: Uuid,
-        parts: Vec<(Uuid, String)>,
+        parts: Vec<blob::JoinPart>,
         object: Uuid,
     ) -> io::Result<String> {
+        if self.1.is_some() {
+            return Err(io::Error::from(io::ErrorKind::StorageFull));
+        }
         blob::concat_parts(self.disk(disk)?, upload, &parts, object).await
+    }
+}
+
+/// A copy on a disk that is full: every write fails with ENOSPC.
+struct FullSink(Box<dyn ReplicaSink>);
+
+#[async_trait]
+impl ReplicaSink for FullSink {
+    async fn write(&mut self, _: bytes::Bytes) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::StorageFull))
+    }
+    async fn commit(self: Box<Self>) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::StorageFull))
+    }
+    async fn abort(self: Box<Self>) {
+        self.0.abort().await;
+    }
+}
+
+/// A node behind a network partition: every call fails, but it keeps heartbeating to the
+/// metadata database.
+struct CutPeer(Arc<AtomicUsize>);
+
+fn cut() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "network partition")
+}
+
+#[async_trait]
+impl Peer for CutPeer {
+    async fn open_sink(&self, _: DiskId, _: Dest) -> io::Result<Box<dyn ReplicaSink>> {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Err(cut())
+    }
+    async fn read(&self, _: DiskId, _: Uuid, _: u64, _: Range<u64>) -> io::Result<BoxReader> {
+        Err(cut())
+    }
+    async fn read_part(&self, _: DiskId, _: Uuid, _: Uuid, _: u64) -> io::Result<BoxReader> {
+        Err(cut())
+    }
+    async fn remove(&self, _: DiskId, _: Dest) -> io::Result<()> {
+        Err(cut())
+    }
+    async fn remove_upload(&self, _: DiskId, _: Uuid) -> io::Result<()> {
+        Err(cut())
+    }
+    async fn concat(
+        &self,
+        _: DiskId,
+        _: Uuid,
+        _: Vec<blob::JoinPart>,
+        _: Uuid,
+    ) -> io::Result<String> {
+        Err(cut())
+    }
+    async fn ping(&self) -> io::Result<()> {
+        Err(cut())
     }
 }
 
 #[derive(Default)]
 struct Registry {
-    nodes: RwLock<HashMap<String, Arc<Store>>>,
+    /// Weak: each store holds the registry as its peers; strong references both ways would
+    /// keep every store (and its database connections) alive after the test.
+    nodes: RwLock<HashMap<String, Weak<Store>>>,
     down: RwLock<HashSet<String>>,
+    partitioned: RwLock<HashSet<String>>,
+    /// Nodes whose disks are full, unknown to the free space they report.
+    full: RwLock<HashSet<String>>,
+    /// Writes opened on those nodes.
+    full_opens: Arc<AtomicUsize>,
+    /// Writes attempted to partitioned nodes.
+    cut_opens: Arc<AtomicUsize>,
 }
 
 impl Peers for Registry {
@@ -72,8 +153,17 @@ impl Peers for Registry {
         if self.down.read().unwrap().contains(node_id) {
             return None;
         }
-        let store = self.nodes.read().unwrap().get(node_id).cloned()?;
-        Some(Arc::new(InProcPeer(store)))
+        if self.partitioned.read().unwrap().contains(node_id) {
+            return Some(Arc::new(CutPeer(Arc::clone(&self.cut_opens))));
+        }
+        let store = self.nodes.read().unwrap().get(node_id)?.upgrade()?;
+        let full = self
+            .full
+            .read()
+            .unwrap()
+            .contains(node_id)
+            .then(|| Arc::clone(&self.full_opens));
+        Some(Arc::new(InProcPeer(store, full)))
     }
 }
 
@@ -105,6 +195,7 @@ impl Cluster {
                 node_id: id.clone(),
                 disks: disks.clone(),
                 metadata_url: meta.clone(),
+                metadata_max_connections: common::MAX_CONNECTIONS,
                 ..StoreConfig::default()
             };
             let store = Arc::new(
@@ -116,7 +207,7 @@ impl Cluster {
                 .nodes
                 .write()
                 .unwrap()
-                .insert(id.clone(), store.clone());
+                .insert(id.clone(), Arc::downgrade(&store));
             node_disks.insert(id, disks);
             nodes.push(store);
         }
@@ -446,4 +537,893 @@ async fn a_node_that_comes_back_gets_its_surplus_copies_trimmed() {
         survivor.repair().await.unwrap(),
         suhms_store::RepairReport::default()
     );
+}
+
+/// Live copies of an object: its replica records on disks that are currently alive.
+async fn live_nodes(c: &Cluster, bucket: &str, key: &str) -> Vec<String> {
+    let view = c.nodes[0].cluster_disks().await.unwrap();
+    let mut nodes: Vec<String> = c.nodes[0]
+        .object_replicas(bucket, key)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|d| view.iter().any(|i| i.id == **d && i.alive))
+        .map(|d| c.disk_node[d].clone())
+        .collect();
+    nodes.sort();
+    nodes
+}
+
+#[tokio::test]
+async fn a_failed_disk_is_replaced_on_another_disk_of_the_same_node() {
+    let c = Cluster::start().await;
+    c.nodes[0].create_bucket(OWNER, "data", None).await.unwrap();
+    let keys: Vec<String> = (0..8).map(|i| format!("k{i}")).collect();
+    for k in &keys {
+        c.nodes[0]
+            .put_object(OWNER, put("data", k), k.as_bytes())
+            .await
+            .unwrap();
+    }
+
+    // node1 loses one disk (unmounted / pulled): its root disappears while the server runs.
+    let root = c.node_disks["node1"][0].clone();
+    let away = root.with_extension("away");
+    std::fs::rename(&root, &away).unwrap();
+    c.nodes[0].heartbeat().await.unwrap();
+    // Its last heartbeat ages out (as 30 s without one would).
+    let failed = c.nodes[0]
+        .cluster_disks()
+        .await
+        .unwrap()
+        .iter()
+        .find(|d| d.node_id == "node1" && !d.alive)
+        .expect("the failed disk is reported down at once on its own node")
+        .id;
+    c.nodes[0]
+        .metadata()
+        .heartbeat_disk(failed, 0, 0)
+        .await
+        .unwrap();
+    c.refresh().await;
+
+    // Scrub on node1 skips the missing disk instead of dropping every copy on it.
+    let r = c.nodes[0].scrub().await.unwrap();
+    assert_eq!((r.removed, r.skipped_disks), (0, 1), "{r:?}");
+
+    // Every object is back to three live copies on three nodes: the copies that were on the
+    // failed disk move to node1's other disk.
+    let r = c.nodes[1].repair().await.unwrap();
+    assert!(r.copied > 0 && r.unrecoverable == 0, "{r:?}");
+    for k in &keys {
+        assert_eq!(
+            live_nodes(&c, "data", k).await,
+            vec!["node1", "node2", "node3"],
+            "{k}"
+        );
+        assert_eq!(read(&c.nodes[0], "data", k).await, k.as_bytes());
+    }
+    // Nothing was written to where the disk used to be mounted.
+    assert!(!root.exists());
+
+    // The disk comes back: the extra copies are trimmed, never leaving two on one node.
+    std::fs::rename(&away, &root).unwrap();
+    c.nodes[0].heartbeat().await.unwrap();
+    c.refresh().await;
+    let r = c.nodes[1].repair().await.unwrap();
+    assert!(r.trimmed > 0, "{r:?}");
+    for k in &keys {
+        assert_eq!(
+            c.nodes_holding("data", k).await,
+            vec!["node1", "node2", "node3"],
+            "{k}"
+        );
+        assert_eq!(read(&c.nodes[0], "data", k).await, k.as_bytes());
+    }
+    let r = c.nodes[0].scrub().await.unwrap();
+    assert_eq!((r.removed, r.skipped_disks), (0, 0), "{r:?}");
+}
+
+#[tokio::test]
+async fn repair_resumes_as_soon_as_a_partition_heals() {
+    let c = Cluster::start().await;
+    c.nodes[0].create_bucket(OWNER, "data", None).await.unwrap();
+
+    // node3 is cut off from the other nodes but still heartbeats to the database.
+    c.registry
+        .partitioned
+        .write()
+        .unwrap()
+        .insert("node3".into());
+    c.nodes[0].heartbeat().await.unwrap();
+    c.nodes[0]
+        .put_object(OWNER, put("data", "during"), &b"during"[..])
+        .await
+        .unwrap();
+    assert_eq!(
+        c.nodes_holding("data", "during").await,
+        vec!["node1", "node2"]
+    );
+    // Cannot be fixed now: the object waits (backoff) instead of being retried every pass.
+    let r = c.nodes[0].repair().await.unwrap();
+    assert_eq!(r.copied, 0, "{r:?}");
+
+    // The partition heals. The next pass notices node3 answering again and does not wait
+    // out the backoff.
+    c.registry.partitioned.write().unwrap().remove("node3");
+    let r = c.nodes[0].repair().await.unwrap();
+    assert_eq!((r.copied, r.unrecoverable), (1, 0), "{r:?}");
+    assert_eq!(
+        c.nodes_holding("data", "during").await,
+        vec!["node1", "node2", "node3"]
+    );
+}
+
+#[tokio::test]
+async fn a_heartbeat_brings_a_disk_marked_offline_back() {
+    let c = Cluster::start().await;
+    // An admin command on node3 that could not open a disk marks node3's disks offline.
+    c.nodes[0]
+        .metadata()
+        .set_node_disks_offline("node3")
+        .await
+        .unwrap();
+    c.refresh().await;
+    let down = |v: &[suhms_store::DiskInfo]| {
+        v.iter()
+            .filter(|d| d.node_id == "node3" && !d.alive)
+            .count()
+    };
+    assert_eq!(down(&c.nodes[0].cluster_disks().await.unwrap()), 2);
+    // The running server's next heartbeat corrects it.
+    c.nodes[2].heartbeat().await.unwrap();
+    c.refresh().await;
+    assert_eq!(down(&c.nodes[0].cluster_disks().await.unwrap()), 0);
+}
+
+/// A node that died since the last ping is still in the cluster view and gets picked for new
+/// copies. Opening the copy there fails before any data is read, and another node takes it, so
+/// even a 2-of-2 write (STANDARD_IA) succeeds.
+#[tokio::test]
+async fn a_peer_that_died_since_the_last_ping_is_replaced_for_new_copies() {
+    let c = Cluster::start().await;
+    c.nodes[0]
+        .create_bucket(OWNER, "data", Some(2))
+        .await
+        .unwrap();
+    c.nodes[0].heartbeat().await.unwrap();
+    // No heartbeat after this: node1 still believes node3 is reachable.
+    c.registry
+        .partitioned
+        .write()
+        .unwrap()
+        .insert("node3".into());
+    for i in 0..12 {
+        let key = format!("k{i}");
+        c.nodes[0]
+            .put_object(OWNER, put("data", &key), &b"x"[..])
+            .await
+            .unwrap();
+        assert_eq!(c.nodes_holding("data", &key).await, vec!["node1", "node2"]);
+    }
+}
+
+/// Runs a 2-copy (2-of-2) multipart upload in which one of the nodes chosen at the start fails
+/// after the first part. `partition` cuts it off without anyone noticing yet (the write itself
+/// finds out); otherwise it crashes and is known to be down.
+async fn multipart_survives_losing_a_chosen_node(partition: bool) {
+    let c = Cluster::start().await;
+    c.nodes[0]
+        .create_bucket(OWNER, "mpu", Some(2))
+        .await
+        .unwrap();
+    let upload = c.nodes[0]
+        .create_multipart_upload(OWNER, put("mpu", "big"))
+        .await
+        .unwrap();
+    let mut chosen: Vec<String> = upload
+        .disks
+        .iter()
+        .map(|d| c.disk_node[d].clone())
+        .collect();
+    chosen.sort();
+    assert_eq!(chosen.len(), 2);
+    // Lose a chosen node other than node1 (which serves the requests).
+    let lost = chosen.iter().find(|n| *n != "node1").unwrap().clone();
+    let p1: Vec<u8> = vec![1; MIN_PART_SIZE as usize];
+    let p2: Vec<u8> = vec![2; 1000];
+    let r1 = c.nodes[0]
+        .upload_part(OWNER, "mpu", "big", upload.id, 1, None, &p1[..])
+        .await
+        .unwrap();
+    if partition {
+        c.registry.partitioned.write().unwrap().insert(lost.clone());
+    } else {
+        let i = c.nodes.iter().position(|n| n.node_id() == lost).unwrap();
+        c.crash(i).await;
+    }
+    let r2 = c.nodes[0]
+        .upload_part(OWNER, "mpu", "big", upload.id, 2, None, &p2[..])
+        .await
+        .unwrap();
+    let parts = [
+        CompletedPart {
+            part_number: 1,
+            etag: r1.etag,
+        },
+        CompletedPart {
+            part_number: 2,
+            etag: r2.etag,
+        },
+    ];
+    c.nodes[0]
+        .complete_multipart_upload(OWNER, "mpu", "big", upload.id, &parts)
+        .await
+        .unwrap();
+    let holding = c.nodes_holding("mpu", "big").await;
+    assert_eq!(holding.len(), 2, "{holding:?}");
+    assert!(
+        !holding.contains(&lost),
+        "{holding:?} must not include {lost}"
+    );
+    let mut expected = p1;
+    expected.extend_from_slice(&p2);
+    assert_eq!(read(&c.nodes[0], "mpu", "big").await, expected);
+    // The part files are gone from every live disk.
+    for node in ["node1", "node2", "node3"].iter().filter(|n| **n != lost) {
+        for d in &c.node_disks[*node] {
+            let dir = d
+                .join(".suhms/multipart")
+                .join(upload.id.simple().to_string());
+            assert!(!dir.exists(), "{}", dir.display());
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_two_copy_multipart_upload_survives_a_node_crash() {
+    multipart_survives_losing_a_chosen_node(false).await;
+}
+
+#[tokio::test]
+async fn a_two_copy_multipart_upload_survives_a_node_lost_since_the_last_ping() {
+    multipart_survives_losing_a_chosen_node(true).await;
+}
+
+/// A whole read served from another node's copy that turns out corrupt drops that copy too
+/// (after checking it again), instead of leaving it to that node's scrub.
+#[tokio::test]
+async fn a_corrupt_copy_on_another_node_found_by_a_read_is_dropped() {
+    let c = Cluster::start().await;
+    c.nodes[0]
+        .create_bucket(OWNER, "data", Some(2))
+        .await
+        .unwrap();
+    let body: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    c.nodes[0]
+        .put_object(OWNER, put("data", "obj"), &body[..])
+        .await
+        .unwrap();
+    let holding = c.nodes_holding("data", "obj").await;
+    let reader = c
+        .nodes
+        .iter()
+        .find(|n| !holding.contains(&n.node_id().to_owned()))
+        .unwrap();
+    // Corrupt both copies, so the reader (which has none) reads a corrupt remote one.
+    let mut bad = body.clone();
+    bad[1000] ^= 0xff;
+    for n in &c.nodes {
+        for p in n.object_locations("data", "obj").await.unwrap() {
+            std::fs::write(p, &bad).unwrap();
+        }
+    }
+    let stored = reader.get_object(OWNER, "data", "obj").await.unwrap();
+    let mut r = reader
+        .read_object(&stored, 0..stored.object.size)
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    let err = r.read_to_end(&mut out).await.unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    for _ in 0..100 {
+        if c.nodes[0]
+            .object_replicas("data", "obj")
+            .await
+            .unwrap()
+            .len()
+            == 1
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the corrupt remote copy was not dropped");
+}
+
+/// After a write fails to open a copy on a node, that node is pinged right away and, if it does
+/// not answer, left out of the following writes instead of being tried until the next heartbeat.
+#[tokio::test]
+async fn a_node_that_fails_a_write_is_pinged_and_skipped() {
+    let c = Cluster::start().await;
+    c.nodes[0].create_bucket(OWNER, "data", None).await.unwrap();
+    c.nodes[0].heartbeat().await.unwrap();
+    c.registry
+        .partitioned
+        .write()
+        .unwrap()
+        .insert("node3".into());
+    c.nodes[0]
+        .put_object(OWNER, put("data", "first"), &b"x"[..])
+        .await
+        .unwrap();
+    assert_eq!(c.registry.cut_opens.load(Ordering::Relaxed), 1);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    for i in 0..5 {
+        c.nodes[0]
+            .put_object(OWNER, put("data", &format!("k{i}")), &b"x"[..])
+            .await
+            .unwrap();
+    }
+    assert_eq!(c.registry.cut_opens.load(Ordering::Relaxed), 1);
+
+    // Once it answers again, the next heartbeat brings it back.
+    c.registry.partitioned.write().unwrap().remove("node3");
+    c.nodes[0].heartbeat().await.unwrap();
+    c.nodes[0]
+        .put_object(OWNER, put("data", "after"), &b"x"[..])
+        .await
+        .unwrap();
+    assert_eq!(
+        c.nodes_holding("data", "after").await,
+        vec!["node1", "node2", "node3"]
+    );
+}
+
+impl Cluster {
+    /// Pending removals recorded for a node's disks.
+    async fn pending_on(&self, node: &str) -> usize {
+        let mut n = 0;
+        for (id, owner) in &self.disk_node {
+            if owner == node {
+                n += self.nodes[0]
+                    .metadata()
+                    .list_pending_removals(*id, 1000)
+                    .await
+                    .unwrap()
+                    .len();
+            }
+        }
+        n
+    }
+
+    /// Whether any disk of the node still has the parts directory of an upload.
+    fn has_upload_dir(&self, node: &str, upload: Uuid) -> bool {
+        self.node_disks[node].iter().any(|d| {
+            d.join(".suhms/multipart")
+                .join(upload.simple().to_string())
+                .exists()
+        })
+    }
+}
+
+/// Deletes and overwrites while a node is down leave its copies behind; the node deletes them
+/// as soon as it is back (its first heartbeat) instead of waiting for gc.
+async fn removals_missed_by_a_node_are_carried_out_when_it_returns(partition: bool) {
+    let c = Cluster::start().await;
+    c.nodes[0].create_bucket(OWNER, "data", None).await.unwrap();
+    for key in ["gone", "replaced", "kept"] {
+        c.nodes[0]
+            .put_object(OWNER, put("data", key), &b"old"[..])
+            .await
+            .unwrap();
+    }
+    let upload = c.nodes[0]
+        .create_multipart_upload(OWNER, put("data", "mpu"))
+        .await
+        .unwrap();
+    c.nodes[0]
+        .upload_part(OWNER, "data", "mpu", upload.id, 1, None, &b"part"[..])
+        .await
+        .unwrap();
+    assert_eq!(c.files_on("node3"), 3);
+    assert!(c.has_upload_dir("node3", upload.id));
+
+    if partition {
+        // Cut off without node1 noticing: the removal requests themselves fail.
+        c.nodes[0].heartbeat().await.unwrap();
+        c.registry
+            .partitioned
+            .write()
+            .unwrap()
+            .insert("node3".into());
+    } else {
+        c.crash(2).await;
+    }
+    c.nodes[0]
+        .delete_object(OWNER, "data", "gone")
+        .await
+        .unwrap();
+    c.nodes[0]
+        .put_object(OWNER, put("data", "replaced"), &b"new"[..])
+        .await
+        .unwrap();
+    c.nodes[0]
+        .abort_multipart_upload(OWNER, "data", "mpu", upload.id)
+        .await
+        .unwrap();
+    // node1 and node2 deleted their copies; node3's are recorded.
+    assert_eq!(c.files_on("node1"), 2);
+    assert_eq!(c.files_on("node3"), 3);
+    assert_eq!(c.pending_on("node3").await, 3);
+    assert_eq!(c.pending_on("node1").await, 0);
+
+    if partition {
+        c.registry.partitioned.write().unwrap().remove("node3");
+    }
+    c.recover(2).await;
+    // Only the copy of the object that still exists is left on node3.
+    assert_eq!(c.files_on("node3"), 1);
+    assert!(!c.has_upload_dir("node3", upload.id));
+    assert_eq!(c.pending_on("node3").await, 0);
+    assert_eq!(read(&c.nodes[2], "data", "kept").await, b"old");
+}
+
+#[tokio::test]
+async fn removals_missed_by_a_crashed_node_are_carried_out_when_it_returns() {
+    removals_missed_by_a_node_are_carried_out_when_it_returns(false).await;
+}
+
+#[tokio::test]
+async fn removals_missed_by_a_partitioned_node_are_carried_out_when_it_returns() {
+    removals_missed_by_a_node_are_carried_out_when_it_returns(true).await;
+}
+
+/// A pending removal of a file the metadata still points at (it should never be recorded, but
+/// the rows are only a hint) leaves the file alone.
+#[tokio::test]
+async fn a_pending_removal_never_deletes_a_live_copy() {
+    let c = Cluster::start().await;
+    c.nodes[0].create_bucket(OWNER, "data", None).await.unwrap();
+    c.nodes[0]
+        .put_object(OWNER, put("data", "obj"), &b"live"[..])
+        .await
+        .unwrap();
+    let stored = c.nodes[0].get_object(OWNER, "data", "obj").await.unwrap();
+    let pending: Vec<_> = stored
+        .replicas
+        .iter()
+        .map(|d| suhms_store::meta::PendingRemoval {
+            disk_id: *d,
+            target: suhms_store::meta::RemovalTarget::Object(stored.object.id),
+        })
+        .collect();
+    c.nodes[0]
+        .metadata()
+        .add_pending_removals(&pending)
+        .await
+        .unwrap();
+    for n in &c.nodes {
+        n.heartbeat().await.unwrap();
+    }
+    for node in ["node1", "node2", "node3"] {
+        assert_eq!(c.files_on(node), 1, "{node}");
+        assert_eq!(c.pending_on(node).await, 0, "{node}");
+    }
+    assert_eq!(read(&c.nodes[2], "data", "obj").await, b"live");
+}
+
+/// Disks reported with less than `min_free_bytes` free get no new copies: node3 with one nearly
+/// full disk writes to its other disk, and with both nearly full it is left out.
+#[tokio::test]
+async fn nearly_full_disks_get_no_new_copies() {
+    let c = Cluster::start().await;
+    c.nodes[0].create_bucket(OWNER, "data", None).await.unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let mut node3: Vec<DiskId> = c
+        .disk_node
+        .iter()
+        .filter(|(_, n)| *n == "node3")
+        .map(|(d, _)| *d)
+        .collect();
+    node3.sort();
+    let meta = c.nodes[0].metadata();
+    meta.heartbeat_disk(node3[0], 100 << 20, now).await.unwrap();
+    c.refresh().await;
+    for i in 0..8 {
+        let key = format!("k{i}");
+        c.nodes[0]
+            .put_object(OWNER, put("data", &key), &b"x"[..])
+            .await
+            .unwrap();
+        let stored = c.nodes[0].get_object(OWNER, "data", &key).await.unwrap();
+        assert!(stored.replicas.contains(&node3[1]), "{key}");
+        assert!(!stored.replicas.contains(&node3[0]), "{key}");
+    }
+
+    meta.heartbeat_disk(node3[1], 100 << 20, now).await.unwrap();
+    c.refresh().await;
+    c.nodes[0]
+        .put_object(OWNER, put("data", "full"), &b"x"[..])
+        .await
+        .unwrap();
+    assert_eq!(
+        c.nodes_holding("data", "full").await,
+        vec!["node1", "node2"]
+    );
+    // Repair has nowhere to put the third copy either.
+    let r = c.nodes[0].repair().await.unwrap();
+    assert_eq!(r.copied, 0, "{r:?}");
+}
+
+/// A PUT whose size is known (`Content-Length`, a copy's source) needs room for the object on
+/// top of `min_free_bytes`: disks that have the minimum but not the object's size are skipped.
+#[tokio::test]
+async fn a_known_size_keeps_copies_off_disks_without_room_for_it() {
+    let c = Cluster::start().await;
+    c.nodes[0].create_bucket(OWNER, "data", None).await.unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let node3: Vec<DiskId> = c
+        .disk_node
+        .iter()
+        .filter(|(_, n)| *n == "node3")
+        .map(|(d, _)| *d)
+        .collect();
+    // 3 GiB free on each disk of node3: above the 1 GiB minimum.
+    for d in &node3 {
+        c.nodes[0]
+            .metadata()
+            .heartbeat_disk(*d, 3 << 30, now)
+            .await
+            .unwrap();
+    }
+    c.refresh().await;
+    let sized = |key: &str, size: u64| PutObjectRequest {
+        size_hint: Some(size),
+        ..put("data", key)
+    };
+
+    // 1 GiB fits (1 + 1 <= 3); 4 GiB does not, so node3 is left out.
+    c.nodes[0]
+        .put_object(OWNER, sized("small", 1 << 30), &b"x"[..])
+        .await
+        .unwrap();
+    assert_eq!(
+        c.nodes_holding("data", "small").await,
+        vec!["node1", "node2", "node3"]
+    );
+    c.nodes[0]
+        .put_object(OWNER, sized("big", 4 << 30), &b"x"[..])
+        .await
+        .unwrap();
+    assert_eq!(c.nodes_holding("data", "big").await, vec!["node1", "node2"]);
+}
+
+/// A disk of a multipart upload that fills up during the upload is replaced for the following
+/// parts (as a disk that is down would be), so a 2-copy upload still completes instead of every
+/// retry of the part failing on the full disk.
+#[tokio::test]
+async fn a_disk_that_fills_up_during_a_multipart_upload_is_replaced() {
+    let c = Cluster::start().await;
+    c.nodes[0]
+        .create_bucket(OWNER, "mpu", Some(2))
+        .await
+        .unwrap();
+    let upload = c.nodes[0]
+        .create_multipart_upload(OWNER, put("mpu", "big"))
+        .await
+        .unwrap();
+    let p1: Vec<u8> = vec![1; MIN_PART_SIZE as usize];
+    let p2: Vec<u8> = vec![2; 1000];
+    let r1 = c.nodes[0]
+        .upload_part_with(
+            OWNER,
+            "mpu",
+            "big",
+            upload.id,
+            1,
+            None,
+            None,
+            Some(p1.len() as u64),
+            &p1[..],
+        )
+        .await
+        .unwrap();
+
+    // One of the upload's disks on another node fills up.
+    let full = *upload
+        .disks
+        .iter()
+        .find(|d| c.disk_node[*d] != "node1")
+        .expect("a copy on another node");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    c.nodes[0]
+        .metadata()
+        .heartbeat_disk(full, 100 << 20, now)
+        .await
+        .unwrap();
+    c.refresh().await;
+    let r2 = c.nodes[0]
+        .upload_part_with(
+            OWNER,
+            "mpu",
+            "big",
+            upload.id,
+            2,
+            None,
+            None,
+            Some(p2.len() as u64),
+            &p2[..],
+        )
+        .await
+        .unwrap();
+    assert!(!r2.disks.contains(&full), "{:?}", r2.disks);
+    assert_eq!(r2.disks.len(), 2);
+
+    let parts = [
+        CompletedPart {
+            part_number: 1,
+            etag: r1.etag,
+        },
+        CompletedPart {
+            part_number: 2,
+            etag: r2.etag,
+        },
+    ];
+    c.nodes[0]
+        .complete_multipart_upload(OWNER, "mpu", "big", upload.id, &parts)
+        .await
+        .unwrap();
+    let mut expected = p1;
+    expected.extend_from_slice(&p2);
+    assert_eq!(read(&c.nodes[1], "mpu", "big").await, expected);
+}
+
+/// Too few disks with room is reported as such (a 507 for S3 clients); too few reachable
+/// disks stays a quorum failure (a 503 worth retrying).
+#[tokio::test]
+async fn running_out_of_space_is_told_apart_from_losing_nodes() {
+    let c = Cluster::start().await;
+    c.nodes[0].create_bucket(OWNER, "data", None).await.unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let others: Vec<DiskId> = c
+        .disk_node
+        .iter()
+        .filter(|(_, n)| *n != "node1")
+        .map(|(d, _)| *d)
+        .collect();
+    for d in &others {
+        c.nodes[0]
+            .metadata()
+            .heartbeat_disk(*d, 100 << 20, now)
+            .await
+            .unwrap();
+    }
+    c.refresh().await;
+    let err = c.nodes[0]
+        .put_object(OWNER, put("data", "k"), &b"x"[..])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::InsufficientStorage {
+                required: 2,
+                available: 1
+            }
+        ),
+        "{err:?}"
+    );
+
+    // With node2 and node3 down instead, it is the usual quorum failure.
+    for n in [1, 2] {
+        c.recover(n).await;
+        c.crash(n).await;
+    }
+    let err = c.nodes[0]
+        .put_object(OWNER, put("data", "k"), &b"x"[..])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::WriteQuorum { .. }), "{err:?}");
+}
+
+/// Completing writes the whole object on each disk: a disk without room for it is left out
+/// (another disk gets the parts copied and assembles instead), and with no disk left to take
+/// its place the completion reports the lack of space.
+#[tokio::test]
+async fn completion_skips_disks_without_room_for_the_object() {
+    let c = Cluster::start().await;
+    c.nodes[0]
+        .create_bucket(OWNER, "mpu", Some(2))
+        .await
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let fill = |disks: Vec<DiskId>| {
+        let meta = Arc::clone(c.nodes[0].metadata());
+        async move {
+            for d in disks {
+                meta.heartbeat_disk(d, 100 << 20, now).await.unwrap();
+            }
+        }
+    };
+    let upload_two_parts = |key: &'static str| {
+        let node = Arc::clone(&c.nodes[0]);
+        async move {
+            let upload = node
+                .create_multipart_upload(OWNER, put("mpu", key))
+                .await
+                .unwrap();
+            let mut parts = Vec::new();
+            for (n, body) in [(1, vec![1u8; MIN_PART_SIZE as usize]), (2, vec![2u8; 1000])] {
+                let r = node
+                    .upload_part(OWNER, "mpu", key, upload.id, n, None, &body[..])
+                    .await
+                    .unwrap();
+                parts.push(CompletedPart {
+                    part_number: n,
+                    etag: r.etag,
+                });
+            }
+            (upload, parts)
+        }
+    };
+
+    // The parts are on node1 and one other node, whose disk then fills up.
+    let (upload, parts) = upload_two_parts("a").await;
+    let full = *upload
+        .disks
+        .iter()
+        .find(|d| c.disk_node[*d] != "node1")
+        .unwrap();
+    fill(vec![full]).await;
+    c.refresh().await;
+    c.nodes[0]
+        .complete_multipart_upload(OWNER, "mpu", "a", upload.id, &parts)
+        .await
+        .unwrap();
+    let stored = c.nodes[0].get_object(OWNER, "mpu", "a").await.unwrap();
+    assert_eq!(stored.replicas.len(), 2);
+    assert!(!stored.replicas.contains(&full), "{:?}", stored.replicas);
+
+    // Every disk outside node1 full: nowhere to put the second copy.
+    c.recover(1).await;
+    c.recover(2).await;
+    let (upload, parts) = upload_two_parts("b").await;
+    fill(
+        c.disk_node
+            .iter()
+            .filter(|(_, n)| *n != "node1")
+            .map(|(d, _)| *d)
+            .collect(),
+    )
+    .await;
+    c.refresh().await;
+    let err = c.nodes[0]
+        .complete_multipart_upload(OWNER, "mpu", "b", upload.id, &parts)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::InsufficientStorage {
+                required: 2,
+                available: 1
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+/// A disk that fills up during a write (its node's heartbeat still reports room): the write
+/// is refused as out of space when it costs the quorum, the disks found full are avoided by the
+/// next writes (instead of each write sending its body to them first), and refusals are counted.
+#[tokio::test]
+async fn disks_that_fill_up_during_writes_are_avoided_and_reported() {
+    let c = Cluster::start().await;
+    c.nodes[0]
+        .create_bucket(OWNER, "data", Some(2))
+        .await
+        .unwrap();
+    c.registry
+        .full
+        .write()
+        .unwrap()
+        .extend(["node2".to_owned(), "node3".to_owned()]);
+    for i in 0..8 {
+        let err = c.nodes[0]
+            .put_object(OWNER, put("data", &format!("k{i}")), &b"x"[..])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::InsufficientStorage { required: 2, .. }),
+            "{err:?}"
+        );
+    }
+    assert_eq!(c.nodes[0].space_refusals(), 8);
+    // node2 and node3 have four disks: each was written to at most once before being avoided.
+    let opens = c.registry.full_opens.load(Ordering::Relaxed);
+    assert!((1..=4).contains(&opens), "{opens}");
+    c.nodes[0]
+        .put_object(OWNER, put("data", "again"), &b"x"[..])
+        .await
+        .unwrap_err();
+    assert_eq!(c.registry.full_opens.load(Ordering::Relaxed), opens);
+}
+
+/// A disk that fills up while an upload is assembled on it: the completion is refused as out of
+/// space (507, not a 503 that clients would retry in vain), and a retry assembles elsewhere.
+#[tokio::test]
+async fn a_disk_that_fills_up_while_assembling_is_reported_and_avoided() {
+    let c = Cluster::start().await;
+    c.nodes[0]
+        .create_bucket(OWNER, "mpu", Some(2))
+        .await
+        .unwrap();
+    let upload = c.nodes[0]
+        .create_multipart_upload(OWNER, put("mpu", "big"))
+        .await
+        .unwrap();
+    let body = vec![7u8; 1000];
+    let r = c.nodes[0]
+        .upload_part(OWNER, "mpu", "big", upload.id, 1, None, &body[..])
+        .await
+        .unwrap();
+    let parts = [CompletedPart {
+        part_number: 1,
+        etag: r.etag,
+    }];
+    let full_disk = *upload
+        .disks
+        .iter()
+        .find(|d| c.disk_node[*d] != "node1")
+        .unwrap();
+    let other = c.disk_node[&full_disk].clone();
+    c.registry.full.write().unwrap().insert(other.clone());
+
+    let err = c.nodes[0]
+        .complete_multipart_upload(OWNER, "mpu", "big", upload.id, &parts)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::InsufficientStorage {
+                required: 2,
+                available: 1
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(c.nodes[0].space_refusals(), 1);
+
+    // Only that disk is full (the test peer fails the whole node; heal it): the retry avoids
+    // the disk found full and copies the part to another disk instead.
+    c.registry.full.write().unwrap().remove(&other);
+    c.nodes[0]
+        .complete_multipart_upload(OWNER, "mpu", "big", upload.id, &parts)
+        .await
+        .unwrap();
+    let stored = c.nodes[0].get_object(OWNER, "mpu", "big").await.unwrap();
+    assert_eq!(stored.replicas.len(), 2);
+    assert!(
+        !stored.replicas.contains(&full_disk),
+        "{:?}",
+        stored.replicas
+    );
+    assert_eq!(read(&c.nodes[1], "mpu", "big").await, body);
 }

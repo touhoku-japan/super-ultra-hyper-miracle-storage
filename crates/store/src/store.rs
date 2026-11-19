@@ -21,8 +21,8 @@ use crate::{
     lock::{self, BucketLock},
     meta::{
         self, BucketRecord, BucketSetting, DeleteBucketOutcome, LifecycleScan, MetadataStore,
-        NULL_VERSION, ObjectRecord, PartRecord, StorageUsage, StoredObject, TenantRecord,
-        UploadRecord, VersioningMode, WriteCondition,
+        NULL_VERSION, ObjectRecord, PartRecord, PendingRemoval, RemovalTarget, StorageUsage,
+        StoredObject, TenantRecord, UploadRecord, VersioningMode, WriteCondition,
     },
     placement::{self, Candidate},
 };
@@ -38,6 +38,8 @@ const MAX_USER_METADATA: usize = 2048;
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 pub const MAX_PART_NUMBER: u32 = 10_000;
 const PAGE: u32 = 500;
+/// Pending removals handled per disk and heartbeat.
+const PENDING_REMOVAL_BATCH: u32 = 1000;
 /// How often nodes refresh their disks' liveness and free space in the metadata store.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// A disk whose last heartbeat is older than this is treated as offline.
@@ -110,6 +112,10 @@ pub struct PutObjectRequest {
     pub lock_mode: Option<String>,
     pub lock_until: Option<i64>,
     pub legal_hold: bool,
+    /// The body's size when known in advance (`Content-Length`, the source of a copy). Disks
+    /// without room for it plus [`StoreConfig::min_free_bytes`] get no copy (see
+    /// [`Store::place`]); without it only the minimum is required.
+    pub size_hint: Option<u64>,
 }
 
 /// Outcome of a DeleteObject.
@@ -187,6 +193,9 @@ pub struct ScrubReport {
     pub checked: u64,
     /// Copies that were missing or did not match their hash and were dropped.
     pub removed: u64,
+    /// This node's configured disks that could not be scrubbed: not opened at startup, or
+    /// failing their health check (unmounted, removed, I/O errors).
+    pub skipped_disks: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +229,198 @@ pub struct Store {
     instance: String,
     /// Live, non-draining disks as of the last repair pass (to notice new capacity).
     repair_capacity: std::sync::Mutex<Option<HashSet<DiskId>>>,
+    /// Configured disks that could not be opened at startup.
+    unopened: usize,
+    /// Nodes whose node API did not answer the last ping. Their disks may still heartbeat
+    /// (the metadata DB is reachable from both sides of a network partition), but this node
+    /// cannot use them.
+    /// Also updated between pings when talking to a node fails ([`Store::suspect_node`]).
+    unreachable: Arc<std::sync::RwLock<HashSet<String>>>,
+    /// Nodes being pinged by [`Store::suspect_node`].
+    probing: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Background checks of copies that served ranged reads.
+    range_checks: Arc<RangeChecks>,
+    /// Other nodes' disks that ran out of space during a write, and when: placed as having no
+    /// free space until their node's next heartbeats report the real figure ([`FULL_TTL`]).
+    full_disks: std::sync::Mutex<HashMap<DiskId, Instant>>,
+    /// Writes refused with [`StoreError::InsufficientStorage`] (for `/metrics`).
+    space_refusals: std::sync::atomic::AtomicU64,
+}
+
+/// How long a disk found full during a write counts as full (see `Store::full_disks`): until
+/// a heartbeat of its node is certain to have refreshed its free space.
+const FULL_TTL: Duration = Duration::from_secs(2 * HEARTBEAT_INTERVAL.as_secs() + 1);
+
+/// How long a copy that was checked after a ranged read is not checked again.
+const RANGE_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
+/// Copies hashed at the same time by [`RangeChecks`].
+const RANGE_CHECK_CONCURRENCY: usize = 2;
+/// Checks waiting for their turn; ranged reads beyond this are left to scrub.
+const RANGE_CHECK_MAX_PENDING: usize = 256;
+
+/// Ranged reads cannot be checked against the object's BLAKE3 without reading the whole copy,
+/// so a copy that served one is hashed in full afterwards, in the background. The bytes already
+/// sent cannot be taken back, but a corrupt copy is found (and dropped, which queues it for
+/// repair) right away instead of at the next scrub, and the following reads use a healthy
+/// copy. Each copy is checked at most once per [`RANGE_CHECK_INTERVAL`] (a client downloading
+/// a large object in parallel ranges triggers one check), with bounded concurrency.
+struct RangeChecks {
+    recent: std::sync::Mutex<HashMap<(Uuid, DiskId), Instant>>,
+    pending: std::sync::atomic::AtomicUsize,
+    running: tokio::sync::Semaphore,
+}
+
+impl RangeChecks {
+    fn new() -> Self {
+        Self {
+            recent: std::sync::Mutex::new(HashMap::new()),
+            pending: std::sync::atomic::AtomicUsize::new(0),
+            running: tokio::sync::Semaphore::new(RANGE_CHECK_CONCURRENCY),
+        }
+    }
+
+    /// Claims a check of `object` on `disk`; false if it was checked recently or too many
+    /// checks are waiting.
+    fn claim(&self, object: Uuid, disk: DiskId) -> bool {
+        use std::sync::atomic::Ordering;
+        let now = Instant::now();
+        let mut recent = self.recent.lock().expect("range check map poisoned");
+        if recent
+            .get(&(object, disk))
+            .is_some_and(|at| now.duration_since(*at) < RANGE_CHECK_INTERVAL)
+        {
+            return false;
+        }
+        if self.pending.load(Ordering::Relaxed) >= RANGE_CHECK_MAX_PENDING {
+            return false;
+        }
+        if recent.len() >= 4096 {
+            recent.retain(|_, at| now.duration_since(*at) < RANGE_CHECK_INTERVAL);
+        }
+        recent.insert((object, disk), now);
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    fn done(&self) {
+        self.pending
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Re-hashes one copy of an object in the background, at most [`RANGE_CHECK_CONCURRENCY`] at a
+/// time; a copy that mismatches every time is dropped (its replicas row first, which queues the
+/// object for repair, then the file), on this node or another. The caller has counted the check
+/// in [`RangeChecks::pending`].
+struct CopyChecker {
+    checks: Arc<RangeChecks>,
+    meta: Arc<dyn MetadataStore>,
+    object: Uuid,
+    size: u64,
+    expected: String,
+}
+
+impl CopyChecker {
+    fn spawn(self, disk: DiskRef, times: usize, suspect: bool) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.checks.done();
+            return;
+        };
+        runtime.spawn(async move {
+            let _permit = self.checks.running.acquire().await;
+            if self.is_corrupt(&disk, times, suspect).await {
+                tracing::warn!(object = %self.object, disk = %disk.label(), "dropping a copy that does not match its hash");
+                // Also queues the object for repair.
+                match self.meta.remove_replica(self.object, disk.id()).await {
+                    Ok(()) => {
+                        if !disk.remove(Dest::Object(self.object)).await {
+                            let pending = PendingRemoval {
+                                disk_id: disk.id(),
+                                target: RemovalTarget::Object(self.object),
+                            };
+                            if let Err(error) = self.meta.add_pending_removals(&[pending]).await {
+                                tracing::warn!(object = %self.object, %error, "failed to record a pending removal");
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(object = %self.object, %error, "failed to drop corrupt replica; scrub will retry");
+                    }
+                }
+            }
+            self.checks.done();
+        });
+    }
+
+    /// Hashes the copy `times` times. `suspect`: a read already found it corrupt (log what the
+    /// check finds even when the copy turns out fine).
+    async fn is_corrupt(&self, disk: &DiskRef, times: usize, suspect: bool) -> bool {
+        for _ in 0..times {
+            match hash_copy(disk, self.object, self.size).await {
+                Ok(hash) if hash != self.expected => {}
+                Ok(_) => {
+                    if suspect {
+                        tracing::warn!(object = %self.object, disk = %disk.label(), "copy matched its hash when read again; keeping it");
+                    }
+                    return false;
+                }
+                Err(error) => {
+                    // Deleted meanwhile, or unreadable: the next read or scrub tells.
+                    if suspect {
+                        tracing::warn!(object = %self.object, disk = %disk.label(), %error, "cannot re-check copy; leaving it to scrub");
+                    } else {
+                        tracing::debug!(object = %self.object, disk = %disk.label(), %error, "cannot check copy");
+                    }
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+/// The CRC a part was uploaded with, from its stored checksum (JSON `{"algorithm", "type",
+/// "value"}` with the value in base64, as the server writes it), if it is a CRC.
+fn part_crc(checksum: Option<&str>) -> Option<blob::PartCrc> {
+    #[derive(serde::Deserialize)]
+    struct Stored {
+        algorithm: String,
+        value: String,
+    }
+    let stored: Stored = serde_json::from_str(checksum?).ok()?;
+    let (algorithm, width) = match stored.algorithm.to_ascii_uppercase().as_str() {
+        "CRC32" => (blob::CrcKind::Crc32, 4),
+        "CRC32C" => (blob::CrcKind::Crc32c, 4),
+        "CRC64NVME" => (blob::CrcKind::Crc64Nvme, 8),
+        _ => return None,
+    };
+    let raw = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(stored.value.trim())
+            .ok()?
+    };
+    if raw.len() != width {
+        return None;
+    }
+    let value = raw.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
+    Some(blob::PartCrc { algorithm, value })
+}
+
+/// Reads a whole copy and returns its hex BLAKE3.
+async fn hash_copy(disk: &DiskRef, object: Uuid, size: u64) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt as _;
+    let mut reader = disk.read(object, size, 0..size).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0; 1 << 20];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn now_millis() -> i64 {
@@ -299,7 +500,17 @@ fn validate_key(key: &str) -> Result<()> {
     if key.is_empty() || key.len() > MAX_KEY_LEN {
         return Err(StoreError::InvalidObjectKey);
     }
+    if key.bytes().any(is_xml_control_byte) {
+        return Err(StoreError::InvalidKeyCharacter);
+    }
     Ok(())
+}
+
+/// Bytes XML 1.0 cannot carry: control characters other than tab, LF and CR. S3 listings echo
+/// keys in XML, and `s3s` refuses to serialize these (the whole listing would fail with 500), so
+/// such keys are rejected when written.
+pub fn is_xml_control_byte(b: u8) -> bool {
+    b < b' ' && !matches!(b, b'\t' | b'\n' | b'\r')
 }
 
 /// Bucket names the server keeps for itself: the health check at
@@ -332,7 +543,8 @@ impl Store {
     /// Opens a store that is part of a cluster; `peers` reaches the other nodes.
     pub async fn open_with_peers(config: StoreConfig, peers: Arc<dyn Peers>) -> Result<Self> {
         config.validate()?;
-        let meta = meta::connect(&config.metadata_url).await?;
+        let meta =
+            meta::connect_with(&config.metadata_url, config.metadata_max_connections).await?;
         Self::with_metadata(config, meta, peers).await
     }
 
@@ -347,8 +559,15 @@ impl Store {
         meta.set_node_disks_offline(&config.node_id).await?;
         let mut disks = Vec::new();
         let mut seen = HashSet::new();
+        let mut unopened = 0;
         for path in &config.disks {
             match Disk::open(path, &config.node_id).await {
+                Ok(disk) if meta.is_disk_removed(disk.id).await? => {
+                    tracing::error!(path = %path.display(), disk_id = %disk.id,
+                        "this disk was removed from the cluster (`suhms disk remove`); not using it. \
+                         Take it out of the config, or empty the directory to reuse it as a new disk");
+                    unopened += 1;
+                }
                 Ok(disk) => {
                     if !seen.insert(disk.id) {
                         return Err(StoreError::Config(format!(
@@ -368,6 +587,7 @@ impl Store {
                 }
                 Err(error) => {
                     tracing::error!(path = %path.display(), %error, "disk unavailable; continuing without it");
+                    unopened += 1;
                 }
             }
         }
@@ -382,8 +602,51 @@ impl Store {
             usage: RwLock::new(HashMap::new()),
             instance: format!("{}/{}", config.node_id, Uuid::new_v4().simple()),
             repair_capacity: std::sync::Mutex::new(None),
+            unopened,
+            unreachable: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            probing: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            range_checks: Arc::new(RangeChecks::new()),
+            full_disks: std::sync::Mutex::new(HashMap::new()),
+            space_refusals: std::sync::atomic::AtomicU64::new(0),
             config,
         })
+    }
+
+    /// Writes refused so far for lack of space ([`StoreError::InsufficientStorage`]).
+    pub fn space_refusals(&self) -> u64 {
+        self.space_refusals
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Counts `e` when it is a refusal for lack of space; returns it.
+    fn note_refusal(&self, e: StoreError) -> StoreError {
+        if matches!(e, StoreError::InsufficientStorage { .. }) {
+            self.space_refusals
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        e
+    }
+
+    /// Treats other nodes' disks that ran out of space as full until [`FULL_TTL`] passes.
+    async fn mark_full(&self, disks: &[DiskId]) {
+        let remote: Vec<DiskId> = disks
+            .iter()
+            .filter(|d| self.local_disk(**d).is_none())
+            .copied()
+            .collect();
+        if remote.is_empty() {
+            // A local disk's free space is read live.
+            return;
+        }
+        let now = Instant::now();
+        {
+            let mut full = self.full_disks.lock().expect("lock poisoned");
+            full.retain(|_, at| at.elapsed() < FULL_TTL);
+            for d in remote {
+                full.insert(d, now);
+            }
+        }
+        self.refresh_cluster().await;
     }
 
     pub fn node_id(&self) -> &str {
@@ -392,14 +655,135 @@ impl Store {
 
     /// Reports this node's disks as alive, with their current free space. Call every
     /// [`HEARTBEAT_INTERVAL`]; other nodes treat disks without a recent heartbeat as offline.
+    ///
+    /// Also probes this node's disks (one that fails, e.g. because it was unmounted, stops
+    /// heartbeating and is taken out of service) and pings the other nodes.
     pub async fn heartbeat(&self) -> Result<()> {
+        let changed = self.probe_disks().await;
         let now = now_millis();
-        for d in &self.disks {
+        for d in self.healthy_disks() {
             self.meta
                 .heartbeat_disk(d.id, d.available_space(), now)
                 .await?;
         }
+        if changed | self.check_peers().await? {
+            self.refresh_cluster().await;
+        }
+        // A failure here must not stop the heartbeat; the rows stay for the next one.
+        if let Err(error) = self.process_pending_removals().await {
+            tracing::warn!(%error, "failed to process pending removals");
+        }
         Ok(())
+    }
+
+    /// Whether this node can serve requests: it has a healthy disk and the metadata database
+    /// answers within `timeout`. For the health check endpoint.
+    pub async fn check_health(&self, timeout: Duration) -> std::result::Result<(), &'static str> {
+        if self.healthy_disks().next().is_none() {
+            return Err("no healthy disks");
+        }
+        match tokio::time::timeout(timeout, self.meta.ping()).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "health check: metadata database failed");
+                Err("metadata database unavailable")
+            }
+            Err(_) => Err("metadata database unavailable"),
+        }
+    }
+
+    /// Probes every local disk; returns whether any changed health.
+    async fn probe_disks(&self) -> bool {
+        let mut changed = false;
+        for d in &self.disks {
+            let was = d.is_healthy();
+            changed |= d.probe().await != was;
+        }
+        changed
+    }
+
+    /// Pings every other node that has disks; returns whether the set of unreachable nodes
+    /// changed. A node that does not answer is not used for reads, writes or repair until it
+    /// answers again (see [`Store::reach`]).
+    pub async fn check_peers(&self) -> Result<bool> {
+        let view = self.cluster_disks().await?;
+        let nodes: HashSet<&str> = view
+            .iter()
+            .map(|i| i.node_id.as_str())
+            .filter(|n| *n != self.config.node_id)
+            .collect();
+        let pings = nodes.into_iter().filter_map(|n| {
+            let peer = self.peers.get(n)?;
+            Some(async move { (n.to_owned(), peer.ping().await) })
+        });
+        let mut down = HashSet::new();
+        for (node, result) in futures::future::join_all(pings).await {
+            if let Err(error) = result {
+                if !self
+                    .unreachable
+                    .read()
+                    .expect("lock poisoned")
+                    .contains(&node)
+                {
+                    tracing::warn!(%node, %error, "node is unreachable; not using its disks");
+                }
+                down.insert(node);
+            }
+        }
+        let mut current = self.unreachable.write().expect("lock poisoned");
+        for node in current.difference(&down) {
+            tracing::info!(%node, "node is reachable again");
+        }
+        let changed = *current != down;
+        *current = down;
+        Ok(changed)
+    }
+
+    /// Talking to `node` just failed: ping it now in the background instead of waiting for the
+    /// next heartbeat, and stop using its disks if it does not answer. Otherwise, after a node
+    /// dies, every write for up to [`HEARTBEAT_INTERVAL`] would first try it (and fall back to
+    /// another disk). The next [`Store::check_peers`] brings it back once it answers.
+    fn suspect_node(&self, node: &str) {
+        if node == self.config.node_id || !self.node_reachable(node) {
+            return;
+        }
+        if !self
+            .probing
+            .lock()
+            .expect("lock poisoned")
+            .insert(node.to_owned())
+        {
+            return;
+        }
+        let Some(peer) = self.peers.get(node) else {
+            self.probing.lock().expect("lock poisoned").remove(node);
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.probing.lock().expect("lock poisoned").remove(node);
+            return;
+        };
+        let unreachable = Arc::clone(&self.unreachable);
+        let probing = Arc::clone(&self.probing);
+        let node = node.to_owned();
+        runtime.spawn(async move {
+            if let Err(error) = peer.ping().await {
+                tracing::warn!(%node, %error, "node is unreachable; not using its disks");
+                unreachable
+                    .write()
+                    .expect("lock poisoned")
+                    .insert(node.clone());
+            }
+            probing.lock().expect("lock poisoned").remove(&node);
+        });
+    }
+
+    fn node_reachable(&self, node: &str) -> bool {
+        !self
+            .unreachable
+            .read()
+            .expect("lock poisoned")
+            .contains(node)
     }
 
     /// Every registered disk of the cluster, with liveness. Cached briefly.
@@ -410,6 +794,14 @@ impl Store {
             return Ok(Arc::clone(view));
         }
         let alive_since = now_millis() - ALIVE_MS;
+        let full: HashSet<DiskId> = self
+            .full_disks
+            .lock()
+            .expect("lock poisoned")
+            .iter()
+            .filter(|(_, at)| at.elapsed() < FULL_TTL)
+            .map(|(d, _)| *d)
+            .collect();
         let infos: Vec<DiskInfo> = self
             .meta
             .list_disks()
@@ -425,11 +817,16 @@ impl Store {
                 },
                 None => DiskInfo {
                     id: r.id,
+                    // A local disk that is not open (or failed its probe) is down.
                     alive: r.online
                         && r.heartbeat_at >= alive_since
                         && r.node_id != self.config.node_id,
                     node_id: r.node_id,
-                    free: r.free_bytes,
+                    free: if full.contains(&r.id) {
+                        0
+                    } else {
+                        r.free_bytes
+                    },
                     draining: r.draining,
                 },
             })
@@ -444,12 +841,12 @@ impl Store {
         *self.view.write().await = None;
     }
 
-    /// How a disk can be reached, if it is alive.
+    /// How a disk can be reached, if it is alive (and its node answers).
     fn reach(&self, info: &DiskInfo) -> Option<DiskRef> {
         if let Some(d) = self.local_disk(info.id) {
             return Some(DiskRef::Local(Arc::clone(d)));
         }
-        if !info.alive {
+        if !info.alive || !self.node_reachable(&info.node_id) {
             return None;
         }
         self.peers.get(&info.node_id).map(|peer| DiskRef::Remote {
@@ -481,9 +878,14 @@ impl Store {
         }
     }
 
-    /// One of this node's own (opened) disks.
+    /// One of this node's own disks, if it is open and passed its last health probe.
     pub fn local_disk(&self, id: DiskId) -> Option<&Arc<Disk>> {
-        self.disks.iter().find(|d| d.id == id)
+        self.disks.iter().find(|d| d.id == id && d.is_healthy())
+    }
+
+    /// This node's disks that passed their last health probe.
+    fn healthy_disks(&self) -> impl Iterator<Item = &Arc<Disk>> {
+        self.disks.iter().filter(|d| d.is_healthy())
     }
 
     fn disk(&self, id: DiskId) -> Option<&Arc<Disk>> {
@@ -537,12 +939,26 @@ impl Store {
     }
 
     /// Picks reachable disks for `count` new copies, avoiding the nodes of the copies in
-    /// `existing` (in a cluster), the disks in `exclude`, and draining disks.
+    /// `existing` (in a cluster), the disks in `exclude`, draining disks, and disks with less
+    /// than `size` (0 when not known in advance) plus [`StoreConfig::min_free_bytes`] free.
     async fn place(
         &self,
         count: usize,
         existing: &[DiskId],
         exclude: &[DiskId],
+        size: u64,
+    ) -> Result<Vec<DiskRef>> {
+        let need = size.saturating_add(self.config.min_free_bytes);
+        self.place_needing(count, existing, exclude, need).await
+    }
+
+    /// [`Store::place`] with the free space a disk needs given directly.
+    async fn place_needing(
+        &self,
+        count: usize,
+        existing: &[DiskId],
+        exclude: &[DiskId],
+        need: u64,
     ) -> Result<Vec<DiskRef>> {
         let view = self.cluster_disks().await?;
         let existing: Vec<(DiskId, &str)> = existing
@@ -552,7 +968,7 @@ impl Store {
             .collect();
         let reachable: Vec<(&DiskInfo, DiskRef)> = view
             .iter()
-            .filter(|i| !i.draining && !exclude.contains(&i.id))
+            .filter(|i| !i.draining && !exclude.contains(&i.id) && i.free >= need)
             .filter_map(|i| self.reach(i).map(|r| (i, r)))
             .collect();
         let candidates = reachable
@@ -580,6 +996,153 @@ impl Store {
             .collect())
     }
 
+    /// Opens `count` new copies of an object before its body is read. A disk that cannot be
+    /// opened (most often on a node that died since the last ping, which can take up to
+    /// [`HEARTBEAT_INTERVAL`] to notice) is replaced by another disk chosen the same way, so a
+    /// write is refused only when there are really fewer than `required` usable disks.
+    async fn open_replicas(
+        &self,
+        dest: Dest,
+        count: usize,
+        required: usize,
+        size: u64,
+    ) -> Result<blob::Replicas> {
+        let targets = self.place(count, &[], &[], size).await?;
+        self.open_replicas_on(dest, &targets, count, required, size)
+            .await
+    }
+
+    /// Writes `body` into the open copies. Nodes whose copy failed (a remote copy that broke off
+    /// midway or did not commit) are pinged right away ([`Store::suspect_node`]), so that the next
+    /// writes skip a node that stopped responding instead of each waiting on it.
+    async fn write_copies<R: AsyncRead + Unpin>(
+        &self,
+        copies: blob::Replicas,
+        required: usize,
+        body: R,
+    ) -> Result<blob::WriteOutcome> {
+        let remote: Vec<DiskRef> = copies
+            .open_targets()
+            .into_iter()
+            .filter(|d| !d.is_local())
+            .collect();
+        let (result, full) = copies.write_tracking(required, body).await;
+        self.mark_full(&full).await;
+        let result = result.map_err(|e| self.note_refusal(e));
+        let written = match &result {
+            Ok(outcome) => outcome.written.clone(),
+            // Which copies failed is not known; pinging the others costs little.
+            Err(StoreError::WriteQuorum { .. }) => Vec::new(),
+            // Disks filled up; the nodes answer.
+            Err(StoreError::InsufficientStorage { .. }) => return result,
+            // The body itself failed (client gone, bad digest): not the peers' fault.
+            Err(_) => return result,
+        };
+        for d in remote.iter().filter(|d| !written.contains(&d.id())) {
+            self.suspect_node(d.node_id());
+        }
+        result
+    }
+
+    /// Pings the nodes of the remote disks among `tried` that could not be opened; returns
+    /// those nodes.
+    fn suspect_failed(&self, copies: &blob::Replicas, tried: &[DiskRef]) -> HashSet<String> {
+        let open = copies.open_disks();
+        let mut nodes = HashSet::new();
+        for d in tried {
+            if !d.is_local() && !open.contains(&d.id()) {
+                self.suspect_node(d.node_id());
+                nodes.insert(d.node_id().to_owned());
+            }
+        }
+        nodes
+    }
+
+    /// Like [`Store::open_replicas`], starting from `targets` (the disks of a multipart upload).
+    async fn open_replicas_on(
+        &self,
+        dest: Dest,
+        targets: &[DiskRef],
+        count: usize,
+        required: usize,
+        size: u64,
+    ) -> Result<blob::Replicas> {
+        let mut copies = blob::Replicas::open(targets, dest).await;
+        // Nodes where opening a copy failed: most likely down, so their other disks are not
+        // tried for this write either (each try can take up to the connect timeout).
+        let mut failed_nodes = self.suspect_failed(&copies, targets);
+        loop {
+            let open = copies.open_disks();
+            if open.len() >= count {
+                break;
+            }
+            let mut exclude = copies.tried().to_vec();
+            if !failed_nodes.is_empty() {
+                exclude.extend(
+                    self.cluster_disks()
+                        .await?
+                        .iter()
+                        .filter(|i| failed_nodes.contains(&i.node_id))
+                        .map(|i| i.id),
+                );
+            }
+            let more = self
+                .place(count - open.len(), &open, &exclude, size)
+                .await?;
+            if more.is_empty() {
+                break;
+            }
+            copies.add(&more).await;
+            failed_nodes.extend(self.suspect_failed(&copies, &more));
+        }
+        let open = copies.open_disks().len();
+        if open < required {
+            copies.abort().await;
+            return Err(self.too_few_disks(required, open, size).await);
+        }
+        Ok(copies)
+    }
+
+    /// The error for a write of `size` bytes that found only `found` of the `required` disks:
+    /// running out of space when too few disks have room for it but enough would be usable
+    /// without the free-space requirement (S3 clients retry the 503 of
+    /// [`StoreError::WriteQuorum`], which only re-sends the body in vain). When enough disks do
+    /// have room, the failure lies elsewhere (a node that just died, say): a 503.
+    async fn too_few_disks(&self, required: usize, found: usize, size: u64) -> StoreError {
+        let roomy = self.place(required, &[], &[], size).await;
+        let without_space = self.place_needing(required, &[], &[], 0).await;
+        if roomy.is_ok_and(|d| d.len() < required)
+            && without_space.is_ok_and(|d| d.len() >= required)
+        {
+            self.note_refusal(StoreError::InsufficientStorage {
+                required,
+                available: found,
+            })
+        } else {
+            StoreError::WriteQuorum {
+                required,
+                written: found,
+            }
+        }
+    }
+
+    /// The disks among `disks` with room for `size` bytes plus [`StoreConfig::min_free_bytes`].
+    async fn with_room(&self, disks: Vec<DiskRef>, size: u64) -> Result<Vec<DiskRef>> {
+        let need = size.saturating_add(self.config.min_free_bytes);
+        if need == 0 {
+            return Ok(disks);
+        }
+        let view = self.cluster_disks().await?;
+        Ok(disks
+            .into_iter()
+            .filter(|d| {
+                view.iter()
+                    .find(|i| i.id == d.id())
+                    .is_some_and(|i| i.free >= need)
+            })
+            .collect())
+    }
+
     async fn require_bucket(&self, name: &str) -> Result<BucketRecord> {
         self.meta
             .get_bucket(name)
@@ -587,16 +1150,46 @@ impl Store {
             .ok_or_else(|| StoreError::NoSuchBucket(name.to_owned()))
     }
 
-    /// Deletes an object's files from every reachable disk. Copies on unreachable disks become
-    /// orphans (they only waste space).
+    /// Deletes an object's files from every reachable disk. Copies on unreachable disks are
+    /// recorded as pending removals, which their node carries out once it is back
+    /// ([`Store::process_pending_removals`]); otherwise they would wait for gc.
     async fn remove_files(&self, stored: &StoredObject) {
-        match self.reachable(&stored.replicas).await {
-            Ok(disks) => {
-                for d in disks {
-                    d.remove(Dest::Object(stored.object.id)).await;
-                }
+        let id = stored.object.id;
+        self.remove_everywhere(&stored.replicas, RemovalTarget::Object(id))
+            .await;
+    }
+
+    /// Removes `target` from each of `disks`, recording the disks that could not be reached.
+    async fn remove_everywhere(&self, disks: &[DiskId], target: RemovalTarget) {
+        let view = match self.cluster_disks().await {
+            Ok(view) => view,
+            Err(error) => {
+                tracing::warn!(%error, "cannot resolve disks to remove files");
+                return;
             }
-            Err(error) => tracing::warn!(%error, "cannot resolve disks to remove files"),
+        };
+        let mut pending = Vec::new();
+        // Disks no longer registered (removed) are skipped: nobody would carry it out.
+        for info in disks
+            .iter()
+            .filter_map(|id| view.iter().find(|i| i.id == *id))
+        {
+            let done = match self.reach(info) {
+                Some(d) => match target {
+                    RemovalTarget::Object(id) => d.remove(Dest::Object(id)).await,
+                    RemovalTarget::Upload(id) => d.remove_upload(id).await,
+                },
+                None => false,
+            };
+            if !done {
+                pending.push(PendingRemoval {
+                    disk_id: info.id,
+                    target,
+                });
+            }
+        }
+        if let Err(error) = self.meta.add_pending_removals(&pending).await {
+            tracing::warn!(%error, ?target, "failed to record pending removals; gc will collect the files");
         }
     }
 
@@ -806,13 +1399,6 @@ impl Store {
             .resolve_replicas(bucket, req.storage_class.as_deref())
             .await?;
         let required = placement::ack_threshold(replicas);
-        let targets = self.place(usize::from(replicas), &[], &[]).await?;
-        if targets.len() < required {
-            return Err(StoreError::WriteQuorum {
-                required,
-                written: targets.len(),
-            });
-        }
 
         let mode = VersioningMode::of(bucket);
         let (lock_mode, lock_until) =
@@ -823,7 +1409,15 @@ impl Store {
             ));
         }
         let id = Uuid::new_v4();
-        let outcome = blob::write_replicas(&targets, Dest::Object(id), required, body).await?;
+        let copies = self
+            .open_replicas(
+                Dest::Object(id),
+                usize::from(replicas),
+                required,
+                req.size_hint.unwrap_or(0),
+            )
+            .await?;
+        let outcome = self.write_copies(copies, required, body).await?;
         let written = StoredObject {
             object: ObjectRecord {
                 id,
@@ -948,6 +1542,7 @@ impl Store {
             dest.tags = Some(source.object.tags.clone());
         }
         dest.content_md5 = None;
+        dest.size_hint = Some(source.object.size);
         let mut reader = self.read_object(&source, 0..source.object.size).await?;
         if let Some(wrap) = wrap {
             reader = wrap(&source.object, reader);
@@ -973,13 +1568,10 @@ impl Store {
         let (replicas, explicit) = self
             .resolve_replicas(&bucket, req.storage_class.as_deref())
             .await?;
-        let targets = self.place(usize::from(replicas), &[], &[]).await?;
+        let targets = self.place(usize::from(replicas), &[], &[], 0).await?;
         let required = placement::ack_threshold(replicas);
         if targets.len() < required {
-            return Err(StoreError::WriteQuorum {
-                required,
-                written: targets.len(),
-            });
+            return Err(self.too_few_disks(required, targets.len(), 0).await);
         }
         let upload = UploadRecord {
             id: Uuid::new_v4(),
@@ -1045,12 +1637,15 @@ impl Store {
             part_number,
             content_md5,
             None,
+            None,
             body,
         )
         .await
     }
 
     /// Like [`Store::upload_part`], recording the checksum published to `checksum`.
+    /// `size_hint` is the part's size when known (`Content-Length`, a copied range): the
+    /// upload's disks without room for it are replaced like disks that are down.
     #[allow(clippy::too_many_arguments)]
     pub async fn upload_part_with<R: AsyncRead + Unpin>(
         &self,
@@ -1061,6 +1656,7 @@ impl Store {
         part_number: u32,
         content_md5: Option<[u8; 16]>,
         checksum: Option<ChecksumSlot>,
+        size_hint: Option<u64>,
         body: R,
     ) -> Result<PartRecord> {
         if !(1..=MAX_PART_NUMBER).contains(&part_number) {
@@ -1069,20 +1665,29 @@ impl Store {
             )));
         }
         let upload = self.owned_upload(owner, bucket, key, upload_id).await?;
-        let targets = self.reachable(&upload.disks).await?;
+        // The upload's disks first; one that is down or has filled up is replaced like for a
+        // plain PUT (otherwise every retry of the part would fail on it again). The replacement
+        // lacks the earlier parts, which completion copies over if it needs to.
+        let size = size_hint.unwrap_or(0);
+        let targets = self
+            .with_room(self.reachable(&upload.disks).await?, size)
+            .await?;
         let required = placement::ack_threshold(upload.desired_replicas);
-        if targets.len() < required {
-            return Err(StoreError::WriteQuorum {
-                required,
-                written: targets.len(),
-            });
-        }
         let blob_id = Uuid::new_v4();
         let dest = Dest::Part {
             upload: upload_id,
             blob: blob_id,
         };
-        let outcome = blob::write_replicas(&targets, dest, required, body).await?;
+        let copies = self
+            .open_replicas_on(
+                dest,
+                &targets,
+                usize::from(upload.desired_replicas),
+                required,
+                size,
+            )
+            .await?;
+        let outcome = self.write_copies(copies, required, body).await?;
         let remove = |disks: Vec<DiskId>, dest: Dest| async move {
             if let Ok(refs) = self.reachable(&disks).await {
                 for d in refs {
@@ -1149,6 +1754,7 @@ impl Store {
                 "copy range is out of bounds".into(),
             ));
         }
+        let size = range.end - range.start;
         let mut reader = self.read_object(&source, range).await?;
         if let Some(wrap) = wrap {
             reader = wrap(&source.object, reader);
@@ -1162,6 +1768,7 @@ impl Store {
                 part_number,
                 None,
                 checksum,
+                Some(size),
                 reader,
             )
             .await?;
@@ -1265,11 +1872,134 @@ impl Store {
         let mut disks: HashSet<DiskId> = upload.disks.iter().copied().collect();
         disks.extend(parts.iter().flat_map(|p| p.disks.iter().copied()));
         let disks: Vec<DiskId> = disks.into_iter().collect();
-        if let Ok(refs) = self.reachable(&disks).await {
-            for d in refs {
-                d.remove_upload(upload.id).await;
+        self.remove_everywhere(&disks, RemovalTarget::Upload(upload.id))
+            .await;
+    }
+
+    /// Reachable disks to assemble an upload on: those holding every chosen part. When a disk
+    /// failed during the upload (its parts went to a replacement), fewer than `required` may hold
+    /// them all; the missing parts are then copied from another disk to the reachable disks
+    /// holding the most parts (on distinct nodes in a cluster) until `required` disks can
+    /// assemble. Assembly checks every part's BLAKE3, so a bad copy fails there.
+    async fn assembly_disks(
+        &self,
+        upload: &UploadRecord,
+        chosen: &[&PartRecord],
+        required: usize,
+    ) -> Result<Vec<DiskRef>> {
+        // Every disk holding any chosen part, the upload's own disks first.
+        let mut all: Vec<DiskId> = upload.disks.clone();
+        for p in chosen {
+            for d in &p.disks {
+                if !all.contains(d) {
+                    all.push(*d);
+                }
             }
         }
+        let reachable = self.reachable(&all).await?;
+        let holds = |d: &DiskRef, p: &PartRecord| p.disks.contains(&d.id());
+        // Assembling writes the whole object next to its parts (deleted only afterwards), and a
+        // disk lacking parts first receives copies of them: a disk without room for that would
+        // fail midway, and the completion with it once too few disks are left.
+        let view = self.cluster_disks().await?;
+        let total: u64 = chosen.iter().map(|p| p.size).sum();
+        let has_room = |d: &DiskRef| {
+            let missing: u64 = chosen.iter().filter(|p| !holds(d, p)).map(|p| p.size).sum();
+            let need = total
+                .saturating_add(missing)
+                .saturating_add(self.config.min_free_bytes);
+            view.iter()
+                .find(|i| i.id == d.id())
+                .is_some_and(|i| i.free >= need)
+        };
+        let (roomy, full): (Vec<DiskRef>, Vec<DiskRef>) =
+            reachable.into_iter().partition(|d| has_room(d));
+        let (mut holders, mut others): (Vec<DiskRef>, Vec<DiskRef>) = roomy
+            .into_iter()
+            .partition(|d| chosen.iter().all(|p| holds(d, p)));
+        if holders.len() >= required {
+            return Ok(holders);
+        }
+        let single_node = self
+            .cluster_disks()
+            .await?
+            .iter()
+            .map(|i| i.node_id.as_str())
+            .collect::<HashSet<_>>()
+            .len()
+            <= 1;
+        others.sort_by_key(|d| std::cmp::Reverse(chosen.iter().filter(|p| holds(d, p)).count()));
+        // Disks holding no part at all come last, chosen like for a new object (room for every
+        // part and the object), when those holding some are not enough.
+        let short = required.saturating_sub(holders.len() + others.len());
+        if short > 0 {
+            let holding: Vec<DiskId> = holders.iter().chain(&others).map(DiskRef::id).collect();
+            let fresh = self
+                .place(short, &holding, &all, total.saturating_mul(2))
+                .await?;
+            others.extend(fresh);
+        }
+        for disk in others {
+            if holders.len() >= required {
+                break;
+            }
+            if !single_node && holders.iter().any(|h| h.node_id() == disk.node_id()) {
+                continue;
+            }
+            match self.fill_parts(upload.id, chosen, &disk).await {
+                Ok(()) => holders.push(disk),
+                Err(error) => {
+                    tracing::warn!(disk = %disk.label(), upload = %upload.id, %error, "cannot copy missing parts to disk");
+                }
+            }
+        }
+        if holders.len() < required && !full.is_empty() {
+            // Disks were left out for lack of space: not worth a retry (see `too_few_disks`).
+            let usable =
+                |d: &&DiskRef| single_node || !holders.iter().any(|h| h.node_id() == d.node_id());
+            let nodes: HashSet<&str> = full.iter().filter(usable).map(|d| d.node_id()).collect();
+            let more = if single_node { full.len() } else { nodes.len() };
+            if holders.len() + more >= required {
+                return Err(self.note_refusal(StoreError::InsufficientStorage {
+                    required,
+                    available: holders.len(),
+                }));
+            }
+        }
+        Ok(holders)
+    }
+
+    /// Copies the parts `disk` lacks from a reachable disk that has them.
+    async fn fill_parts(&self, upload: Uuid, chosen: &[&PartRecord], disk: &DiskRef) -> Result<()> {
+        for part in chosen.iter().filter(|p| !p.disks.contains(&disk.id())) {
+            let dest = Dest::Part {
+                upload,
+                blob: part.blob_id,
+            };
+            let mut copied = false;
+            for src in self.reachable(&part.disks).await? {
+                let reader = match src.read_part(upload, part.blob_id, part.size).await {
+                    Ok(r) => r,
+                    Err(error) => {
+                        tracing::warn!(disk = %src.label(), part = part.part_number, %error, "cannot read part");
+                        continue;
+                    }
+                };
+                match blob::write_replicas(std::slice::from_ref(disk), dest, 1, reader).await {
+                    Ok(_) => {
+                        copied = true;
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(from = %src.label(), to = %disk.label(), part = part.part_number, %error, "cannot copy part");
+                    }
+                }
+            }
+            if !copied {
+                return Err(StoreError::NoHealthyReplica(part.blob_id));
+            }
+        }
+        Ok(())
     }
 
     pub async fn abort_multipart_upload(
@@ -1387,19 +2117,18 @@ impl Store {
         };
         let size: u64 = chosen.iter().map(|p| p.size).sum();
         self.check_quota(owner, size).await?;
-        let blobs: Vec<(Uuid, String)> = chosen
+        let blobs: Vec<blob::JoinPart> = chosen
             .iter()
-            .map(|p| (p.blob_id, p.blake3.clone()))
+            .map(|p| blob::JoinPart {
+                blob: p.blob_id,
+                blake3: p.blake3.clone(),
+                crc: part_crc(p.checksum.as_deref()),
+            })
             .collect();
 
         let object_id = Uuid::new_v4();
-        let holders: Vec<DiskId> = upload
-            .disks
-            .iter()
-            .filter(|d| chosen.iter().all(|p| p.disks.contains(d)))
-            .copied()
-            .collect();
-        let candidates = self.reachable(&holders).await?;
+        let required = placement::ack_threshold(upload.desired_replicas);
+        let candidates = self.assembly_disks(&upload, &chosen, required).await?;
         let results = futures::future::join_all(candidates.iter().map(|disk| {
             let blobs = blobs.clone();
             async move {
@@ -1409,14 +2138,19 @@ impl Store {
         }))
         .await;
         let mut written: Vec<(DiskId, String)> = Vec::new();
+        let mut full: Vec<DiskId> = Vec::new();
         for (disk, r) in results {
             match r {
                 Ok(hash) => written.push((disk.id(), hash)),
                 Err(error) => {
                     tracing::warn!(disk = %disk.label(), %error, "cannot assemble upload on disk");
+                    if error.kind() == std::io::ErrorKind::StorageFull {
+                        full.push(disk.id());
+                    }
                 }
             }
         }
+        self.mark_full(&full).await;
         // Every part was verified on every disk, so all results must agree.
         let blake3 = written.first().map(|(_, h)| h.clone()).unwrap_or_default();
         let replicas: Vec<DiskId> = written
@@ -1450,9 +2184,15 @@ impl Store {
             },
             replicas: written.iter().map(|(d, _)| *d).collect(),
         };
-        let required = placement::ack_threshold(upload.desired_replicas);
         if replicas.len() < required || replicas.len() != new_object.replicas.len() {
             self.remove_files(&new_object).await;
+            // Disks that filled up while assembling: retrying would fail the same way (507).
+            if replicas.len() < required && !full.is_empty() {
+                return Err(self.note_refusal(StoreError::InsufficientStorage {
+                    required,
+                    available: replicas.len(),
+                }));
+            }
             return Err(StoreError::WriteQuorum {
                 required,
                 written: replicas.len(),
@@ -1514,7 +2254,85 @@ impl Store {
 
     /// Opens `range` of an object, from a copy on this node if there is one, otherwise from
     /// another node; unreadable copies are skipped.
+    ///
+    /// A read of the whole object is checked against its BLAKE3: if the copy turns out to be
+    /// corrupt, the reader fails before handing out the last bytes instead of finishing (and a corrupt copy on this
+    /// node is dropped, as [`Store::scrub`] would, so a retry reads a healthy one). Ranged reads
+    /// cannot be checked without reading the rest: the copy is checked in full afterwards
+    /// ([`RangeChecks`]).
     pub async fn read_object(&self, stored: &StoredObject, range: Range<u64>) -> Result<BoxReader> {
+        let whole = range.start == 0 && range.end == stored.object.size;
+        let (disk, reader) = self.open_copy(stored, range).await?;
+        let expected = stored.object.blake3.clone();
+        if expected.is_empty() {
+            return Ok(reader);
+        }
+        if !whole {
+            self.check_after_ranged_read(stored, disk);
+            return Ok(reader);
+        }
+        let on_mismatch = self.on_corrupt_read(stored, disk);
+        Ok(Box::new(blob::VerifyingReader::new(
+            reader,
+            stored.object.size,
+            expected,
+            on_mismatch,
+        )))
+    }
+
+    /// Schedules a background check of the copy that served a ranged read (see [`RangeChecks`]).
+    /// A copy that does not match twice is dropped, wherever it is, and the object is queued for
+    /// repair.
+    fn check_after_ranged_read(&self, stored: &StoredObject, disk: DiskRef) {
+        if self.range_checks.claim(stored.object.id, disk.id()) {
+            self.spawn_copy_check(stored, disk, 2);
+        }
+    }
+
+    /// Called when a whole-object read did not match the object's hash. Logs it, then re-hashes
+    /// the copy in the background and drops it if it really is corrupt (a one-off read or
+    /// network error leaves it alone), whether the copy is on this node or another.
+    fn on_corrupt_read(
+        &self,
+        stored: &StoredObject,
+        disk: DiskRef,
+    ) -> Box<dyn FnOnce() + Send + Sync> {
+        let checker = CopyChecker {
+            checks: Arc::clone(&self.range_checks),
+            meta: Arc::clone(&self.meta),
+            object: stored.object.id,
+            size: stored.object.size,
+            expected: stored.object.blake3.clone(),
+        };
+        Box::new(move || {
+            tracing::error!(object = %checker.object, disk = %disk.label(), "read a copy that does not match its hash; response aborted");
+            checker
+                .checks
+                .pending
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            checker.spawn(disk, 1, true);
+        })
+    }
+
+    /// Hashes `disk`'s copy in the background `times` times (see [`CopyChecker`]), quietly
+    /// unless it turns out corrupt.
+    fn spawn_copy_check(&self, stored: &StoredObject, disk: DiskRef, times: usize) {
+        CopyChecker {
+            checks: Arc::clone(&self.range_checks),
+            meta: Arc::clone(&self.meta),
+            object: stored.object.id,
+            size: stored.object.size,
+            expected: stored.object.blake3.clone(),
+        }
+        .spawn(disk, times, false);
+    }
+
+    /// Opens `range` from the first readable copy, without checking its hash.
+    async fn open_copy(
+        &self,
+        stored: &StoredObject,
+        range: Range<u64>,
+    ) -> Result<(DiskRef, BoxReader)> {
         if range.start > range.end || range.end > stored.object.size {
             return Err(StoreError::InvalidArgument("range is out of bounds".into()));
         }
@@ -1523,9 +2341,12 @@ impl Store {
                 .read(stored.object.id, stored.object.size, range.clone())
                 .await
             {
-                Ok(reader) => return Ok(reader),
+                Ok(reader) => return Ok((disk, reader)),
                 Err(error) => {
                     tracing::warn!(disk = %disk.label(), object = %stored.object.id, %error, "replica unreadable");
+                    if !disk.is_local() {
+                        self.suspect_node(disk.node_id());
+                    }
                 }
             }
         }
@@ -1541,7 +2362,7 @@ impl Store {
         sink: &mut (dyn FnMut(&[u8]) + Send),
     ) -> Result<bool> {
         use tokio::io::AsyncReadExt as _;
-        let mut reader = self.read_object(stored, 0..stored.object.size).await?;
+        let (_, mut reader) = self.open_copy(stored, 0..stored.object.size).await?;
         let mut hasher = blake3::Hasher::new();
         let mut buf = vec![0; 1 << 20];
         loop {
@@ -2307,5 +3128,46 @@ impl Store {
             .filter_map(|id| self.disk(*id))
             .map(|d| d.object_path(stored.object.id))
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{blob, part_crc};
+
+    #[test]
+    fn part_crcs_are_read_from_stored_checksums() {
+        let crc64 = part_crc(Some(
+            r#"{"algorithm":"CRC64NVME","type":"FULL_OBJECT","value":"AAAAAAAAAQI="}"#,
+        ));
+        assert_eq!(
+            crc64,
+            Some(blob::PartCrc {
+                algorithm: blob::CrcKind::Crc64Nvme,
+                value: 0x0102
+            })
+        );
+        let crc32c = part_crc(Some(
+            r#"{"algorithm":"CRC32C","type":"COMPOSITE","value":"AAABAg=="}"#,
+        ));
+        assert_eq!(
+            crc32c.map(|c| (c.algorithm, c.value)),
+            Some((blob::CrcKind::Crc32c, 0x0102))
+        );
+        // Not a CRC, malformed, or absent: the BLAKE3 is checked instead.
+        assert_eq!(
+            part_crc(Some(
+                r#"{"algorithm":"SHA256","type":"COMPOSITE","value":"AAAA"}"#
+            )),
+            None
+        );
+        assert_eq!(
+            part_crc(Some(
+                r#"{"algorithm":"CRC32","type":"COMPOSITE","value":"AAAAAAAAAQI="}"#
+            )),
+            None
+        );
+        assert_eq!(part_crc(Some("not json")), None);
+        assert_eq!(part_crc(None), None);
     }
 }

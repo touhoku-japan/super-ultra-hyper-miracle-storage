@@ -40,6 +40,7 @@ impl Env {
         StoreConfig {
             disks: self.disks.clone(),
             metadata_url: self.meta_url.clone(),
+            metadata_max_connections: common::MAX_CONNECTIONS,
             ..StoreConfig::default()
         }
     }
@@ -259,6 +260,100 @@ async fn scrub_and_repair_restore_corrupt_and_missing_copies() {
         Default::default(),
         "idempotent"
     );
+}
+
+/// Waits for a corrupt copy found by a read to be dropped in the background.
+async fn wait_for_copies(store: &Store, bucket: &str, key: &str, n: usize) {
+    for _ in 0..200 {
+        if store.object_locations(bucket, key).await.unwrap().len() == n {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("{bucket}/{key} did not get down to {n} copies");
+}
+
+#[tokio::test]
+async fn reading_a_corrupt_copy_fails_and_drops_it() {
+    let env = Env::new(3).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "bk1", None).await.unwrap();
+    let data = payload();
+    store
+        .put_object(OWNER, put("bk1", "k", None), &data[..])
+        .await
+        .unwrap();
+    // Reads try copies in this order: corrupt the first two, keep the last one healthy.
+    let locs = store.object_locations("bk1", "k").await.unwrap();
+    assert_eq!(locs.len(), 3);
+    let mut bad = data.clone();
+    bad[12345] ^= 0xff;
+    std::fs::write(&locs[0], &bad).unwrap();
+    std::fs::write(&locs[1], &bad).unwrap();
+
+    // A ranged read cannot be checked up front (that would mean reading the whole object): it
+    // returns what the copy holds, and the copy is then checked in full in the background and
+    // dropped.
+    let stored = store.get_object(OWNER, "bk1", "k").await.unwrap();
+    let mut r = store.read_object(&stored, 12340..12350).await.unwrap();
+    let mut out = Vec::new();
+    r.read_to_end(&mut out).await.unwrap();
+    assert_eq!(out, bad[12340..12350]);
+    wait_for_copies(&store, "bk1", "k", 2).await;
+
+    // A whole read of the next corrupt copy fails before its last bytes rather than finishing
+    // (an HTTP server stops polling the body once Content-Length bytes are out).
+    let stored = store.get_object(OWNER, "bk1", "k").await.unwrap();
+    let mut r = store
+        .read_object(&stored, 0..stored.object.size)
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    let err = r.read_to_end(&mut out).await.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(out.len() < data.len(), "the last bytes must be withheld");
+    wait_for_copies(&store, "bk1", "k", 1).await;
+
+    // The retry reads the healthy copy, and repair restores the dropped ones.
+    assert_eq!(read_object(&store, "bk1", "k").await, data);
+    assert_eq!(store.repair().await.unwrap().copied, 2);
+    let locs = store.object_locations("bk1", "k").await.unwrap();
+    for p in &locs {
+        assert_eq!(std::fs::read(p).unwrap(), data);
+    }
+
+    // Copying from a corrupt copy fails instead of spreading it, and drops that copy.
+    std::fs::write(&locs[0], &bad).unwrap();
+    store
+        .copy_object(OWNER, "bk1", "k", put("bk1", "copy", None), false)
+        .await
+        .unwrap_err();
+    assert!(store.get_object(OWNER, "bk1", "copy").await.is_err());
+    wait_for_copies(&store, "bk1", "k", 2).await;
+    assert_eq!(store.repair().await.unwrap().copied, 1);
+}
+
+/// A healthy copy that served a ranged read is checked once and kept; another ranged read soon
+/// after does not check it again.
+#[tokio::test]
+async fn ranged_reads_of_a_healthy_copy_keep_it() {
+    let env = Env::new(3).await;
+    let store = env.open().await;
+    store.create_bucket(OWNER, "bk1", None).await.unwrap();
+    let data = payload();
+    store
+        .put_object(OWNER, put("bk1", "k", None), &data[..])
+        .await
+        .unwrap();
+    let stored = store.get_object(OWNER, "bk1", "k").await.unwrap();
+    for _ in 0..3 {
+        let mut r = store.read_object(&stored, 100..200).await.unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, data[100..200]);
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(store.object_locations("bk1", "k").await.unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -1970,6 +2065,14 @@ async fn every_table_gets_audit_timestamps() {
     .await
     .unwrap();
 
+    let disk = store.cluster_disks().await.unwrap()[0].id;
+    meta.add_pending_removals(&[suhms_store::meta::PendingRemoval {
+        disk_id: disk,
+        target: suhms_store::meta::RemovalTarget::Object(uuid::Uuid::new_v4()),
+    }])
+    .await
+    .unwrap();
+
     for table in [
         "tenants",
         "access_keys",
@@ -1980,6 +2083,7 @@ async fn every_table_gets_audit_timestamps() {
         "multipart_uploads",
         "multipart_parts",
         "usage_hourly",
+        "pending_removals",
         "schema_migrations",
     ] {
         let url = &env.meta_url;

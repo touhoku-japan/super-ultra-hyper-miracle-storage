@@ -2,6 +2,7 @@ mod common;
 
 use axum::{body::Body, http::Request};
 use common::{Creds, Server, path_encode, signed_with_payload_hash, xml_values};
+use futures::StreamExt;
 use md5::{Digest, Md5};
 
 fn data(n: usize) -> Vec<u8> {
@@ -26,6 +27,83 @@ async fn health_needs_no_auth() {
         .send(Request::get("/suhms/health").body(Body::empty()).unwrap())
         .await;
     assert_ne!(resp.status, 200);
+}
+
+#[tokio::test]
+async fn health_fails_while_no_disk_is_usable() {
+    let srv = Server::start(1).await;
+    let health = || {
+        Request::get(suhms_server::HEALTH_PATH)
+            .body(Body::empty())
+            .unwrap()
+    };
+    // The only disk is unmounted: the next heartbeat's probe takes it out of service.
+    let away = srv.disks[0].with_extension("away");
+    std::fs::rename(&srv.disks[0], &away).unwrap();
+    srv.store.heartbeat().await.unwrap();
+    let resp = srv.send(health()).await;
+    assert_eq!(resp.status, 503);
+    assert_eq!(resp.text(), "no healthy disks");
+
+    std::fs::rename(&away, &srv.disks[0]).unwrap();
+    srv.store.heartbeat().await.unwrap();
+    // The result is reused for a second.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let resp = srv.send(health()).await;
+    assert_eq!(resp.status, 200);
+}
+
+/// A request body that records how many bytes the server read from it.
+fn counted_body(chunks: usize) -> (Body, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let read = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&read);
+    let stream = futures::stream::iter(0..chunks).map(move |_| {
+        counter.fetch_add(4096, std::sync::atomic::Ordering::SeqCst);
+        Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'x'; 4096]))
+    });
+    (Body::from_stream(stream), read)
+}
+
+#[tokio::test]
+async fn a_rejected_request_body_is_read_before_answering() {
+    use std::sync::atomic::Ordering;
+    let srv = Server::start(1).await;
+    // Anonymous PUT: refused without the service reading the body. The rest is read anyway so
+    // the client sees the 403 instead of a reset connection.
+    let (body, read) = counted_body(16);
+    let resp = srv
+        .send(
+            Request::put("/some-bucket/key")
+                .header("content-length", 16 * 4096)
+                .body(body)
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status, 403);
+    assert_eq!(read.load(Ordering::SeqCst), 16 * 4096);
+
+    // A client waiting for 100 Continue has sent nothing: the body is left alone.
+    let (body, read) = counted_body(16);
+    let resp = srv
+        .send(
+            Request::put("/some-bucket/key")
+                .header("content-length", 16 * 4096)
+                .header("expect", "100-continue")
+                .body(body)
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status, 403);
+    assert_eq!(read.load(Ordering::SeqCst), 0);
+
+    // Large bodies are not read (at most DRAIN_MAX, then the connection is closed).
+    let (body, read) = counted_body(1024);
+    let resp = srv
+        .send(Request::put("/some-bucket/key").body(body).unwrap())
+        .await;
+    assert_eq!(resp.status, 403);
+    let n = read.load(Ordering::SeqCst) as u64;
+    assert!(n <= suhms_server::drain::DRAIN_MAX + 4096, "{n}");
 }
 
 #[tokio::test]
@@ -430,4 +508,172 @@ async fn delete_objects_batch() {
         .s3(&c, "GET", "/bk1", &[("list-type", "2")], &[], vec![])
         .await;
     assert_eq!(xml_values(&resp.text(), "Key"), vec!["c"]);
+}
+
+#[tokio::test]
+async fn get_of_a_corrupt_copy_is_cut_short() {
+    use tower::ServiceExt as _;
+    let srv = Server::start(1).await;
+    let (_, c) = srv.tenant("acme").await;
+    srv.s3(&c, "PUT", "/bk1", &[], &[], vec![]).await;
+    let body = data(300_000);
+    let mut bad = body.clone();
+    bad[1234] ^= 0xff;
+    // Two objects: the ranged read schedules a background check that drops the corrupt (and
+    // only) copy, after which the object could no longer be read at all.
+    for key in ["k", "ranged"] {
+        let path = format!("/bk1/{key}");
+        assert_eq!(
+            srv.s3(&c, "PUT", &path, &[], &[], body.clone())
+                .await
+                .status,
+            200
+        );
+        let locs = srv.store.object_locations("bk1", key).await.unwrap();
+        std::fs::write(&locs[0], &bad).unwrap();
+    }
+
+    // A ranged GET is not checked (that would mean reading the whole object).
+    let resp = srv
+        .s3(
+            &c,
+            "GET",
+            "/bk1/ranged",
+            &[],
+            &[("range", "bytes=0-9")],
+            vec![],
+        )
+        .await;
+    assert_eq!(resp.status, 206);
+    assert_eq!(&resp.body[..], &bad[..10]);
+
+    // Headers are already out when the mismatch shows up, so the body fails before its last
+    // bytes: the client gets less than Content-Length (a broken transfer), never the corrupt
+    // bytes as a finished download. An HTTP server stops polling the body once Content-Length
+    // bytes are out, so only the bytes before the error count here.
+    let req = common::signed(&c, "GET", "/bk1/k", &[], &[], Default::default());
+    let resp = srv.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let mut stream = resp.into_body().into_data_stream();
+    let mut received = 0;
+    let mut failed = false;
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        match chunk {
+            Ok(bytes) => received += bytes.len(),
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+    }
+    assert!(failed);
+    assert!(received < body.len());
+}
+
+#[tokio::test]
+async fn delete_objects_on_another_tenants_bucket_is_refused_as_a_whole() {
+    let srv = Server::start(1).await;
+    let (_, alice) = srv.tenant("alice").await;
+    let (_, bob) = srv.tenant("bob").await;
+    srv.s3(&alice, "PUT", "/alices", &[], &[], vec![]).await;
+    srv.s3(&alice, "PUT", "/alices/a", &[], &[], b"x".to_vec())
+        .await;
+    let xml = "<Delete><Object><Key>a</Key></Object></Delete>";
+    let md5 = base64_md5(xml.as_bytes());
+    for (bucket, status, code) in [
+        ("/alices", 403, "AccessDenied"),
+        ("/nobody", 404, "NoSuchBucket"),
+    ] {
+        let resp = srv
+            .s3(
+                &bob,
+                "POST",
+                bucket,
+                &[("delete", "")],
+                &[("content-md5", &md5)],
+                xml.as_bytes().to_vec(),
+            )
+            .await;
+        assert_eq!(resp.status, status, "{}", resp.text());
+        assert_eq!(resp.error_code().as_deref(), Some(code));
+    }
+    let resp = srv.s3(&alice, "GET", "/alices/a", &[], &[], vec![]).await;
+    assert_eq!(resp.status, 200);
+}
+
+/// Keys with control characters (other than tab / LF / CR) cannot appear in an XML listing, so
+/// writes that would create them are refused instead of breaking every later listing.
+#[tokio::test]
+async fn keys_with_control_characters_are_rejected() {
+    let srv = Server::start(1).await;
+    let (_, c) = srv.tenant("acme").await;
+    srv.s3(&c, "PUT", "/ctl", &[], &[], vec![]).await;
+    srv.s3(&c, "PUT", "/ctl/src", &[], &[], b"x".to_vec()).await;
+    let bad = format!("/ctl/{}", path_encode("a\u{1}b"));
+    let resp = srv.s3(&c, "PUT", &bad, &[], &[], b"x".to_vec()).await;
+    assert_eq!(resp.status, 400, "{}", resp.text());
+    assert_eq!(resp.error_code().as_deref(), Some("InvalidArgument"));
+    let resp = srv
+        .s3(&c, "POST", &bad, &[("uploads", "")], &[], vec![])
+        .await;
+    assert_eq!(resp.status, 400, "{}", resp.text());
+    let resp = srv
+        .s3(
+            &c,
+            "PUT",
+            &bad,
+            &[],
+            &[("x-amz-copy-source", "/ctl/src")],
+            vec![],
+        )
+        .await;
+    assert_eq!(resp.status, 400, "{}", resp.text());
+
+    // Tab, LF and CR are valid XML and stay allowed.
+    let ok = format!("/ctl/{}", path_encode("t\tn\nr\r"));
+    let resp = srv.s3(&c, "PUT", &ok, &[], &[], b"x".to_vec()).await;
+    assert_eq!(resp.status, 200, "{}", resp.text());
+    let resp = srv
+        .s3(&c, "GET", "/ctl", &[("list-type", "2")], &[], vec![])
+        .await;
+    assert_eq!(resp.status, 200, "{}", resp.text());
+    assert_eq!(xml_values(&resp.text(), "Key").len(), 2);
+}
+
+/// A cluster out of space answers 507 (not retried by S3 clients), not a retryable 503.
+#[tokio::test]
+async fn writes_without_room_get_507() {
+    let srv = Server::start_with(1, |c| c.storage.min_free_bytes = u64::MAX / 2).await;
+    let (_, c) = srv.tenant("acme").await;
+    srv.s3(&c, "PUT", "/bk1", &[], &[], vec![]).await;
+    let resp = srv.s3(&c, "PUT", "/bk1/k", &[], &[], data(1000)).await;
+    assert_eq!(resp.status, 507, "{}", resp.text());
+    assert_eq!(
+        xml_values(&resp.text(), "Code"),
+        vec!["InsufficientStorage"]
+    );
+    let resp = srv
+        .s3(&c, "POST", "/bk1/mp", &[("uploads", "")], &[], vec![])
+        .await;
+    assert_eq!(resp.status, 507, "{}", resp.text());
+
+    // Counted for alerting.
+    use tower::ServiceExt as _;
+    let resp = srv
+        .admin
+        .clone()
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let text = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        text.contains("suhms_storage_full_refusals_total 2"),
+        "{text}"
+    );
 }

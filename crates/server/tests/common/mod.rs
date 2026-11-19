@@ -96,8 +96,9 @@ impl Server {
         let mut config = Config {
             storage: StoreConfig {
                 disks: disk_paths.clone(),
-                metadata_url: format!("sqlite://{}", dir.path().join("meta.db").display()),
+                metadata_url: metadata_url(dir.path()).await,
                 default_replicas: u8::try_from(disks.min(3)).unwrap(),
+                metadata_max_connections: MAX_CONNECTIONS,
                 ..StoreConfig::default()
             },
             s3: S3Config {
@@ -121,6 +122,10 @@ impl Server {
             Arc::clone(&store),
             Arc::clone(&tenancy),
             Arc::clone(&cipher),
+            Arc::new(suhms_server::jobs::Jobs::from_config(
+                Arc::clone(&store),
+                &config,
+            )),
             ADMIN_TOKEN,
             &config,
         );
@@ -345,4 +350,34 @@ pub fn signed_with_payload_hash(
         builder = builder.header(*k, *v);
     }
     builder.body(Body::from(body)).unwrap()
+}
+
+/// The metadata database for a test: a fresh database on the server named by
+/// `SUHMS_TEST_POSTGRES` (e.g. `postgres://postgres:pw@127.0.0.1:5432`) or `SUHMS_TEST_MYSQL`
+/// (e.g. `mysql://root:pw@127.0.0.1:3306`), otherwise a SQLite file in `dir` (as in the store
+/// crate's tests).
+/// Connection pool size for test stores on PostgreSQL / MariaDB. Tests run in parallel and a
+/// cluster test opens three stores, so the default pool size would add up to more connections
+/// than a database server allows by default (100 for PostgreSQL).
+pub const MAX_CONNECTIONS: u32 = 4;
+
+pub async fn metadata_url(dir: &std::path::Path) -> String {
+    use sqlx::{AssertSqlSafe, Connection};
+    let db = format!("t{}", uuid::Uuid::new_v4().simple());
+    let create = AssertSqlSafe(format!("CREATE DATABASE {db}"));
+    if let Ok(base) = std::env::var("SUHMS_TEST_POSTGRES") {
+        let mut c = sqlx::PgConnection::connect(&format!("{base}/postgres"))
+            .await
+            .expect("connect to SUHMS_TEST_POSTGRES");
+        sqlx::raw_sql(create).execute(&mut c).await.unwrap();
+        return format!("{base}/{db}");
+    }
+    if let Ok(base) = std::env::var("SUHMS_TEST_MYSQL") {
+        let mut c = sqlx::MySqlConnection::connect(&base)
+            .await
+            .expect("connect to SUHMS_TEST_MYSQL");
+        sqlx::raw_sql(create).execute(&mut c).await.unwrap();
+        return format!("{base}/{db}");
+    }
+    format!("sqlite://{}", dir.join("meta.db").display())
 }

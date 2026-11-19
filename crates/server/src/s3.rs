@@ -116,7 +116,7 @@ impl S3Auth for KeyStore {
             .directory
             .key(access_key)
             .await
-            .map_err(internal)?
+            .map_err(s3_err)?
             .filter(|k| k.active)
             .ok_or_else(|| s3_error!(InvalidAccessKeyId))?;
         let secret = self.cipher.decrypt(&key.id, &key.secret_enc).map_err(|e| {
@@ -154,14 +154,14 @@ impl S3Service {
             .directory
             .key(&cred.access_key)
             .await
-            .map_err(internal)?
+            .map_err(s3_err)?
             .filter(|k| k.active)
             .ok_or_else(|| s3_error!(InvalidAccessKeyId))?;
         let tenant = t
             .directory
             .tenant(&key.tenant_id)
             .await
-            .map_err(internal)?
+            .map_err(s3_err)?
             .ok_or_else(|| s3_error!(InvalidAccessKeyId))?;
         if tenant.suspended {
             t.meter.rejected_total.fetch_add(1, Ordering::Relaxed);
@@ -210,7 +210,7 @@ impl S3Service {
             .metadata()
             .get_bucket(bucket)
             .await
-            .map_err(internal)?
+            .map_err(s3_err)?
             .map(|b| b.owner)
             .unwrap_or_default();
         self.tenancy.meter.request(&owner, Class::B);
@@ -234,6 +234,10 @@ fn s3_err(e: StoreError) -> S3Error {
         StoreError::BucketNotEmpty(_) => s3_error!(BucketNotEmpty),
         StoreError::InvalidBucketName(_) => s3_error!(InvalidBucketName),
         StoreError::InvalidObjectKey => s3_error!(KeyTooLongError),
+        StoreError::InvalidKeyCharacter => s3_error!(
+            InvalidArgument,
+            "Object keys must not contain control characters other than tab, LF and CR"
+        ),
         StoreError::AccessDenied => s3_error!(AccessDenied),
         StoreError::UnknownStorageClass(_) => s3_error!(InvalidStorageClass),
         StoreError::BadDigest => s3_error!(BadDigest),
@@ -262,6 +266,20 @@ fn s3_err(e: StoreError) -> S3Error {
         StoreError::InvalidTag(m) => S3Error::with_message(S3ErrorCode::InvalidTag, m),
         e @ (StoreError::InvalidReplicaCount { .. } | StoreError::InvalidArgument(_)) => {
             S3Error::with_message(S3ErrorCode::InvalidArgument, e.to_string())
+        }
+        e if e.is_metadata_unavailable() => {
+            tracing::error!(error = %e, source = ?std::error::Error::source(&e), "metadata database unavailable");
+            s3_error!(ServiceUnavailable)
+        }
+        e @ StoreError::InsufficientStorage { .. } => {
+            tracing::warn!(error = %e, "out of storage space");
+            // 507 like MinIO's XMinioStorageFull: not a status S3 clients retry, unlike 503.
+            let mut err = S3Error::with_message(
+                S3ErrorCode::Custom("InsufficientStorage".into()),
+                "The cluster does not have enough free space to store the object.",
+            );
+            err.set_status_code(axum::http::StatusCode::INSUFFICIENT_STORAGE);
+            err
         }
         e @ (StoreError::WriteQuorum { .. }
         | StoreError::NoHealthyReplica(_)
@@ -375,6 +393,26 @@ fn encoder(encoding_type: Option<&s3s::dto::EncodingType>) -> S3Result<fn(&str) 
     }
 }
 
+/// Listings without `encoding-type=url` echo keys verbatim in XML, which cannot carry control
+/// characters; `s3s` would then fail the whole response with 500, which clients retry forever.
+/// New keys with such characters are rejected on write, but keys stored before that could
+/// still exist: answer 400 and point at `encoding-type=url`, which can list them.
+fn require_xml_safe<'a>(url: bool, keys: impl IntoIterator<Item = &'a str>) -> S3Result<()> {
+    if url {
+        return Ok(());
+    }
+    if keys
+        .into_iter()
+        .any(|k| k.bytes().any(suhms_store::is_xml_control_byte))
+    {
+        return Err(s3_error!(
+            InvalidArgument,
+            "The listing contains object keys with control characters; retry with encoding-type=url"
+        ));
+    }
+    Ok(())
+}
+
 fn max_keys(v: Option<i32>) -> S3Result<usize> {
     match v {
         None => Ok(1000),
@@ -394,6 +432,13 @@ fn object_entries(page: &ListPage, enc: fn(&str) -> String) -> Vec<Object> {
             ..Default::default()
         })
         .collect()
+}
+
+fn page_keys(page: &ListPage) -> impl Iterator<Item = &str> {
+    page.objects
+        .iter()
+        .map(|o| o.key.as_str())
+        .chain(page.common_prefixes.iter().map(String::as_str))
 }
 
 fn prefix_entries(page: &ListPage, enc: fn(&str) -> String) -> Vec<CommonPrefix> {
@@ -867,7 +912,7 @@ impl S3 for S3Service {
             .metadata()
             .get_tenant(&tenant_id)
             .await
-            .map_err(internal)?;
+            .map_err(s3_err)?;
         let buckets = self
             .store
             .list_buckets(&tenant_id)
@@ -997,6 +1042,14 @@ impl S3 for S3Service {
             )
             .await
             .map_err(s3_err)?;
+        require_xml_safe(
+            input.encoding_type.is_some(),
+            page.versions
+                .iter()
+                .map(|o| o.key.as_str())
+                .chain(page.common_prefixes.iter().map(String::as_str))
+                .chain(page.next_key_marker.as_deref()),
+        )?;
         let owner = Owner {
             id: Some(tenant.clone()),
             display_name: None,
@@ -1435,6 +1488,7 @@ impl S3 for S3Service {
         let tenant = self.tenant(&req, Class::A).await?;
         let expected = checksum::expected(&req.headers, req.trailing_headers.as_ref())?;
         let input = req.input;
+        let size_hint = input.content_length.and_then(|n| u64::try_from(n).ok());
         let condition = write_condition(input.if_match.as_ref(), input.if_none_match.as_ref())?;
         let policy = Algo::of(input.checksum_algorithm.as_ref())?
             .map_or(Policy::ClientOrDefault, Policy::Required);
@@ -1458,6 +1512,7 @@ impl S3 for S3Service {
             legal_hold: input
                 .object_lock_legal_hold_status
                 .is_some_and(|s| s.as_str() == ObjectLockLegalHoldStatus::ON),
+            size_hint,
             ..PutObjectRequest::default()
         };
         let rec = self
@@ -1640,6 +1695,7 @@ impl S3 for S3Service {
                 part_number(input.part_number)?,
                 parse_md5(input.content_md5.as_deref())?,
                 Some(slot),
+                input.content_length.and_then(|n| u64::try_from(n).ok()),
                 body,
             )
             .await
@@ -1941,6 +1997,14 @@ impl S3 for S3Service {
             )
             .await
             .map_err(s3_err)?;
+        require_xml_safe(
+            input.encoding_type.is_some(),
+            page.uploads
+                .iter()
+                .map(|u| u.key.as_str())
+                .chain(page.common_prefixes.iter().map(String::as_str))
+                .chain(page.next_key_marker.as_deref()),
+        )?;
         Ok(S3Response::new(ListMultipartUploadsOutput {
             bucket: Some(input.bucket),
             prefix: input.prefix.as_deref().map(enc),
@@ -2158,6 +2222,12 @@ impl S3 for S3Service {
         if input.delete.objects.len() > 1000 {
             return Err(s3_error!(MalformedXML, "at most 1000 keys per request"));
         }
+        // Like S3, a bucket that is missing or not the caller's fails the whole request (rather
+        // than one error per key).
+        self.store
+            .get_bucket(&tenant, &input.bucket)
+            .await
+            .map_err(s3_err)?;
         let quiet = input.delete.quiet.unwrap_or(false);
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
@@ -2248,6 +2318,14 @@ impl S3 for S3Service {
             )
             .await
             .map_err(s3_err)?;
+        require_xml_safe(
+            input.encoding_type.is_some(),
+            page_keys(&page).chain(
+                [&input.prefix, &input.delimiter, &input.start_after]
+                    .into_iter()
+                    .filter_map(|v| v.as_deref()),
+            ),
+        )?;
         let key_count = page.objects.len() + page.common_prefixes.len();
         Ok(S3Response::new(ListObjectsV2Output {
             name: Some(input.bucket),
@@ -2291,6 +2369,14 @@ impl S3 for S3Service {
             )
             .await
             .map_err(s3_err)?;
+        require_xml_safe(
+            input.encoding_type.is_some(),
+            page_keys(&page).chain(
+                [&input.prefix, &input.delimiter, &input.marker]
+                    .into_iter()
+                    .filter_map(|v| v.as_deref()),
+            ),
+        )?;
         Ok(S3Response::new(ListObjectsOutput {
             name: Some(input.bucket),
             prefix: Some(enc(input.prefix.as_deref().unwrap_or_default())),
@@ -2313,7 +2399,15 @@ impl S3 for S3Service {
 
 #[cfg(test)]
 mod tests {
-    use super::url_encode;
+    use super::{require_xml_safe, url_encode};
+
+    #[test]
+    fn listing_keys_with_control_characters_needs_url_encoding() {
+        assert!(require_xml_safe(false, ["a\tb", "c\nd\r", "日"]).is_ok());
+        let err = require_xml_safe(false, ["ok", "a\u{1}b"]).unwrap_err();
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
+        assert!(require_xml_safe(true, ["a\u{1}b"]).is_ok());
+    }
 
     #[test]
     fn url_encoding_keeps_slashes_and_unreserved() {

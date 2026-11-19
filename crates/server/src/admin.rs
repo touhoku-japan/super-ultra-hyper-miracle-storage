@@ -84,7 +84,11 @@ pub fn now_millis() -> i64 {
 }
 
 async fn metadata(config: &Config) -> anyhow::Result<Arc<dyn MetadataStore>> {
-    Ok(meta::connect(&config.storage.metadata_url).await?)
+    Ok(meta::connect_with(
+        &config.storage.metadata_url,
+        config.storage.metadata_max_connections,
+    )
+    .await?)
 }
 
 async fn tenant_id(meta: &dyn MetadataStore, name: &str) -> anyhow::Result<String> {
@@ -198,6 +202,12 @@ pub async fn scrub(config: Config) -> anyhow::Result<()> {
         "checked {} copies, removed {} bad copies",
         r.checked, r.removed
     );
+    if r.skipped_disks > 0 {
+        anyhow::bail!(
+            "{} configured disk(s) could not be scrubbed (not mounted, missing or failing; see the log above)",
+            r.skipped_disks
+        );
+    }
     Ok(())
 }
 

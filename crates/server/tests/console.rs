@@ -686,24 +686,11 @@ async fn maintenance_jobs_run_in_the_background() {
     assert_eq!(s, 202);
     let (s, _) = srv.admin("POST", "/admin/v1/jobs/nope", None).await;
     assert_eq!(s, 404);
-    let mut finished = None;
-    for _ in 0..100 {
-        let (_, jobs) = srv.admin("GET", "/admin/v1/jobs", None).await;
-        let scrub = jobs
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|j| j["name"] == "scrub")
-            .unwrap()
-            .clone();
-        if scrub["running"] == false && scrub["finished_at"].is_number() {
-            finished = Some(scrub);
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    let scrub = finished.expect("scrub finishes");
+    let scrub = finished_run(&srv, "scrub").await;
     assert_eq!(scrub["result"]["checked"], 0);
+    assert_eq!(scrub["started_by"], "console");
+    assert_eq!(scrub["this_node"], true);
+    assert_eq!(scrub["node_id"], srv.store.node_id());
 
     let (s, _) = srv
         .admin(
@@ -721,4 +708,182 @@ async fn maintenance_jobs_run_in_the_background() {
         )
         .await;
     assert_eq!(s, 422);
+}
+
+/// The job as `GET /admin/v1/jobs` lists it.
+async fn job_info(srv: &Server, name: &str) -> serde_json::Value {
+    let (s, jobs) = srv.admin("GET", "/admin/v1/jobs", None).await;
+    assert_eq!(s, 200);
+    jobs.as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["name"] == name)
+        .unwrap()
+        .clone()
+}
+
+/// Waits for this node's run of `name` started from the console to finish and returns it.
+async fn finished_run(srv: &Server, name: &str) -> serde_json::Value {
+    for _ in 0..200 {
+        let job = job_info(srv, name).await;
+        if let Some(run) = job["runs"].as_array().unwrap().iter().find(|r| {
+            r["this_node"] == true && r["running"] == false && r["started_by"] == "console"
+        }) {
+            return run.clone();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("{name} does not finish");
+}
+
+fn other_node_run(job: &str, running: bool, heartbeat_at: i64) -> suhms_store::meta::JobRun {
+    suhms_store::meta::JobRun {
+        node_id: "node-b".into(),
+        job: job.into(),
+        running,
+        started_by: "schedule".into(),
+        started_at: heartbeat_at,
+        finished_at: None,
+        heartbeat_at,
+        result: None,
+        error: None,
+    }
+}
+
+#[tokio::test]
+async fn job_state_is_shared_across_nodes() {
+    let srv = Server::start(1).await;
+    let meta = srv.store.metadata();
+    let now = suhms_server::admin::now_millis();
+
+    // Another node runs repair (a cluster-wide job): this node lists it and refuses to start one.
+    meta.put_job_run(&other_node_run("repair", true, now))
+        .await
+        .unwrap();
+    let repair = job_info(&srv, "repair").await;
+    assert_eq!(repair["scope"], "cluster");
+    assert_eq!(repair["blocked"], true);
+    assert_eq!(repair["runs"][0]["node_id"], "node-b");
+    assert_eq!(repair["runs"][0]["running"], true);
+    assert_eq!(repair["runs"][0]["this_node"], false);
+    let (s, body) = srv.admin("POST", "/admin/v1/jobs/repair", None).await;
+    assert_eq!(s, 409);
+    assert!(body.to_string().contains("node-b"), "{body}");
+
+    // Scrub is per node: another node's scrub does not stop this one.
+    meta.put_job_run(&other_node_run("scrub", true, now))
+        .await
+        .unwrap();
+    assert_eq!(job_info(&srv, "scrub").await["blocked"], false);
+    let (s, _) = srv.admin("POST", "/admin/v1/jobs/scrub", None).await;
+    assert_eq!(s, 202);
+    finished_run(&srv, "scrub").await;
+    assert_eq!(
+        job_info(&srv, "scrub").await["runs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // A node that stopped updating its heartbeat (crashed) no longer counts as running.
+    meta.put_job_run(&other_node_run("repair", true, now - 10 * 60_000))
+        .await
+        .unwrap();
+    let repair = job_info(&srv, "repair").await;
+    assert_eq!(repair["blocked"], false);
+    assert_eq!(repair["runs"][0]["running"], false);
+    assert_eq!(repair["runs"][0]["interrupted"], true);
+    assert!(
+        repair["runs"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("中断")
+    );
+    let (s, _) = srv.admin("POST", "/admin/v1/jobs/repair", None).await;
+    assert_eq!(s, 202);
+    let mine = finished_run(&srv, "repair").await;
+    assert!(mine["error"].is_null(), "{mine}");
+    assert_eq!(mine["result"]["copied"], 0);
+}
+
+#[tokio::test]
+async fn scheduled_runs_are_recorded_and_restarts_mark_them_interrupted() {
+    let srv = Server::start(1).await;
+    let meta = srv.store.metadata();
+    let node = srv.store.node_id().to_owned();
+    let jobs = std::sync::Arc::new(suhms_server::jobs::Jobs::new(
+        std::sync::Arc::clone(&srv.store),
+        std::time::Duration::from_secs(60),
+        0,
+    ));
+
+    let r = jobs.run_scheduled("scrub").await.unwrap().unwrap();
+    assert_eq!(r["checked"], 0);
+    assert!(suhms_server::jobs::is_idle(&r));
+    let row = meta.get_job_run(&node, "scrub").await.unwrap().unwrap();
+    assert_eq!(row.started_by, "schedule");
+    assert!(!row.running && row.finished_at.is_some() && row.result.is_some());
+
+    // A scheduled repair that finds the lease taken leaves no trace (another node is doing it).
+    let now = suhms_server::admin::now_millis();
+    assert!(
+        meta.try_acquire_lease("replicas", "node-b", now, 60_000)
+            .await
+            .unwrap()
+    );
+    assert_eq!(jobs.run_scheduled("repair").await.unwrap(), None);
+    assert_eq!(meta.get_job_run(&node, "repair").await.unwrap(), None);
+    // ...and keeps the previous run if there was one.
+    meta.release_lease("replicas", "node-b").await.unwrap();
+    jobs.run_scheduled("repair").await.unwrap().unwrap();
+    let before = meta.get_job_run(&node, "repair").await.unwrap().unwrap();
+    assert!(
+        meta.try_acquire_lease("replicas", "node-b", now + 1, 60_000)
+            .await
+            .unwrap()
+    );
+    assert_eq!(jobs.run_scheduled("repair").await.unwrap(), None);
+    assert_eq!(
+        meta.get_job_run(&node, "repair").await.unwrap(),
+        Some(before)
+    );
+    // Started from the console, the same conflict is shown as the run's error.
+    let (s, _) = srv.admin("POST", "/admin/v1/jobs/repair", None).await;
+    assert_eq!(s, 202);
+    let run = finished_run(&srv, "repair").await;
+    assert!(
+        run["error"]
+            .as_str()
+            .unwrap()
+            .contains("別の処理が実行中です"),
+        "{run}"
+    );
+
+    // A run left "running" by a previous process is marked interrupted at startup.
+    let mut stuck =
+        meta.get_job_run(&node, "gc")
+            .await
+            .unwrap()
+            .unwrap_or(suhms_store::meta::JobRun {
+                node_id: node.clone(),
+                ..other_node_run("gc", true, now)
+            });
+    stuck.running = true;
+    meta.put_job_run(&stuck).await.unwrap();
+    meta.put_job_run(&other_node_run("gc", true, now))
+        .await
+        .unwrap();
+    jobs.recover().await.unwrap();
+    let gc = meta.get_job_run(&node, "gc").await.unwrap().unwrap();
+    assert!(!gc.running);
+    assert!(gc.error.unwrap().contains("再起動"));
+    // Other nodes' rows are theirs to fix.
+    assert!(
+        meta.get_job_run("node-b", "gc")
+            .await
+            .unwrap()
+            .unwrap()
+            .running
+    );
 }

@@ -12,6 +12,7 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,9 @@ pub struct Disk {
     pub id: DiskId,
     pub node_id: String,
     pub root: PathBuf,
+    /// Result of the last [`Disk::probe`]. An unhealthy disk is treated like one that is down:
+    /// no reads, writes, heartbeats, scrub or gc until it passes a probe again.
+    healthy: AtomicBool,
 }
 
 impl Disk {
@@ -91,7 +95,50 @@ impl Disk {
         fs::create_dir_all(root.join(OBJECTS_DIR)).map_err(unavailable)?;
         fs::create_dir_all(meta_dir.join(TMP_DIR)).map_err(unavailable)?;
 
-        Ok(Self { id, node_id, root })
+        Ok(Self {
+            id,
+            node_id,
+            root,
+            healthy: AtomicBool::new(true),
+        })
+    }
+
+    /// Whether the disk passed its last probe.
+    pub fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Relaxed)
+    }
+
+    /// Checks that the disk is still there: its identity file must be readable and name this
+    /// disk. Fails when the filesystem was unmounted (the mount point is an empty directory),
+    /// the directory was moved or deleted, or the device returns I/O errors. Records and
+    /// returns the result; logs when it changes.
+    pub async fn probe(&self) -> bool {
+        let path = self.meta_dir().join(FORMAT_FILE);
+        let expected = self.id;
+        let result = tokio::task::spawn_blocking(move || -> std::result::Result<(), String> {
+            let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+            let format: FormatFile = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            if format.disk_id == expected {
+                Ok(())
+            } else {
+                Err(format!("identity is now {}", format.disk_id))
+            }
+        })
+        .await
+        .expect("disk probe task panicked");
+        let healthy = result.is_ok();
+        let was = self.healthy.swap(healthy, Ordering::Relaxed);
+        match result {
+            Err(reason) if was => {
+                tracing::error!(disk = %self.id, path = %self.root.display(), %reason,
+                    "disk failed its health check (unmounted, removed or failing); taking it out of service");
+            }
+            Ok(()) if !was => {
+                tracing::info!(disk = %self.id, path = %self.root.display(), "disk is healthy again");
+            }
+            _ => {}
+        }
+        healthy
     }
 
     /// Writes a new identity to an empty directory. Refuses non-empty directories so a typo in
