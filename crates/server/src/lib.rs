@@ -172,7 +172,12 @@ pub fn app(
             cors::middleware,
         ))
         .layer(axum::middleware::from_fn(audit))
-        .layer(TraceLayer::new_for_http()))
+        // 5xx responses are already logged with their cause by the S3 service (ERROR for
+        // storage failures); the trace layer's own report of them stays at WARN.
+        .layer(
+            TraceLayer::new_for_http()
+                .on_failure(tower_http::trace::DefaultOnFailure::new().level(tracing::Level::WARN)),
+        ))
 }
 
 /// The tenancy services (key cache, rate limits, meter) for an app.

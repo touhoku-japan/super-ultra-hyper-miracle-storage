@@ -915,6 +915,34 @@ impl Store {
         self.open_replicas_on(dest, &targets, count, required).await
     }
 
+    /// Writes `body` into the open copies. Nodes whose copy failed (a remote copy that broke off
+    /// midway or did not commit) are pinged right away ([`Store::suspect_node`]), so that the next
+    /// writes skip a node that stopped responding instead of each waiting on it.
+    async fn write_copies<R: AsyncRead + Unpin>(
+        &self,
+        copies: blob::Replicas,
+        required: usize,
+        body: R,
+    ) -> Result<blob::WriteOutcome> {
+        let remote: Vec<DiskRef> = copies
+            .open_targets()
+            .into_iter()
+            .filter(|d| !d.is_local())
+            .collect();
+        let result = copies.write(required, body).await;
+        let written = match &result {
+            Ok(outcome) => outcome.written.clone(),
+            // Which copies failed is not known; pinging the others costs little.
+            Err(StoreError::WriteQuorum { .. }) => Vec::new(),
+            // The body itself failed (client gone, bad digest): not the peers' fault.
+            Err(_) => return result,
+        };
+        for d in remote.iter().filter(|d| !written.contains(&d.id())) {
+            self.suspect_node(d.node_id());
+        }
+        result
+    }
+
     /// Pings the nodes of the remote disks among `tried` that could not be opened; returns
     /// those nodes.
     fn suspect_failed(&self, copies: &blob::Replicas, tried: &[DiskRef]) -> HashSet<String> {
@@ -1213,7 +1241,7 @@ impl Store {
         let copies = self
             .open_replicas(Dest::Object(id), usize::from(replicas), required)
             .await?;
-        let outcome = copies.write(required, body).await?;
+        let outcome = self.write_copies(copies, required, body).await?;
         let written = StoredObject {
             object: ObjectRecord {
                 id,
@@ -1476,7 +1504,7 @@ impl Store {
                 required,
             )
             .await?;
-        let outcome = copies.write(required, body).await?;
+        let outcome = self.write_copies(copies, required, body).await?;
         let remove = |disks: Vec<DiskId>, dest: Dest| async move {
             if let Ok(refs) = self.reachable(&disks).await {
                 for d in refs {

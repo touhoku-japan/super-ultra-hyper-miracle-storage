@@ -72,10 +72,14 @@ SoraHost の社内バックアップ＋顧客向け外販が目的。マルチ�
       `crc_fast::checksum_combine` で合成。データは読み直さない）を求める。コピーは要求されたアルゴリズム、
       無ければコピー元のアルゴリズムで計算し直す
     - `cluster.rs` — ノード間 API（`[cluster] listen` の別リスナー、`x-suhms-node-auth` の HMAC 認証）と
-      `HttpPeer`（`reqwest`）。`open_store` がクラスタ構成ならピア付きで Store を開く
+      `HttpPeer`（`reqwest`）。`open_store` がクラスタ構成ならピア付きで Store を開く。
+      ピアへの要求には全体のタイムアウトを付けない（大きい転送や連結は時間がかかる）代わりに、待っている間は 5 秒ごとに ping し
+      （`HttpPeer::alive`、`LIVENESS_INTERVAL`）、ping に失敗したら打ち切る。固まったプロセスは TCP 接続だけは受け付けるので、
+      これが無いと要求が永久に待つ。書き込みに失敗したノードは `Store::write_copies` がすぐ ping し、次の書き込みから外す
     - `main.rs` — 全リスナーで受け付けた接続に TCP_NODELAY を設定（`nodelay`。無いとキープアライブ接続の小さい応答が遅延 ACK で約 40ms 待つ）。
       s3s が拒否したリクエスト（署名不一致・不正なバケット名等のクライアントエラー）を `s3s::ops` の ERROR で 2 行ずつ出すので、
-      そのターゲットの ERROR は捨てる（`is_s3s_request_error`。状態コードは監査ログに残る。`RUST_LOG` を指定したときは捨てない）
+      そのターゲットの ERROR は捨てる（`is_s3s_request_error`。状態コードは監査ログに残る。`RUST_LOG` を指定したときは捨てない）。
+      TraceLayer の 5xx の報告（`response failed`）は WARN にする（原因は S3 サービスが ERROR で出すので二重になるため）
     - `drain.rs` — S3 がリクエスト本文を読まずにエラーを返したとき、残りが 1 MiB 以下なら読み捨ててから応答する（読まずに閉じるとクライアントには `SlowDown` 等より先に BrokenPipe が見える）。`Expect: 100-continue` のリクエストは対象外
     - `tls.rs` — ノード間の相互 TLS（`[cluster.tls]`）。起動時に自ノードの証明書の有効期間を検査し（`check_node_cert`。X.509 パーサは使わず DER を直接読む）、期限切れなら起動しない。30 日前から警告、期限は `/metrics` に出す。rustls（暗号プロバイダは `ring`。aws-lc はビルドが重いので使わない）。
       クラスタ CA が署名したクライアント証明書を必須にし、サーバ証明書も同じ CA でだけ検証する。HMAC 認証は残す。

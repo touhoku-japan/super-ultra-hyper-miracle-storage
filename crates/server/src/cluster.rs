@@ -325,31 +325,93 @@ pub fn internal_router(store: Arc<Store>, secret: &str) -> Router {
 
 // ---------------------------------------------------------------- client side
 
+#[derive(Clone)]
 pub struct HttpPeer {
     client: reqwest::Client,
     base: String,
     secret: Arc<str>,
+    timing: Timing,
 }
+
+/// How a peer's liveness is checked while waiting for it (see [`HttpPeer::alive`]).
+#[derive(Debug, Clone, Copy)]
+struct Timing {
+    /// Ping interval while a request is outstanding.
+    liveness: Duration,
+    /// How long a ping may take.
+    ping: Duration,
+}
+
+const TIMING: Timing = Timing {
+    liveness: LIVENESS_INTERVAL,
+    ping: PING_TIMEOUT,
+};
 
 fn io_err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
 
 impl HttpPeer {
-    /// GETs a file from the peer as a reader.
-    async fn get_stream(&self, path_and_query: &str) -> io::Result<BoxReader> {
+    /// Waits for `fut` for as long as the peer stays alive: while it is pending, the peer is
+    /// pinged every [`LIVENESS_INTERVAL`], and the wait fails once a ping does.
+    ///
+    /// Requests to peers have no overall timeout, since a large transfer or assembly can take
+    /// long. Without this, a peer that stops responding without closing its connections (a
+    /// frozen process, a hung disk, a network that drops packets) would leave the request
+    /// waiting forever: the client of the S3 request too, and repair. A peer that is merely
+    /// slow still answers pings and is waited for.
+    async fn alive<T>(&self, fut: impl std::future::Future<Output = T>) -> io::Result<T> {
+        tokio::pin!(fut);
+        loop {
+            tokio::select! {
+                v = &mut fut => return Ok(v),
+                r = async {
+                    tokio::time::sleep(self.timing.liveness).await;
+                    self.ping_once().await
+                } => {
+                    if let Err(e) = r {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("peer stopped responding: {e}"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    async fn ping_once(&self) -> io::Result<()> {
         let resp = self
-            .request(Method::GET, path_and_query)
+            .request(Method::GET, "/internal/v1/ping")
+            .timeout(self.timing.ping)
             .send()
             .await
             .map_err(io_err)?;
-        let resp = Self::check(resp).await?;
+        Self::check(resp).await.map(drop)
+    }
+
+    /// Sends a request and checks its status, for as long as the peer stays alive.
+    async fn send(&self, req: reqwest::RequestBuilder) -> io::Result<reqwest::Response> {
+        self.alive(async { Self::check(req.send().await.map_err(io_err)?).await })
+            .await?
+    }
+
+    /// GETs a file from the peer as a reader.
+    async fn get_stream(&self, path_and_query: &str) -> io::Result<BoxReader> {
+        let resp = self.send(self.request(Method::GET, path_and_query)).await?;
         // Pump through a channel so the reader is Sync (required by the S3 response body).
         let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(4);
         let mut stream = resp.bytes_stream().map_err(io_err);
+        let peer = self.clone();
         tokio::spawn(async move {
-            while let Some(item) = stream.next().await {
-                if tx.send(item).await.is_err() {
+            loop {
+                let item = match peer.alive(stream.next()).await {
+                    Ok(Some(item)) => item,
+                    Ok(None) => break,
+                    Err(e) => Err(e),
+                };
+                let failed = item.is_err();
+                if tx.send(item).await.is_err() || failed {
                     break;
                 }
             }
@@ -392,8 +454,10 @@ impl HttpPeer {
     }
 }
 
-/// Streams a write to a peer through a bounded channel feeding the request body.
+/// Streams a write to a peer through a bounded channel feeding the request body. Every wait on
+/// the peer is bounded by its liveness ([`HttpPeer::alive`]).
 struct HttpSink {
+    peer: HttpPeer,
     tx: Option<mpsc::Sender<io::Result<Bytes>>>,
     response: tokio::task::JoinHandle<reqwest::Result<reqwest::Response>>,
 }
@@ -402,26 +466,34 @@ struct HttpSink {
 impl ReplicaSink for HttpSink {
     async fn write(&mut self, chunk: Bytes) -> io::Result<()> {
         let tx = self.tx.as_ref().expect("sink used after finishing");
-        tx.send(Ok(chunk))
-            .await
+        self.peer
+            .alive(tx.send(Ok(chunk)))
+            .await?
             .map_err(|_| io_err("peer stopped receiving"))
     }
 
     async fn commit(mut self: Box<Self>) -> io::Result<()> {
-        drop(self.tx.take());
-        let resp = (&mut self.response)
-            .await
-            .map_err(io_err)?
-            .map_err(io_err)?;
-        HttpPeer::check(resp).await.map(drop)
+        let this = &mut *self;
+        drop(this.tx.take());
+        let resp = match this.peer.alive(&mut this.response).await {
+            Ok(r) => r.map_err(io_err)?.map_err(io_err)?,
+            Err(e) => {
+                this.response.abort();
+                return Err(e);
+            }
+        };
+        this.peer.alive(HttpPeer::check(resp)).await?.map(drop)
     }
 
     async fn abort(mut self: Box<Self>) {
+        let this = &mut *self;
         // Failing the body makes the peer discard its temp file.
-        if let Some(tx) = self.tx.take() {
-            let _ = tx.send(Err(io_err("write aborted"))).await;
+        if let Some(tx) = this.tx.take() {
+            let _ = this.peer.alive(tx.send(Err(io_err("write aborted")))).await;
         }
-        let _ = (&mut self.response).await;
+        if this.peer.alive(&mut this.response).await.is_err() {
+            this.response.abort();
+        }
     }
 }
 
@@ -465,6 +537,7 @@ impl Peer for HttpPeer {
             }
         }
         Ok(Box::new(HttpSink {
+            peer: self.clone(),
             tx: Some(tx),
             response,
         }))
@@ -501,32 +574,18 @@ impl Peer for HttpPeer {
     }
 
     async fn remove(&self, disk: DiskId, dest: Dest) -> io::Result<()> {
-        let resp = self
-            .request(Method::DELETE, &Self::path(disk, dest))
-            .send()
+        self.send(self.request(Method::DELETE, &Self::path(disk, dest)))
             .await
-            .map_err(io_err)?;
-        Self::check(resp).await.map(drop)
+            .map(drop)
     }
 
     async fn ping(&self) -> io::Result<()> {
-        let resp = self
-            .request(Method::GET, "/internal/v1/ping")
-            .timeout(PING_TIMEOUT)
-            .send()
-            .await
-            .map_err(io_err)?;
-        Self::check(resp).await.map(drop)
+        self.ping_once().await
     }
 
     async fn remove_upload(&self, disk: DiskId, upload: Uuid) -> io::Result<()> {
         let pq = format!("/internal/v1/disks/{disk}/uploads/{upload}");
-        let resp = self
-            .request(Method::DELETE, &pq)
-            .send()
-            .await
-            .map_err(io_err)?;
-        Self::check(resp).await.map(drop)
+        self.send(self.request(Method::DELETE, &pq)).await.map(drop)
     }
 
     async fn concat(
@@ -537,14 +596,16 @@ impl Peer for HttpPeer {
         object: Uuid,
     ) -> io::Result<String> {
         let pq = format!("/internal/v1/disks/{disk}/uploads/{upload}/concat");
-        let resp = self
+        let req = self
             .request(Method::POST, &pq)
-            .json(&ConcatRequest::new(parts, object))
-            .send()
-            .await
-            .map_err(io_err)?;
-        let resp = Self::check(resp).await?;
-        Ok(resp.json::<ConcatResponse>().await.map_err(io_err)?.blake3)
+            .json(&ConcatRequest::new(parts, object));
+        // Assembling a large object takes a while; the peer keeps answering pings meanwhile.
+        let resp = self.send(req).await?;
+        Ok(self
+            .alive(resp.json::<ConcatResponse>())
+            .await?
+            .map_err(io_err)?
+            .blake3)
     }
 }
 
@@ -553,6 +614,8 @@ impl Peer for HttpPeer {
 const PING_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long opening a remote copy may wait for a connection to the peer.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
+/// How often a peer is pinged while a request to it is outstanding ([`HttpPeer::alive`]).
+const LIVENESS_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct HttpPeers {
     peers: HashMap<String, Arc<dyn Peer>>,
@@ -579,6 +642,7 @@ impl HttpPeers {
                     client: client.clone(),
                     base: n.url.trim_end_matches('/').to_owned(),
                     secret: Arc::clone(&secret),
+                    timing: TIMING,
                 });
                 (n.id.clone(), peer)
             })
@@ -632,6 +696,90 @@ pub fn auth_header(secret: &str, method: &str, path_and_query: &str) -> HeaderMa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer for `base` that checks liveness quickly.
+    fn fast_peer(base: String) -> HttpPeer {
+        crate::tls::install_provider();
+        HttpPeer {
+            client: reqwest::Client::new(),
+            base,
+            secret: Arc::from("x".repeat(32)),
+            timing: Timing {
+                liveness: Duration::from_millis(100),
+                ping: Duration::from_millis(300),
+            },
+        }
+    }
+
+    /// A "peer" that accepts connections and never answers (like a frozen process: the kernel
+    /// still completes the TCP handshake).
+    async fn black_hole() -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = l.accept().await {
+                held.push(s);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    async fn within<T>(f: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), f)
+            .await
+            .expect("must fail, not hang")
+    }
+
+    #[tokio::test]
+    async fn requests_to_a_peer_that_stopped_responding_fail_instead_of_hanging() {
+        let peer = fast_peer(black_hole().await);
+        let disk = Uuid::new_v4();
+        let blob = Uuid::new_v4();
+
+        // The body is accepted into socket buffers, so opening and writing succeed; the commit
+        // waits for an answer that never comes.
+        let mut sink = peer.open_sink(disk, Dest::Object(blob)).await.unwrap();
+        sink.write(Bytes::from_static(b"data")).await.unwrap();
+        let err = within(sink.commit()).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+
+        let err = within(peer.read(disk, blob, 4, 0..4)).await.err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        within(peer.remove(disk, Dest::Object(blob)))
+            .await
+            .unwrap_err();
+        within(peer.concat(disk, Uuid::new_v4(), Vec::new(), blob))
+            .await
+            .unwrap_err();
+        peer.ping().await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn a_slow_peer_that_answers_pings_is_waited_for() {
+        use axum::routing::put;
+        let app = Router::new()
+            .route("/internal/v1/ping", get(|| async { "ok" }))
+            .route(
+                "/internal/v1/disks/{disk}/objects/{blob}",
+                put(|body: Body| async move {
+                    let _ = axum::body::to_bytes(body, usize::MAX).await;
+                    // Much longer than the ping interval (a slow fsync, say).
+                    tokio::time::sleep(Duration::from_millis(800)).await;
+                    StatusCode::OK
+                }),
+            );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await });
+        let peer = fast_peer(format!("http://{addr}"));
+        let mut sink = peer
+            .open_sink(Uuid::new_v4(), Dest::Object(Uuid::new_v4()))
+            .await
+            .unwrap();
+        sink.write(Bytes::from_static(b"data")).await.unwrap();
+        sink.commit().await.unwrap();
+    }
 
     #[test]
     fn signatures_bind_method_path_and_time() {

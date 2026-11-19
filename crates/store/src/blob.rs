@@ -185,6 +185,11 @@ impl Replicas {
         }
     }
 
+    /// The disks with an open copy.
+    pub fn open_targets(&self) -> Vec<DiskRef> {
+        self.slots.iter().map(|s| s.disk.clone()).collect()
+    }
+
     /// Disks with an open copy.
     pub fn open_disks(&self) -> Vec<DiskId> {
         self.slots.iter().map(|s| s.disk.id()).collect()
