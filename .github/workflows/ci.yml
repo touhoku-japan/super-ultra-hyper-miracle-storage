@@ -105,6 +105,15 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Each cluster test opens three stores (a pool of up to 16 connections each) and tests run
+      # in parallel, which outgrows the default limit of 100 (PG) / 151 (MariaDB) connections.
+      # Service containers take no server options, so raise the limits here (PG needs a restart).
+      - name: Raise connection limits
+        run: |
+          docker exec ${{ job.services.postgres.id }} psql -U postgres -c "ALTER SYSTEM SET max_connections = 500"
+          docker restart ${{ job.services.postgres.id }}
+          until docker exec ${{ job.services.postgres.id }} pg_isready -U postgres; do sleep 1; done
+          docker exec ${{ job.services.mariadb.id }} mariadb -uroot -ppw -e "SET GLOBAL max_connections = 500"
       - name: PostgreSQL
         run: cargo test -p suhms-store -p suhms-server
         env:
