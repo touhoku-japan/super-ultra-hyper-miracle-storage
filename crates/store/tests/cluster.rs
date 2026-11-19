@@ -70,6 +70,9 @@ impl Peer for InProcPeer {
         parts: Vec<blob::JoinPart>,
         object: Uuid,
     ) -> io::Result<String> {
+        if self.1.is_some() {
+            return Err(io::Error::from(io::ErrorKind::StorageFull));
+        }
         blob::concat_parts(self.disk(disk)?, upload, &parts, object).await
     }
 }
@@ -1360,4 +1363,67 @@ async fn disks_that_fill_up_during_writes_are_avoided_and_reported() {
         .await
         .unwrap_err();
     assert_eq!(c.registry.full_opens.load(Ordering::Relaxed), opens);
+}
+
+/// A disk that fills up while an upload is assembled on it: the completion is refused as out of
+/// space (507, not a 503 that clients would retry in vain), and a retry assembles elsewhere.
+#[tokio::test]
+async fn a_disk_that_fills_up_while_assembling_is_reported_and_avoided() {
+    let c = Cluster::start().await;
+    c.nodes[0]
+        .create_bucket(OWNER, "mpu", Some(2))
+        .await
+        .unwrap();
+    let upload = c.nodes[0]
+        .create_multipart_upload(OWNER, put("mpu", "big"))
+        .await
+        .unwrap();
+    let body = vec![7u8; 1000];
+    let r = c.nodes[0]
+        .upload_part(OWNER, "mpu", "big", upload.id, 1, None, &body[..])
+        .await
+        .unwrap();
+    let parts = [CompletedPart {
+        part_number: 1,
+        etag: r.etag,
+    }];
+    let full_disk = *upload
+        .disks
+        .iter()
+        .find(|d| c.disk_node[*d] != "node1")
+        .unwrap();
+    let other = c.disk_node[&full_disk].clone();
+    c.registry.full.write().unwrap().insert(other.clone());
+
+    let err = c.nodes[0]
+        .complete_multipart_upload(OWNER, "mpu", "big", upload.id, &parts)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::InsufficientStorage {
+                required: 2,
+                available: 1
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(c.nodes[0].space_refusals(), 1);
+
+    // Only that disk is full (the test peer fails the whole node; heal it): the retry avoids
+    // the disk found full and copies the part to another disk instead.
+    c.registry.full.write().unwrap().remove(&other);
+    c.nodes[0]
+        .complete_multipart_upload(OWNER, "mpu", "big", upload.id, &parts)
+        .await
+        .unwrap();
+    let stored = c.nodes[0].get_object(OWNER, "mpu", "big").await.unwrap();
+    assert_eq!(stored.replicas.len(), 2);
+    assert!(
+        !stored.replicas.contains(&full_disk),
+        "{:?}",
+        stored.replicas
+    );
+    assert_eq!(read(&c.nodes[1], "mpu", "big").await, body);
 }
